@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from tradelab.aggregate import _bucket_start, _four_hour_bucket_start, _trading_day_start, aggregate_bars
 from tradelab.bar import Bar1m
+from tradelab.session_calendar import expected_open_minutes
 
 NY = ZoneInfo("America/New_York")
 CONTRACT = "NQZ25"
@@ -22,7 +23,8 @@ def bar_at_utc(utc_dt: datetime, o: float = 1, h: float = 1, l: float = 1, c: fl
 def minute_series_ny(start_ny: datetime, n: int, price: float = 100.0) -> list[Bar1m]:
     """n consecutive 1m bars anchored to an NY wall-clock start, each with a distinct
     high/low/volume so rollup math is checkable. Only safe when [start_ny, start_ny+n
-    minutes) does not cross a DST gap/fold; use minute_series_utc for that."""
+    minutes) does not cross a DST gap/fold or the 17:00-18:00 NY daily break; use
+    minute_series_utc / session_bars for those."""
     bars = []
     for i in range(n):
         ts = start_ny + timedelta(minutes=i)
@@ -31,8 +33,15 @@ def minute_series_ny(start_ny: datetime, n: int, price: float = 100.0) -> list[B
 
 
 def minute_series_utc(start_utc: datetime, n: int) -> list[Bar1m]:
-    """n consecutive 1m bars anchored to a UTC start; safe across any DST transition."""
+    """n consecutive 1m bars anchored to a UTC start; safe across any DST transition.
+    Does not skip the daily break -- only use for windows that don't touch it."""
     return [bar_at_utc(start_utc + timedelta(minutes=i)) for i in range(n)]
+
+
+def session_bars(start_utc: datetime, end_utc: datetime) -> list[Bar1m]:
+    """One 1m bar per expected-open minute in [start_utc, end_utc), i.e. a
+    fully complete window per tradelab.session_calendar (break excluded)."""
+    return [bar_at_utc(t) for t in expected_open_minutes(start_utc, end_utc)]
 
 
 class OhlcvRollupTests(unittest.TestCase):
@@ -88,7 +97,8 @@ class BoundaryLabelTests(unittest.TestCase):
 
 class CompletenessTests(unittest.TestCase):
     """Per PR #2 review: no bucket -- first, interior, or trailing -- may be
-    aggregated unless it contains every expected 1-minute bar."""
+    aggregated unless its bars exactly match the session calendar's expected-open
+    minutes for that window (see tradelab.session_calendar)."""
 
     def test_full_bucket_is_aggregated(self):
         start = datetime(2026, 1, 5, 9, 30, tzinfo=NY)
@@ -133,37 +143,101 @@ class CompletenessTests(unittest.TestCase):
             aggregate_bars(minute_series_ny(start, 5), "3m")
 
 
+class DailyBreakCompletenessTests(unittest.TestCase):
+    """Per PR #2 review: the 17:00-18:00 NY daily maintenance break must not be
+    expected to have bars, but every *regular-session* minute still must."""
+
+    def test_full_1d_bucket_with_1380_active_minutes_and_no_break_bars_is_returned(self):
+        start_utc = datetime(2026, 1, 5, 18, 0, tzinfo=NY).astimezone(timezone.utc)
+        end_utc = datetime(2026, 1, 6, 18, 0, tzinfo=NY).astimezone(timezone.utc)
+        bars = session_bars(start_utc, end_utc)
+        self.assertEqual(len(bars), 1380)  # sanity check on the fixture itself
+
+        [agg] = aggregate_bars(bars, "1D")
+        self.assertEqual(agg.timestamp, start_utc)
+        self.assertEqual(agg.known_at, end_utc)
+        self.assertEqual(agg.open, bars[0].open)
+        self.assertEqual(agg.close, bars[-1].close)
+
+    def test_4h_bucket_14_to_18_with_180_active_minutes_is_returned(self):
+        start_utc = datetime(2026, 1, 6, 14, 0, tzinfo=NY).astimezone(timezone.utc)
+        end_utc = datetime(2026, 1, 6, 18, 0, tzinfo=NY).astimezone(timezone.utc)
+        bars = session_bars(start_utc, end_utc)
+        self.assertEqual(len(bars), 180)  # sanity check on the fixture itself
+
+        [agg] = aggregate_bars(bars, "4H")
+        self.assertEqual(agg.timestamp, start_utc)
+        self.assertEqual(agg.known_at, end_utc)
+
+    def test_one_missing_regular_minute_still_rejects_the_4h_bucket(self):
+        start_utc = datetime(2026, 1, 6, 14, 0, tzinfo=NY).astimezone(timezone.utc)
+        end_utc = datetime(2026, 1, 6, 18, 0, tzinfo=NY).astimezone(timezone.utc)
+        expected = expected_open_minutes(start_utc, end_utc)
+        missing_15_00 = datetime(2026, 1, 6, 15, 0, tzinfo=NY).astimezone(timezone.utc)
+        self.assertIn(missing_15_00, expected)  # sanity check on the fixture itself
+
+        bars = [bar_at_utc(t) for t in expected if t != missing_15_00]
+        self.assertEqual(aggregate_bars(bars, "4H"), [])
+
+    def test_a_bar_landing_inside_the_break_rejects_the_bucket(self):
+        # Anomalous data: a 1m bar timestamped inside the 17:00-18:00 break. This
+        # is "data inconsistent with the regular schedule" and must be rejected,
+        # not silently folded into the bucket.
+        start_utc = datetime(2026, 1, 6, 14, 0, tzinfo=NY).astimezone(timezone.utc)
+        end_utc = datetime(2026, 1, 6, 18, 0, tzinfo=NY).astimezone(timezone.utc)
+        bars = session_bars(start_utc, end_utc)
+        stray_in_break = bar_at_ny(datetime(2026, 1, 6, 17, 30, tzinfo=NY))
+        # Insert in timestamp order to satisfy the strict-ordering requirement.
+        combined = sorted(bars + [stray_in_break], key=lambda b: b.timestamp)
+        self.assertEqual(aggregate_bars(combined, "4H"), [])
+
+
 class TradingDayTests(unittest.TestCase):
     def test_full_trading_days_roll_over_at_18_00_ny(self):
-        day1_start = datetime(2026, 1, 4, 18, 0, tzinfo=NY)  # a full, non-DST trading day: 1440 min
-        day1 = minute_series_ny(day1_start, 1440)
-        day2 = minute_series_ny(day1_start + timedelta(days=1), 1440, price=200.0)
-        agg = aggregate_bars(day1 + day2, "1D")
+        day1_start = datetime(2026, 1, 4, 18, 0, tzinfo=NY).astimezone(timezone.utc)  # non-DST day
+        day1_end = datetime(2026, 1, 5, 18, 0, tzinfo=NY).astimezone(timezone.utc)
+        day2_end = datetime(2026, 1, 6, 18, 0, tzinfo=NY).astimezone(timezone.utc)
+        day1 = session_bars(day1_start, day1_end)
+        day2 = session_bars(day1_end, day2_end)
 
+        agg = aggregate_bars(day1 + day2, "1D")
         self.assertEqual(len(agg), 2)
-        self.assertEqual(agg[0].timestamp, day1_start.astimezone(timezone.utc))
+        self.assertEqual(agg[0].timestamp, day1_start)
         self.assertEqual(agg[0].open, day1[0].open)
         self.assertEqual(agg[0].close, day1[-1].close)
-        self.assertEqual(agg[0].known_at, (day1_start + timedelta(days=1)).astimezone(timezone.utc))
+        self.assertEqual(agg[0].known_at, day1_end)
         self.assertEqual(agg[1].open, day2[0].open)
 
 
 class FourHourAnchorTests(unittest.TestCase):
     def test_all_six_anchors_produce_complete_buckets(self):
-        day_start = datetime(2026, 1, 5, 18, 0, tzinfo=NY)  # non-DST trading day
-        bars = minute_series_ny(day_start, 1440)
+        day_start = datetime(2026, 1, 5, 18, 0, tzinfo=NY).astimezone(timezone.utc)  # non-DST day
+        day_end = datetime(2026, 1, 6, 18, 0, tzinfo=NY).astimezone(timezone.utc)
+        bars = session_bars(day_start, day_end)  # 1380 bars, break excluded
+
         agg = aggregate_bars(bars, "4H")
         self.assertEqual(len(agg), 6)
         expected_hours = [18, 22, 2, 6, 10, 14]
         self.assertEqual([a.timestamp.astimezone(NY).hour for a in agg], expected_hours)
-        for a in agg:
-            self.assertEqual((a.known_at - a.timestamp).total_seconds() / 60, 240)
+        # known_at is always the nominal wall-clock close of the window (raw
+        # 240 minutes later here, no DST involved) -- it marks *when* the bar
+        # is known, independent of how many bars fed it.
+        raw_durations = [(a.known_at - a.timestamp).total_seconds() / 60 for a in agg]
+        self.assertEqual(raw_durations, [240] * 6)
+        # Each bar_at_utc fixture has volume=1, so summed volume reveals how
+        # many 1m bars actually fed each bucket: 240 for every segment except
+        # the last (14:00-18:00), which loses its final hour to the daily
+        # break and is fed by only 180.
+        actual_bar_counts = [a.volume for a in agg]
+        self.assertEqual(actual_bar_counts, [240, 240, 240, 240, 240, 180])
 
 
 class DstTransitionTests(unittest.TestCase):
     def test_spring_forward_4h_bucket_needs_only_180_minutes(self):
         # 2026-03-08: US clocks jump 02:00 -> 03:00 NY, so the 02:00-06:00 4H
         # bucket (UTC 07:00-10:00 that day) spans only 3 real hours (180 minutes).
+        # This window doesn't touch the 17:00-18:00 break, so it is unaffected
+        # by the session-calendar change.
         start_utc = datetime(2026, 3, 8, 7, 0, tzinfo=timezone.utc)
         closer = [bar_at_utc(datetime(2026, 3, 8, 10, 5, tzinfo=timezone.utc))]
 
@@ -177,7 +251,8 @@ class DstTransitionTests(unittest.TestCase):
 
     def test_fall_back_4h_bucket_needs_300_minutes(self):
         # 2026-11-01: US clocks fall back 02:00 -> 01:00 NY (repeated hour), so the
-        # 22:00-02:00 4H bucket (UTC 02:00-07:00 that day) spans 5 real hours (300 minutes).
+        # 22:00-02:00 4H bucket (UTC 02:00-07:00 that day) spans 5 real hours (300
+        # minutes). Doesn't touch the 17:00-18:00 break either.
         start_utc = datetime(2026, 11, 1, 2, 0, tzinfo=timezone.utc)
         closer = [bar_at_utc(datetime(2026, 11, 1, 7, 5, tzinfo=timezone.utc))]
 
@@ -188,18 +263,25 @@ class DstTransitionTests(unittest.TestCase):
         one_short = minute_series_utc(start_utc, 299)
         self.assertEqual(aggregate_bars(one_short + closer, "4H"), [])
 
-    def test_fall_back_trading_day_needs_1500_minutes(self):
-        # The CME trading day opening 18:00 NY on Oct 31 still ends 18:00 NY on Nov 1,
-        # but that wall-clock day is 25 real hours (1500 minutes) long.
-        opener_utc = datetime(2026, 10, 31, 22, 0, tzinfo=timezone.utc)  # 18:00 NY EDT
-        closer = [bar_at_utc(datetime(2026, 11, 2, 0, 0, tzinfo=timezone.utc))]  # after next 18:00 NY EST
+    def test_fall_back_trading_day_needs_1440_minutes(self):
+        # The CME trading day opening 18:00 NY on Oct 31 still ends 18:00 NY on
+        # Nov 1. Raw wall-clock span is 25 real hours (1500 min, extra fall-back
+        # hour), minus the 60-minute daily break = 1440 expected minutes.
+        day_start = datetime(2026, 10, 31, 18, 0, tzinfo=NY).astimezone(timezone.utc)
+        day_end = datetime(2026, 11, 1, 18, 0, tzinfo=NY).astimezone(timezone.utc)
+        expected = expected_open_minutes(day_start, day_end)
+        self.assertEqual(len(expected), 1440)
 
-        complete = minute_series_utc(opener_utc, 1500)
+        complete = [bar_at_utc(t) for t in expected]
+        closer = [bar_at_utc(datetime(2026, 11, 2, 0, 0, tzinfo=timezone.utc))]
         [agg] = aggregate_bars(complete + closer, "1D")
+        # known_at is the nominal wall-clock close (25 real hours later here,
+        # the fall-back extra hour) -- independent of how many bars fed it.
         self.assertEqual((agg.known_at - agg.timestamp).total_seconds() / 60, 1500)
         self.assertEqual(agg.known_at.astimezone(NY), datetime(2026, 11, 1, 18, 0, tzinfo=NY))
+        self.assertEqual(agg.volume, 1440)  # each fixture bar has volume=1: 1440 fed the bucket
 
-        one_short = minute_series_utc(opener_utc, 1499)
+        one_short = [bar_at_utc(t) for t in expected[:-1]]
         self.assertEqual(aggregate_bars(one_short + closer, "1D"), [])
 
 

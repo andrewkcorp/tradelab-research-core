@@ -17,16 +17,25 @@ document), chosen to line up with the CME trading day rather than NY
 midnight.
 
 Completeness policy: an aggregated bar is only ever returned when its
-bucket contains *every* expected 1-minute bar for its actual (DST-aware)
-duration -- no exceptions for the first bucket of the input or for a gap
-in the middle of a bucket. A bucket that is short even one minute is
-silently dropped rather than aggregated from partial data: rolling up
-incomplete OHLC would fabricate highs/lows/closes that were never
-actually observed, which can manufacture spurious FVGs, liquidity
-sweeps and bias in any downstream research that reads this data.
+bucket's 1-minute bars exactly match ``tradelab.session_calendar``'s set of
+expected-open minutes for that bucket's window -- no exceptions for the
+first bucket of the input, for a gap in the middle of a bucket, or for the
+daily 17:00-18:00 NY maintenance break (which is expected to have *no*
+bars, not treated as a gap). Any mismatch -- a missing open-session minute,
+an extra bar landing inside the break, or data that otherwise doesn't match
+the regular schedule -- drops the whole bucket rather than aggregating it
+from partial or non-standard data: rolling up incomplete OHLC would
+fabricate highs/lows/closes that were never actually observed, which can
+manufacture spurious FVGs, liquidity sweeps and bias in any downstream
+research that reads this data.
+
+Because ``tradelab.session_calendar`` has no notion of CME holidays or
+early closes (see its module docstring), a bucket touching such a day will
+also be rejected here -- there is no separate "unsupported schedule" marker,
+it just never appears in the output, same as a bucket with a real data gap.
 Callers who need to know *why* a period has no aggregate should cross
-reference ``tradelab.validation.validate_bars``' missing-minutes
-registry against the input.
+reference ``tradelab.validation.validate_bars``' missing-minutes registry
+against the input.
 """
 from __future__ import annotations
 
@@ -35,9 +44,9 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from tradelab.bar import Bar1m
+from tradelab.session_calendar import expected_open_minutes
 
 NY = ZoneInfo("America/New_York")
-ONE_MINUTE = timedelta(minutes=1)
 TRADING_DAY_START_HOUR = 18
 FOUR_HOUR_SEGMENT_HOURS = 4
 
@@ -83,9 +92,10 @@ def aggregate_bars(bars: list[Bar1m], timeframe: str) -> list[AggregatedBar]:
         # silently misjudge magnitude across a DST transition.
         bucket_start_utc = bucket_start_ny.astimezone(timezone.utc)
         bucket_end_utc = bucket_end_ny.astimezone(timezone.utc)
-        expected_minutes = int((bucket_end_utc - bucket_start_utc).total_seconds() // 60)
-        if len(acc) != expected_minutes:
-            return  # partial bucket (start, gap, or short end): never aggregated
+        expected = expected_open_minutes(bucket_start_utc, bucket_end_utc)
+        actual = [b.timestamp for b in acc]
+        if actual != expected:
+            return  # missing an expected-open minute, or data outside the regular schedule
         results.append(
             AggregatedBar(
                 timestamp=bucket_start_utc,
