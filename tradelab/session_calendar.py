@@ -1,8 +1,13 @@
 """Regular trading-session calendar for NQ/MNQ on CME Globex.
 
 This is a TradeLab execution/data-availability rule, not a strategy
-definition -- it exists purely so the aggregator (``tradelab.aggregate``)
-knows which 1-minute slots the *regular* session actually expects data for.
+definition. Two other modules build on it, for two different purposes:
+
+- ``tradelab.aggregate`` uses it to know which 1-minute slots a bucket must
+  contain before it can be aggregated at all.
+- ``tradelab.validation`` uses it to know which missing 1-minute slots are
+  an actual data gap worth reporting, as opposed to the market simply being
+  closed on schedule.
 
 Regular session, every calendar day: opens 18:00 NY (previous calendar day)
 and runs to 17:00 NY (current day) -- a 23-hour active window -- followed by
@@ -15,13 +20,17 @@ assumption): CME holidays, early-close days, and any other one-off special
 schedule. Because those aren't modeled, this calendar cannot distinguish a
 normal trading day from a holiday or an early close -- it will claim the
 regular 23h/1h shape applies on those days too, which is simply wrong. In
-practice this stays safe rather than silently wrong: real holiday/early-close
-data has fewer 1-minute bars than this calendar expects, so
-``tradelab.aggregate.aggregate_bars``' completeness check (which requires an
-exact match against ``expected_open_minutes``) will reject any bucket
-touching such a day instead of fabricating an aggregate from partial data.
-A full weekend closure is handled the same way, by the same accident of
-conservatism, not because weekends are modeled here.
+practice this stays safe rather than silently wrong on the aggregation side:
+real holiday/early-close data has fewer 1-minute bars than this calendar
+expects, so ``tradelab.aggregate.aggregate_bars``' completeness check (which
+requires an exact match against ``expected_open_minutes``) will reject any
+bucket touching such a day instead of fabricating an aggregate from partial
+data. A full weekend closure is handled the same way, by the same accident
+of conservatism, not because weekends are modeled here. On the validation
+side, the same blind spot means a holiday/early-close day's missing minutes
+get reported by ``tradelab.validation.validate_bars`` as an ordinary data
+gap -- there is no way, from this module alone, to tell "the market was
+closed for a reason we don't model" apart from "the data is missing".
 """
 from __future__ import annotations
 
