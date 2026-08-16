@@ -91,11 +91,18 @@ RED_FOLDER_AFTER = timedelta(minutes=5)
 class NewsEvent:
     """A single scheduled high-impact USD macro release.
 
-    ``scheduled_at`` is normalized to UTC and must be exact -- v1 only
-    accepts events whose publication time is precisely known
-    (``time_is_exact=True``); anything else is rejected outright rather than
-    stored with an approximate time, since the whole point of this model is
-    to drive a precise entry blackout window.
+    ``scheduled_at`` is normalized to UTC and must be exact to the minute
+    (second=0, microsecond=0) -- v1 only accepts events whose publication
+    time is precisely known (``time_is_exact=True``); anything else,
+    including a timestamp with leftover seconds, is rejected outright
+    rather than stored with an approximate time. TradeLab fills entries on
+    1-minute bars, so the T-15/T+5 blackout boundary must land exactly on a
+    minute or it is ambiguous which bar it applies to.
+
+    ``schema_version`` must equal ``SCHEMA_VERSION`` exactly (currently
+    ``"1.0"``) -- there is no cross-version compatibility in v1, so any
+    other value, including a plausible-looking one like ``"1.1"``, is
+    rejected rather than silently accepted.
     """
 
     event_id: str
@@ -116,6 +123,12 @@ class NewsEvent:
         if self.scheduled_at.tzinfo is None:
             raise ValueError(f"NewsEvent.scheduled_at must be timezone-aware: {self.scheduled_at!r}")
         object.__setattr__(self, "scheduled_at", self.scheduled_at.astimezone(timezone.utc))
+        if self.scheduled_at.second != 0 or self.scheduled_at.microsecond != 0:
+            raise ValueError(
+                f"NewsEvent.scheduled_at must be exact to the minute (second=0, microsecond=0): "
+                f"{self.scheduled_at!r} -- entries fill on 1m bars, so the T-15/T+5 blackout boundary "
+                "must be unambiguous"
+            )
 
         if self.country != REQUIRED_COUNTRY:
             raise ValueError(f"NewsEvent.country must be {REQUIRED_COUNTRY!r}, got {self.country!r}")
@@ -136,8 +149,11 @@ class NewsEvent:
             raise ValueError(f"NewsEvent {self.event_id!r}: source_url must be non-empty (required for audit)")
         if not self.source_reference:
             raise ValueError(f"NewsEvent {self.event_id!r}: source_reference must be non-empty (required for audit)")
-        if not self.schema_version:
-            raise ValueError(f"NewsEvent {self.event_id!r}: schema_version must be non-empty")
+        if self.schema_version != SCHEMA_VERSION:
+            raise ValueError(
+                f"NewsEvent {self.event_id!r}: schema_version must be exactly {SCHEMA_VERSION!r}, "
+                f"got {self.schema_version!r}"
+            )
 
 
 def validate_news_events(events: list[NewsEvent]) -> None:

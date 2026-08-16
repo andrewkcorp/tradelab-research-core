@@ -74,6 +74,20 @@ class CsvLoaderTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 read_news_events_csv(path)
 
+    def test_wrong_schema_version_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "news.csv"
+            path.write_text(HEADER + ROW_1.replace(",true,1.0\n", ",true,2.0\n"), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                read_news_events_csv(path)
+
+    def test_scheduled_at_with_nonzero_seconds_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "news.csv"
+            path.write_text(HEADER + ROW_1.replace("13:30:00Z", "13:30:01Z"), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                read_news_events_csv(path)
+
 
 class ParquetImportGuardTests(unittest.TestCase):
     def test_missing_pyarrow_raises_clear_import_error(self):
@@ -123,6 +137,30 @@ class ParquetLoaderTests(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0].event_id, "CPI-2026-01")
             self.assertEqual(events[0].scheduled_at, datetime(2026, 1, 13, 13, 30, tzinfo=timezone.utc))
+
+    def test_wrong_schema_version_raises(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        table = pa.table(
+            {
+                "event_id": ["CPI-2026-01"],
+                "scheduled_at": pa.array([datetime(2026, 1, 13, 13, 30, tzinfo=timezone.utc)], type=pa.timestamp("us", tz="UTC")),
+                "country": ["United States"],
+                "currency": ["USD"],
+                "event_type": ["CPI"],
+                "source_agency": ["BLS"],
+                "source_url": ["https://www.bls.gov/cpi/"],
+                "source_reference": ["CPI-2026-01-REL"],
+                "time_is_exact": [True],
+                "schema_version": ["2.0"],
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "news.parquet"
+            pq.write_table(table, str(path))
+            with self.assertRaises(ValueError):
+                read_news_events_parquet(path)
 
     def test_duplicate_event_id_raises(self):
         import pyarrow as pa

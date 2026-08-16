@@ -94,6 +94,37 @@ class NewsEventModelTests(unittest.TestCase):
         self.assertNotIn("actual", field_names)
         self.assertNotIn("forecast", field_names)
 
+    def test_correct_schema_version_is_accepted(self):
+        event = make_event(schema_version="1.0")
+        self.assertEqual(event.schema_version, "1.0")
+
+    def test_other_schema_versions_are_rejected(self):
+        for bad_version in ("2.0", "1.1", "1", "", "1.0 ", " 1.0"):
+            with self.subTest(schema_version=bad_version):
+                with self.assertRaises(ValueError):
+                    make_event(schema_version=bad_version)
+
+    def test_exact_minute_boundary_scheduled_at_is_accepted(self):
+        event = make_event(scheduled_at=datetime(2026, 1, 13, 13, 30, 0, 0, tzinfo=timezone.utc))
+        self.assertEqual(event.scheduled_at.second, 0)
+        self.assertEqual(event.scheduled_at.microsecond, 0)
+
+    def test_nonzero_seconds_in_scheduled_at_is_rejected(self):
+        with self.assertRaises(ValueError):
+            make_event(scheduled_at=datetime(2026, 1, 13, 13, 30, 1, tzinfo=timezone.utc))
+
+    def test_nonzero_microseconds_in_scheduled_at_is_rejected(self):
+        with self.assertRaises(ValueError):
+            make_event(scheduled_at=datetime(2026, 1, 13, 13, 30, 0, 1, tzinfo=timezone.utc))
+
+    def test_minute_misalignment_is_rejected_even_after_utc_normalization(self):
+        # 08:30:30 in UTC-5 is exactly 13:30:30 UTC: still off the minute
+        # grid, so this must be rejected even though the *local* second
+        # looks like part of the offset conversion rather than real data.
+        minus_five = timezone(timedelta(hours=-5))
+        with self.assertRaises(ValueError):
+            make_event(scheduled_at=datetime(2026, 1, 13, 8, 30, 30, tzinfo=minus_five))
+
 
 class ValidateNewsEventsTests(unittest.TestCase):
     def test_distinct_events_pass(self):
