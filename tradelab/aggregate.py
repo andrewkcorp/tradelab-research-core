@@ -10,21 +10,23 @@ The 1D bucket is the CME trading day: it starts at 18:00 NY (the prior
 calendar day when the trading day is still "in progress" locally) and
 runs 24 wall-clock hours to the next 18:00 NY, per spec section 2.
 
-An aggregated bar is only ever returned once it is fully closed. Every
-bucket except the very last one in the input is closed by construction:
-seeing a later bar proves wall-clock time has moved past that bucket's
-end boundary, even if the bucket has internal missing minutes (a data
-coverage issue tracked separately by ``tradelab.validation``, not a
-"not yet known" issue). The trailing bucket of the whole series is the
-only one that can still be genuinely in progress, so it is dropped
-unless the last supplied 1-minute bar exactly reaches its bucket's end
-boundary. This keeps the API from ever exposing a partially-formed,
-not-yet-known aggregate as if it were historical (spec section 2, point 6).
+4H buckets are anchored to the same 18:00 NY trading-day open, sliced
+into six fixed segments: 18:00, 22:00, 02:00, 06:00, 10:00, 14:00 NY.
+This is a fixed TradeLab business rule (not derived from the spec
+document), chosen to line up with the CME trading day rather than NY
+midnight.
 
-4H buckets are anchored to NY midnight (00:00, 04:00, ..., 20:00). The
-spec does not pin an explicit 4H anchor; this is a documented assumption
-tracked as an open item for owner confirmation, not a redefinition of
-anything the spec does state.
+Completeness policy: an aggregated bar is only ever returned when its
+bucket contains *every* expected 1-minute bar for its actual (DST-aware)
+duration -- no exceptions for the first bucket of the input or for a gap
+in the middle of a bucket. A bucket that is short even one minute is
+silently dropped rather than aggregated from partial data: rolling up
+incomplete OHLC would fabricate highs/lows/closes that were never
+actually observed, which can manufacture spurious FVGs, liquidity
+sweeps and bias in any downstream research that reads this data.
+Callers who need to know *why* a period has no aggregate should cross
+reference ``tradelab.validation.validate_bars``' missing-minutes
+registry against the input.
 """
 from __future__ import annotations
 
@@ -37,6 +39,7 @@ from tradelab.bar import Bar1m
 NY = ZoneInfo("America/New_York")
 ONE_MINUTE = timedelta(minutes=1)
 TRADING_DAY_START_HOUR = 18
+FOUR_HOUR_SEGMENT_HOURS = 4
 
 _INTRADAY_MINUTES = {"5m": 5, "15m": 15, "1H": 60, "4H": 240}
 SUPPORTED_TIMEFRAMES = frozenset(_INTRADAY_MINUTES) | {"1D"}
@@ -44,7 +47,7 @@ SUPPORTED_TIMEFRAMES = frozenset(_INTRADAY_MINUTES) | {"1D"}
 
 @dataclass(frozen=True)
 class AggregatedBar:
-    """A closed higher-timeframe bar aggregated from 1-minute bars."""
+    """A closed, fully-covered higher-timeframe bar aggregated from 1-minute bars."""
 
     timestamp: datetime  # UTC, start of the bucket
     open: float
@@ -69,24 +72,23 @@ def aggregate_bars(bars: list[Bar1m], timeframe: str) -> list[AggregatedBar]:
     acc: list[Bar1m] = []
     previous_ts: datetime | None = None
 
-    def finalize(require_full_coverage: bool) -> None:
+    def finalize() -> None:
         if not acc:
             return
+        # Bar1m.timestamp is always a fixed-offset UTC instant (see tradelab.bar),
+        # so these are plain UTC-to-UTC computations. Deliberately not done on the
+        # NY-zoneinfo bucket_start_ny/bucket_end_ny values: CPython's aware-datetime
+        # subtraction takes an identity-based fast path when both operands share the
+        # exact same ZoneInfo object, which skips UTC offset reconciliation and can
+        # silently misjudge magnitude across a DST transition.
+        bucket_start_utc = bucket_start_ny.astimezone(timezone.utc)
         bucket_end_utc = bucket_end_ny.astimezone(timezone.utc)
-        if require_full_coverage:
-            # Bar1m.timestamp is already a fixed-offset UTC instant, so this
-            # comparison is a plain UTC-to-UTC check. Comparing two zoneinfo
-            # datetimes here instead would be a trap: CPython's aware-datetime
-            # subtraction/comparison takes an identity-based fast path when
-            # both operands share the exact same ZoneInfo object, which skips
-            # UTC offset reconciliation and can silently misjudge magnitude
-            # across a DST transition.
-            last_bar_end_utc = acc[-1].timestamp + ONE_MINUTE
-            if last_bar_end_utc < bucket_end_utc:
-                return  # trailing bucket still in progress: never expose it
+        expected_minutes = int((bucket_end_utc - bucket_start_utc).total_seconds() // 60)
+        if len(acc) != expected_minutes:
+            return  # partial bucket (start, gap, or short end): never aggregated
         results.append(
             AggregatedBar(
-                timestamp=bucket_start_ny.astimezone(timezone.utc),
+                timestamp=bucket_start_utc,
                 open=acc[0].open,
                 high=max(b.high for b in acc),
                 low=min(b.low for b in acc),
@@ -107,9 +109,7 @@ def aggregate_bars(bars: list[Bar1m], timeframe: str) -> list[AggregatedBar]:
         this_bucket_start = _bucket_start(ts_ny, timeframe)
 
         if bucket_start_ny is not None and this_bucket_start != bucket_start_ny:
-            # A bar in a later bucket proves the previous bucket's window has
-            # fully elapsed, regardless of how many minutes it actually contains.
-            finalize(require_full_coverage=False)
+            finalize()
             acc = []
 
         if not acc:
@@ -122,13 +122,15 @@ def aggregate_bars(bars: list[Bar1m], timeframe: str) -> list[AggregatedBar]:
             )
         acc.append(bar)
 
-    finalize(require_full_coverage=True)
+    finalize()
     return results
 
 
 def _bucket_start(ts_ny: datetime, timeframe: str) -> datetime:
     if timeframe == "1D":
         return _trading_day_start(ts_ny)
+    if timeframe == "4H":
+        return _four_hour_bucket_start(ts_ny)
     minutes = _INTRADAY_MINUTES[timeframe]
     midnight = ts_ny.replace(hour=0, minute=0, second=0, microsecond=0)
     minutes_since_midnight = ts_ny.hour * 60 + ts_ny.minute
@@ -146,3 +148,16 @@ def _trading_day_start(ts_ny: datetime) -> datetime:
     """CME trading day: begins 18:00 NY, ends 18:00 NY the next calendar day."""
     anchor_date = ts_ny.date() if ts_ny.hour >= TRADING_DAY_START_HOUR else ts_ny.date() - timedelta(days=1)
     return datetime(anchor_date.year, anchor_date.month, anchor_date.day, TRADING_DAY_START_HOUR, tzinfo=NY)
+
+
+def _four_hour_bucket_start(ts_ny: datetime) -> datetime:
+    """4H segments anchored to the trading day open: 18/22/02/06/10/14 NY.
+
+    Fixed TradeLab business rule. Computed as an offset from the same
+    18:00 trading-day anchor used for 1D, so a 4H bucket never straddles
+    the trading-day boundary.
+    """
+    trading_day_start_ny = _trading_day_start(ts_ny)
+    hours_since_open = (ts_ny.hour - TRADING_DAY_START_HOUR) % 24
+    segment_index = hours_since_open // FOUR_HOUR_SEGMENT_HOURS
+    return trading_day_start_ny + timedelta(hours=segment_index * FOUR_HOUR_SEGMENT_HOURS)

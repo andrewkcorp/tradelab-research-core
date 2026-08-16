@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
-"""Aggregation tests: OHLCV rollup, timeframe boundaries, trading-day and DST rules."""
+"""Aggregation tests: OHLCV rollup, timeframe boundaries, completeness, trading-day and DST rules."""
 import unittest
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from tradelab.aggregate import aggregate_bars
+from tradelab.aggregate import _bucket_start, _four_hour_bucket_start, _trading_day_start, aggregate_bars
 from tradelab.bar import Bar1m
 
 NY = ZoneInfo("America/New_York")
 CONTRACT = "NQZ25"
 
 
-def bar_at_ny(ny_dt: datetime, o: float, h: float, l: float, c: float, v: float) -> Bar1m:
+def bar_at_ny(ny_dt: datetime, o: float = 1, h: float = 1, l: float = 1, c: float = 1, v: float = 1) -> Bar1m:
     return Bar1m(ny_dt.astimezone(timezone.utc), o, h, l, c, v, CONTRACT)
 
 
-def minute_series(start_ny: datetime, n: int, price: float = 100.0) -> list[Bar1m]:
-    """n consecutive 1m bars, each with a distinct high/low/volume so rollup math is checkable."""
+def bar_at_utc(utc_dt: datetime, o: float = 1, h: float = 1, l: float = 1, c: float = 1, v: float = 1) -> Bar1m:
+    return Bar1m(utc_dt, o, h, l, c, v, CONTRACT)
+
+
+def minute_series_ny(start_ny: datetime, n: int, price: float = 100.0) -> list[Bar1m]:
+    """n consecutive 1m bars anchored to an NY wall-clock start, each with a distinct
+    high/low/volume so rollup math is checkable. Only safe when [start_ny, start_ny+n
+    minutes) does not cross a DST gap/fold; use minute_series_utc for that."""
     bars = []
     for i in range(n):
         ts = start_ny + timedelta(minutes=i)
@@ -24,10 +30,15 @@ def minute_series(start_ny: datetime, n: int, price: float = 100.0) -> list[Bar1
     return bars
 
 
+def minute_series_utc(start_utc: datetime, n: int) -> list[Bar1m]:
+    """n consecutive 1m bars anchored to a UTC start; safe across any DST transition."""
+    return [bar_at_utc(start_utc + timedelta(minutes=i)) for i in range(n)]
+
+
 class OhlcvRollupTests(unittest.TestCase):
     def test_open_high_low_close_volume_are_correctly_rolled_up(self):
         start = datetime(2026, 1, 5, 9, 30, tzinfo=NY)
-        bars = minute_series(start, 5)  # exactly one closed 5m bucket
+        bars = minute_series_ny(start, 5)  # exactly one complete 5m bucket
         [agg] = aggregate_bars(bars, "5m")
         self.assertEqual(agg.open, bars[0].open)
         self.assertEqual(agg.close, bars[-1].close)
@@ -38,113 +49,80 @@ class OhlcvRollupTests(unittest.TestCase):
         self.assertEqual(agg.timeframe, "5m")
 
 
-class BoundaryTests(unittest.TestCase):
-    def test_5m_boundary_splits_buckets(self):
-        start = datetime(2026, 1, 5, 9, 33, tzinfo=NY)  # mid-bucket start (09:30-09:35)
-        bars = minute_series(start, 4)  # 09:33, 09:34 (bucket A) ; 09:35, 09:36 (bucket B)
-        agg = aggregate_bars(bars, "5m")
-        self.assertEqual(len(agg), 1)  # only bucket A is closed; trailing bucket B is dropped
-        self.assertEqual(agg[0].timestamp, datetime(2026, 1, 5, 9, 30, tzinfo=NY).astimezone(timezone.utc))
-        self.assertEqual(agg[0].open, bars[0].open)
-        self.assertEqual(agg[0].close, bars[1].close)
+class BoundaryLabelTests(unittest.TestCase):
+    """Direct checks of the boundary-computation functions, independent of the
+    completeness policy exercised in CompletenessTests below."""
 
-    def test_15m_boundary_splits_buckets(self):
-        start = datetime(2026, 1, 5, 9, 44, tzinfo=NY)
-        bars = minute_series(start, 3)  # 09:44 (bucket 09:30-09:45); 09:45, 09:46 (next bucket)
-        agg = aggregate_bars(bars, "15m")
-        self.assertEqual(len(agg), 1)
-        self.assertEqual(agg[0].timestamp, datetime(2026, 1, 5, 9, 30, tzinfo=NY).astimezone(timezone.utc))
-        self.assertEqual(agg[0].open, bars[0].open)
-        self.assertEqual(agg[0].close, bars[0].close)
+    def test_5m_boundary_labels(self):
+        self.assertEqual(_bucket_start(datetime(2026, 1, 5, 9, 34, tzinfo=NY), "5m"), datetime(2026, 1, 5, 9, 30, tzinfo=NY))
+        self.assertEqual(_bucket_start(datetime(2026, 1, 5, 9, 35, tzinfo=NY), "5m"), datetime(2026, 1, 5, 9, 35, tzinfo=NY))
 
-    def test_1h_boundary_splits_buckets(self):
-        start = datetime(2026, 1, 5, 9, 59, tzinfo=NY)
-        bars = minute_series(start, 3)  # 09:59 (bucket 09:00-10:00); 10:00, 10:01 (next bucket)
-        agg = aggregate_bars(bars, "1H")
-        self.assertEqual(len(agg), 1)
-        self.assertEqual(agg[0].timestamp, datetime(2026, 1, 5, 9, 0, tzinfo=NY).astimezone(timezone.utc))
-        self.assertEqual(agg[0].close, bars[0].close)
+    def test_15m_boundary_labels(self):
+        self.assertEqual(_bucket_start(datetime(2026, 1, 5, 9, 44, tzinfo=NY), "15m"), datetime(2026, 1, 5, 9, 30, tzinfo=NY))
+        self.assertEqual(_bucket_start(datetime(2026, 1, 5, 9, 45, tzinfo=NY), "15m"), datetime(2026, 1, 5, 9, 45, tzinfo=NY))
 
-    def test_4h_boundary_splits_buckets(self):
-        start = datetime(2026, 1, 5, 11, 59, tzinfo=NY)
-        bars = minute_series(start, 3)  # 11:59 (bucket 08:00-12:00); 12:00, 12:01 (next bucket)
-        agg = aggregate_bars(bars, "4H")
-        self.assertEqual(len(agg), 1)
-        self.assertEqual(agg[0].timestamp, datetime(2026, 1, 5, 8, 0, tzinfo=NY).astimezone(timezone.utc))
-        self.assertEqual(agg[0].close, bars[0].close)
+    def test_1h_boundary_labels(self):
+        self.assertEqual(_bucket_start(datetime(2026, 1, 5, 9, 59, tzinfo=NY), "1H"), datetime(2026, 1, 5, 9, 0, tzinfo=NY))
+        self.assertEqual(_bucket_start(datetime(2026, 1, 5, 10, 0, tzinfo=NY), "1H"), datetime(2026, 1, 5, 10, 0, tzinfo=NY))
 
+    def test_4h_boundary_labels_use_the_18_22_02_06_10_14_anchors(self):
+        cases = {
+            18: 18, 19: 18, 21: 18,
+            22: 22, 23: 22,
+            0: 22, 1: 22,
+            2: 2, 3: 2, 5: 2,
+            6: 6, 9: 6,
+            10: 10, 13: 10,
+            14: 14, 17: 14,
+        }
+        for hour, expected_anchor_hour in cases.items():
+            with self.subTest(hour=hour):
+                ts = datetime(2026, 1, 5, hour, 30, tzinfo=NY)
+                got = _four_hour_bucket_start(ts)
+                self.assertEqual(got.hour, expected_anchor_hour)
 
-class TradingDayTests(unittest.TestCase):
-    def test_trading_day_rolls_over_at_18_00_ny(self):
-        pre_rollover = bar_at_ny(datetime(2026, 1, 5, 17, 59, tzinfo=NY), 1, 1, 1, 1, 1)
-        post_rollover = bar_at_ny(datetime(2026, 1, 5, 18, 0, tzinfo=NY), 2, 2, 2, 2, 2)
-        next_day_close = bar_at_ny(datetime(2026, 1, 6, 18, 0, tzinfo=NY), 3, 3, 3, 3, 3)
-        agg = aggregate_bars([pre_rollover, post_rollover, next_day_close], "1D")
-
-        self.assertEqual(len(agg), 2)
-        # 17:59 NY on Jan 5 still belongs to the trading day that opened 18:00 NY on Jan 4.
-        self.assertEqual(agg[0].timestamp, datetime(2026, 1, 4, 18, 0, tzinfo=NY).astimezone(timezone.utc))
-        self.assertEqual(agg[0].close, pre_rollover.close)
-        # 18:00 NY on Jan 5 opens the next trading day.
-        self.assertEqual(agg[1].timestamp, datetime(2026, 1, 5, 18, 0, tzinfo=NY).astimezone(timezone.utc))
-        self.assertEqual(agg[1].close, post_rollover.close)
-        self.assertEqual(agg[1].known_at, datetime(2026, 1, 6, 18, 0, tzinfo=NY).astimezone(timezone.utc))
-
-    def test_trading_day_uses_ny_calendar_not_utc_midnight(self):
-        # 20:00 UTC on Jan 5 is 15:00 NY (winter, UTC-5): still inside the trading
-        # day that opened 18:00 NY on Jan 4, well past UTC midnight.
-        bar = bar_at_ny(datetime(2026, 1, 5, 15, 0, tzinfo=NY), 1, 1, 1, 1, 1)
-        closer = bar_at_ny(datetime(2026, 1, 5, 18, 0, tzinfo=NY), 2, 2, 2, 2, 2)
-        [agg] = aggregate_bars([bar, closer], "1D")
-        self.assertEqual(agg.timestamp, datetime(2026, 1, 4, 18, 0, tzinfo=NY).astimezone(timezone.utc))
+    def test_trading_day_boundary_labels(self):
+        self.assertEqual(_trading_day_start(datetime(2026, 1, 5, 17, 59, tzinfo=NY)), datetime(2026, 1, 4, 18, 0, tzinfo=NY))
+        self.assertEqual(_trading_day_start(datetime(2026, 1, 5, 18, 0, tzinfo=NY)), datetime(2026, 1, 5, 18, 0, tzinfo=NY))
 
 
-class DstTransitionTests(unittest.TestCase):
-    def test_spring_forward_4h_bucket_has_correct_wall_clock_boundaries(self):
-        # 2026-03-08: US clocks jump 02:00 -> 03:00 NY. A 00:00-04:00 bucket
-        # spans only 3 real hours that day, but the boundary is still 04:00 wall clock.
-        start = datetime(2026, 3, 8, 0, 0, tzinfo=NY)
-        bars = minute_series(start, 2)
-        closer = bar_at_ny(datetime(2026, 3, 8, 4, 5, tzinfo=NY), 9, 9, 9, 9, 9)
-        agg = aggregate_bars(bars + [closer], "4H")
-        self.assertEqual(len(agg), 1)
-        self.assertEqual(agg[0].known_at.astimezone(NY), datetime(2026, 3, 8, 4, 0, tzinfo=NY))
-        # Real elapsed time for this bucket is 3 hours, not 4, because of the DST jump.
-        # (Subtract the fixed-offset UTC values, not NY-zoneinfo ones: CPython's aware
-        # datetime subtraction takes an identity-based shortcut when both operands
-        # share the same ZoneInfo object, which would silently give 4h here instead.)
-        elapsed_hours = (agg[0].known_at - agg[0].timestamp).total_seconds() / 3600
-        self.assertEqual(elapsed_hours, 3.0)
+class CompletenessTests(unittest.TestCase):
+    """Per PR #2 review: no bucket -- first, interior, or trailing -- may be
+    aggregated unless it contains every expected 1-minute bar."""
 
-    def test_fall_back_trading_day_spans_25_real_hours(self):
-        # 2026-11-01: US clocks fall back 02:00 -> 01:00 NY (extra hour).
-        # The CME trading day opening 18:00 NY on Oct 31 still ends 18:00 NY on Nov 1,
-        # but that wall-clock day is 25 real hours long.
-        opener = bar_at_ny(datetime(2026, 10, 31, 18, 0, tzinfo=NY), 1, 1, 1, 1, 1)
-        closer = bar_at_ny(datetime(2026, 11, 1, 18, 0, tzinfo=NY), 2, 2, 2, 2, 2)
-        [agg] = aggregate_bars([opener, closer], "1D")
-        elapsed_hours = (agg.known_at - agg.timestamp).total_seconds() / 3600
-        self.assertEqual(elapsed_hours, 25.0)
-        self.assertEqual(agg.known_at.astimezone(NY), datetime(2026, 11, 1, 18, 0, tzinfo=NY))
-
-
-class KnownAtSemanticsTests(unittest.TestCase):
-    def test_trailing_incomplete_bucket_is_not_returned(self):
+    def test_full_bucket_is_aggregated(self):
         start = datetime(2026, 1, 5, 9, 30, tzinfo=NY)
-        bars = minute_series(start, 4)  # only 4 of 5 minutes: bucket never closes
+        bars = minute_series_ny(start, 5)
+        agg = aggregate_bars(bars, "5m")
+        self.assertEqual(len(agg), 1)
+        self.assertEqual(agg[0].timestamp, start.astimezone(timezone.utc))
+
+    def test_partial_first_bucket_is_dropped(self):
+        # Input starts mid-bucket (09:30-09:35 window), so only 2 of 5 minutes exist.
+        start = datetime(2026, 1, 5, 9, 33, tzinfo=NY)
+        bars = minute_series_ny(start, 2)  # 09:33, 09:34 only
         self.assertEqual(aggregate_bars(bars, "5m"), [])
 
-    def test_interior_bucket_with_missing_minutes_still_closes(self):
+    def test_gap_inside_bucket_is_dropped(self):
         start = datetime(2026, 1, 5, 9, 30, tzinfo=NY)
-        # bucket 09:30-09:35 only has bars for :30 and :31 (gap at :32-:34), then
-        # bucket 09:35-09:40 is fully present: bucket A must still close, because a
-        # later bar proves wall-clock time has moved past its boundary.
+        # bucket 09:30-09:35 has only :30 and :31 (gap at :32-:34); next bucket is full.
         gappy = [bar_at_ny(start, 1, 1, 1, 1, 1), bar_at_ny(start + timedelta(minutes=1), 2, 2, 2, 2, 2)]
-        full_next = minute_series(start + timedelta(minutes=5), 5, price=200.0)
+        full_next = minute_series_ny(start + timedelta(minutes=5), 5, price=200.0)
         agg = aggregate_bars(gappy + full_next, "5m")
-        self.assertEqual(len(agg), 2)
-        self.assertEqual(agg[0].open, gappy[0].open)
-        self.assertEqual(agg[0].close, gappy[-1].close)
+        self.assertEqual(len(agg), 1)
+        self.assertEqual(agg[0].timestamp, (start + timedelta(minutes=5)).astimezone(timezone.utc))
+        self.assertEqual(agg[0].open, full_next[0].open)
+        self.assertEqual(agg[0].close, full_next[-1].close)
+
+    def test_boundary_split_does_not_borrow_bars_from_the_next_bucket(self):
+        # A full 09:30-09:35 bucket plus one bar already in 09:35-09:40: only the
+        # first bucket is complete and returned; the lone 09:35 bar is dropped.
+        start = datetime(2026, 1, 5, 9, 30, tzinfo=NY)
+        bucket_a = minute_series_ny(start, 5)
+        stray = [bar_at_ny(start + timedelta(minutes=5), 9, 9, 9, 9, 9)]
+        agg = aggregate_bars(bucket_a + stray, "5m")
+        self.assertEqual(len(agg), 1)
+        self.assertEqual(agg[0].close, bucket_a[-1].close)
 
     def test_empty_input_returns_empty_list(self):
         self.assertEqual(aggregate_bars([], "5m"), [])
@@ -152,7 +130,77 @@ class KnownAtSemanticsTests(unittest.TestCase):
     def test_unsupported_timeframe_raises(self):
         start = datetime(2026, 1, 5, 9, 30, tzinfo=NY)
         with self.assertRaises(ValueError):
-            aggregate_bars(minute_series(start, 5), "3m")
+            aggregate_bars(minute_series_ny(start, 5), "3m")
+
+
+class TradingDayTests(unittest.TestCase):
+    def test_full_trading_days_roll_over_at_18_00_ny(self):
+        day1_start = datetime(2026, 1, 4, 18, 0, tzinfo=NY)  # a full, non-DST trading day: 1440 min
+        day1 = minute_series_ny(day1_start, 1440)
+        day2 = minute_series_ny(day1_start + timedelta(days=1), 1440, price=200.0)
+        agg = aggregate_bars(day1 + day2, "1D")
+
+        self.assertEqual(len(agg), 2)
+        self.assertEqual(agg[0].timestamp, day1_start.astimezone(timezone.utc))
+        self.assertEqual(agg[0].open, day1[0].open)
+        self.assertEqual(agg[0].close, day1[-1].close)
+        self.assertEqual(agg[0].known_at, (day1_start + timedelta(days=1)).astimezone(timezone.utc))
+        self.assertEqual(agg[1].open, day2[0].open)
+
+
+class FourHourAnchorTests(unittest.TestCase):
+    def test_all_six_anchors_produce_complete_buckets(self):
+        day_start = datetime(2026, 1, 5, 18, 0, tzinfo=NY)  # non-DST trading day
+        bars = minute_series_ny(day_start, 1440)
+        agg = aggregate_bars(bars, "4H")
+        self.assertEqual(len(agg), 6)
+        expected_hours = [18, 22, 2, 6, 10, 14]
+        self.assertEqual([a.timestamp.astimezone(NY).hour for a in agg], expected_hours)
+        for a in agg:
+            self.assertEqual((a.known_at - a.timestamp).total_seconds() / 60, 240)
+
+
+class DstTransitionTests(unittest.TestCase):
+    def test_spring_forward_4h_bucket_needs_only_180_minutes(self):
+        # 2026-03-08: US clocks jump 02:00 -> 03:00 NY, so the 02:00-06:00 4H
+        # bucket (UTC 07:00-10:00 that day) spans only 3 real hours (180 minutes).
+        start_utc = datetime(2026, 3, 8, 7, 0, tzinfo=timezone.utc)
+        closer = [bar_at_utc(datetime(2026, 3, 8, 10, 5, tzinfo=timezone.utc))]
+
+        complete = minute_series_utc(start_utc, 180)
+        [agg] = aggregate_bars(complete + closer, "4H")
+        self.assertEqual((agg.known_at - agg.timestamp).total_seconds() / 60, 180)
+        self.assertEqual(agg.known_at.astimezone(NY), datetime(2026, 3, 8, 6, 0, tzinfo=NY))
+
+        one_short = minute_series_utc(start_utc, 179)
+        self.assertEqual(aggregate_bars(one_short + closer, "4H"), [])
+
+    def test_fall_back_4h_bucket_needs_300_minutes(self):
+        # 2026-11-01: US clocks fall back 02:00 -> 01:00 NY (repeated hour), so the
+        # 22:00-02:00 4H bucket (UTC 02:00-07:00 that day) spans 5 real hours (300 minutes).
+        start_utc = datetime(2026, 11, 1, 2, 0, tzinfo=timezone.utc)
+        closer = [bar_at_utc(datetime(2026, 11, 1, 7, 5, tzinfo=timezone.utc))]
+
+        complete = minute_series_utc(start_utc, 300)
+        [agg] = aggregate_bars(complete + closer, "4H")
+        self.assertEqual((agg.known_at - agg.timestamp).total_seconds() / 60, 300)
+
+        one_short = minute_series_utc(start_utc, 299)
+        self.assertEqual(aggregate_bars(one_short + closer, "4H"), [])
+
+    def test_fall_back_trading_day_needs_1500_minutes(self):
+        # The CME trading day opening 18:00 NY on Oct 31 still ends 18:00 NY on Nov 1,
+        # but that wall-clock day is 25 real hours (1500 minutes) long.
+        opener_utc = datetime(2026, 10, 31, 22, 0, tzinfo=timezone.utc)  # 18:00 NY EDT
+        closer = [bar_at_utc(datetime(2026, 11, 2, 0, 0, tzinfo=timezone.utc))]  # after next 18:00 NY EST
+
+        complete = minute_series_utc(opener_utc, 1500)
+        [agg] = aggregate_bars(complete + closer, "1D")
+        self.assertEqual((agg.known_at - agg.timestamp).total_seconds() / 60, 1500)
+        self.assertEqual(agg.known_at.astimezone(NY), datetime(2026, 11, 1, 18, 0, tzinfo=NY))
+
+        one_short = minute_series_utc(opener_utc, 1499)
+        self.assertEqual(aggregate_bars(one_short + closer, "1D"), [])
 
 
 if __name__ == "__main__":

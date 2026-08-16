@@ -26,7 +26,10 @@ class Bar1m:
     def __post_init__(self) -> None:
         if self.timestamp.tzinfo is None:
             raise ValueError(f"Bar1m.timestamp must be timezone-aware: {self.timestamp!r}")
-        if self.timestamp.utcoffset() != timezone.utc.utcoffset(None):
-            object.__setattr__(self, "timestamp", self.timestamp.astimezone(timezone.utc))
+        object.__setattr__(self, "timestamp", self.timestamp.astimezone(timezone.utc))
+        if self.timestamp.second != 0 or self.timestamp.microsecond != 0:
+            raise ValueError(
+                f"Bar1m.timestamp must fall exactly on a minute boundary (second=0, microsecond=0): {self.timestamp!r}"
+            )
         if not self.contract:
             raise ValueError("Bar1m.contract must be a non-empty source contract identifier")
