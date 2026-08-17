@@ -15,6 +15,7 @@ from tradelab.bias import (
 )
 from tradelab.data_wicks import DataWickDetectionResult, DataWickEvent, DataWickDirection, detect_data_wicks
 from tradelab.fvg import Candle, FVGDetectionResult, FVGEvent, FVGStatus, FVGZone, detect_fvgs, from_aggregated_bar, from_bar1m
+from tradelab.fvg_entry import FVGEntryCandidate, FVGEntryCandidateResult, SourceType, detect_fvg_entry_candidates
 from tradelab.fvg_touch import FVGContactType, FVGTouchDetectionResult, FVGTouchEvent, detect_fvg_touch_events
 from tradelab.liquidity import (
     LiquidityDetectionResult,
@@ -95,4 +96,8 @@ __all__ = [
     "LiquidityEntryCandidate",
     "LiquidityEntryCandidateResult",
     "detect_liquidity_entry_candidates",
+    "SourceType",
+    "FVGEntryCandidate",
+    "FVGEntryCandidateResult",
+    "detect_fvg_entry_candidates",
 ]
