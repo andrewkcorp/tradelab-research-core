@@ -4,6 +4,15 @@ Research-only. No broker connectivity, no live execution, no network calls.
 """
 from tradelab.bar import Bar1m
 from tradelab.aggregate import AggregatedBar, aggregate_bars
+from tradelab.bias import (
+    BiasSnapshot,
+    ConfluenceSource,
+    ConfluenceType,
+    HTFBiasResult,
+    TimeframeBiasChange,
+    bias_at,
+    compute_htf_bias,
+)
 from tradelab.data_wicks import DataWickDetectionResult, DataWickEvent, DataWickDirection, detect_data_wicks
 from tradelab.fvg import Candle, FVGDetectionResult, FVGEvent, FVGStatus, FVGZone, detect_fvgs, from_aggregated_bar, from_bar1m
 from tradelab.liquidity import (
@@ -60,4 +69,11 @@ __all__ = [
     "DataWickDirection",
     "DataWickDetectionResult",
     "detect_data_wicks",
+    "ConfluenceType",
+    "ConfluenceSource",
+    "TimeframeBiasChange",
+    "HTFBiasResult",
+    "BiasSnapshot",
+    "compute_htf_bias",
+    "bias_at",
 ]
