@@ -4,6 +4,7 @@ Research-only. No broker connectivity, no live execution, no network calls.
 """
 from tradelab.bar import Bar1m
 from tradelab.aggregate import AggregatedBar, aggregate_bars
+from tradelab.data_wicks import DataWickDetectionResult, DataWickEvent, DataWickDirection, detect_data_wicks
 from tradelab.fvg import Candle, FVGDetectionResult, FVGEvent, FVGStatus, FVGZone, detect_fvgs, from_aggregated_bar, from_bar1m
 from tradelab.liquidity import (
     LiquidityDetectionResult,
@@ -55,4 +56,8 @@ __all__ = [
     "LiquidityDetectionResult",
     "detect_liquidity",
     "detect_session_liquidity",
+    "DataWickEvent",
+    "DataWickDirection",
+    "DataWickDetectionResult",
+    "detect_data_wicks",
 ]

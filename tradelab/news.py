@@ -14,10 +14,10 @@ computable before the number is even published, so it is driven purely by
 ``scheduled_at`` -- ``NewsEvent`` has no actual/forecast fields to be
 misused for that decision, or at all.
 
-Out of scope for v1, on purpose:
+Out of scope for this module, on purpose:
 - Data wicks (unusually large 1-minute candles around a release) are a
-  separate, future module that will *consume* ``NewsEvent`` as an input;
-  nothing here detects or scores price reaction.
+  separate module, ``tradelab.data_wicks``, that *consumes* ``NewsEvent``
+  as an input; nothing here detects or scores price reaction.
 - CME holidays / early closes are a market-session concept
   (``tradelab.session_calendar``), not a property of a news event. A
   release can be scheduled on a day the market calendar doesn't recognize;
