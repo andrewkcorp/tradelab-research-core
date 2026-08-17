@@ -192,7 +192,7 @@ class EqualHighsLowsTests(unittest.TestCase):
         # separately-confirmed swing (100.1) falls right back inside its
         # old band.
         candles = self._two_swing_highs(0.2) + [
-            candle(6, 100.0, 100.2, 99.9, 100.0),  # takes the [100.0, 100.2] cluster (high >= 100.2)
+            candle(6, 100.0, 100.25, 99.9, 100.0),  # takes the [100.0, 100.2] cluster (high > 100.2, exceeds by 1 tick)
             candle(7, 99.8, 99.9, 99.5, 99.7),
             candle(8, 99.7, 99.8, 99.4, 99.6),
             candle(9, 99.6, 99.7, 99.3, 99.5),
@@ -231,6 +231,95 @@ class TakeTests(unittest.TestCase):
         ]
         result = detect_liquidity(candles, "1m", pivot_strength=1, reclaim_window_bars=3)
         self.assertEqual(len(result.takes), 1)
+
+
+class TakeBoundaryTests(unittest.TestCase):
+    """Take requires the wick to strictly exceed the level's outer boundary
+    -- an exact touch does not collect liquidity and does not consume it."""
+
+    def _two_swing_highs(self, gap: float) -> list[Candle]:
+        return [
+            candle(0, 99, 99.2, 98.8, 99),
+            candle(1, 99.3, 100.0, 98.9, 99.5),  # swing high = 100.0
+            candle(2, 99.5, 99.6, 99.0, 99.2),
+            candle(3, 99.6, 99.7, 99.1, 99.3),
+            candle(4, 99.8, 100.0 + gap, 99.4, 100.0),  # swing high = 100.0 + gap
+            candle(5, 99.9, 100.0, 99.5, 99.7),
+        ]
+
+    def _two_swing_lows(self, gap: float) -> list[Candle]:
+        return [
+            candle(0, 99.5, 99.8, 99.3, 99.5),
+            candle(1, 99.2, 99.5, 99.0, 99.3),  # swing low = 99.0
+            candle(2, 99.4, 99.6, 99.2, 99.5),
+            candle(3, 99.3, 99.5, 99.1, 99.4),
+            candle(4, 99.1, 99.3, 99.0 - gap, 99.0),  # swing low = 99.0 - gap
+            candle(5, 99.2, 99.4, 99.0, 99.3),
+        ]
+
+    def test_high_exactly_equal_to_swing_high_level_is_not_taken(self):
+        candles = swing_high_series(pivot_strength=1, pivot_high=100.0) + [
+            candle(4, 99.9, 100.0, 99.8, 99.9),  # high == 100.0 exactly
+        ]
+        result = detect_liquidity(candles, "1m", pivot_strength=1, reclaim_window_bars=3)
+        self.assertEqual(result.levels[0].status, LiquidityStatus.ACTIVE)
+        self.assertEqual(result.takes, [])
+
+    def test_low_exactly_equal_to_swing_low_level_is_not_taken(self):
+        candles = swing_low_series(pivot_strength=1, pivot_low=99.0) + [
+            candle(4, 99.1, 99.2, 99.0, 99.1),  # low == 99.0 exactly
+        ]
+        result = detect_liquidity(candles, "1m", pivot_strength=1, reclaim_window_bars=3)
+        self.assertEqual(result.levels[0].status, LiquidityStatus.ACTIVE)
+        self.assertEqual(result.takes, [])
+
+    def test_high_exactly_equal_to_equal_highs_band_upper_is_not_taken(self):
+        candles = self._two_swing_highs(0.2) + [  # band = [100.0, 100.2]
+            candle(6, 100.0, 100.2, 99.9, 100.0),  # high == upper (100.2) exactly
+        ]
+        result = detect_liquidity(candles, "1m", pivot_strength=1, reclaim_window_bars=3, tick_size=TICK)
+        cluster = next(lv for lv in result.levels if lv.liquidity_type == LiquidityType.EQUAL_HIGHS)
+        self.assertEqual(cluster.status, LiquidityStatus.ACTIVE)
+
+    def test_low_exactly_equal_to_equal_lows_band_lower_is_not_taken(self):
+        candles = self._two_swing_lows(0.2) + [  # band = [98.8, 99.0]
+            candle(6, 99.0, 99.1, 98.8, 99.0),  # low == lower (98.8) exactly
+        ]
+        result = detect_liquidity(candles, "1m", pivot_strength=1, reclaim_window_bars=3, tick_size=TICK)
+        cluster = next(lv for lv in result.levels if lv.liquidity_type == LiquidityType.EQUAL_LOWS)
+        self.assertEqual(cluster.status, LiquidityStatus.ACTIVE)
+
+    def test_exceeding_by_the_smallest_tick_takes_the_swing_high(self):
+        candles = swing_high_series(pivot_strength=1, pivot_high=100.0) + [
+            candle(4, 99.9, 100.0 + TICK, 99.8, 99.9),  # high exceeds by exactly 1 tick
+        ]
+        result = detect_liquidity(candles, "1m", pivot_strength=1, reclaim_window_bars=3, tick_size=TICK)
+        self.assertEqual(result.levels[0].status, LiquidityStatus.TAKEN)
+        self.assertEqual(len(result.takes), 1)
+
+    def test_exceeding_by_the_smallest_tick_takes_the_swing_low(self):
+        candles = swing_low_series(pivot_strength=1, pivot_low=99.0) + [
+            candle(4, 99.1, 99.2, 99.0 - TICK, 99.1),  # low exceeds by exactly 1 tick
+        ]
+        result = detect_liquidity(candles, "1m", pivot_strength=1, reclaim_window_bars=3, tick_size=TICK)
+        self.assertEqual(result.levels[0].status, LiquidityStatus.TAKEN)
+        self.assertEqual(len(result.takes), 1)
+
+    def test_exceeding_equal_highs_band_upper_by_the_smallest_tick_takes_it(self):
+        candles = self._two_swing_highs(0.2) + [  # band = [100.0, 100.2]
+            candle(6, 100.0, 100.2 + TICK, 99.9, 100.0),  # high exceeds upper by exactly 1 tick
+        ]
+        result = detect_liquidity(candles, "1m", pivot_strength=1, reclaim_window_bars=3, tick_size=TICK)
+        cluster = next(lv for lv in result.levels if lv.liquidity_type == LiquidityType.EQUAL_HIGHS)
+        self.assertEqual(cluster.status, LiquidityStatus.TAKEN)
+
+    def test_exceeding_equal_lows_band_lower_by_the_smallest_tick_takes_it(self):
+        candles = self._two_swing_lows(0.2) + [  # band = [98.8, 99.0]
+            candle(6, 99.0, 99.1, 98.8 - TICK, 99.0),  # low exceeds lower by exactly 1 tick
+        ]
+        result = detect_liquidity(candles, "1m", pivot_strength=1, reclaim_window_bars=3, tick_size=TICK)
+        cluster = next(lv for lv in result.levels if lv.liquidity_type == LiquidityType.EQUAL_LOWS)
+        self.assertEqual(cluster.status, LiquidityStatus.TAKEN)
 
 
 class ReclaimTests(unittest.TestCase):

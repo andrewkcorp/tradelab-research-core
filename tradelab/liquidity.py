@@ -30,12 +30,14 @@ redundant level for the same zone. Swings may come from different days;
 there is no time-based expiry on cluster eligibility.
 
 Take (6.1/6.2, mechanically confirmed here): a level is taken by the first
-later candle whose wick reaches or crosses its outer boundary -- no close
-requirement of any kind. A swing high / equal-highs level is taken when a
-candle's high reaches or exceeds the level's upper boundary; a swing low /
-equal-lows level when a candle's low reaches or falls below the lower
-boundary. The take is known at that candle's close. The first take
-consumes the level (terminal; it is never "taken" a second time).
+later candle whose wick strictly exceeds its outer boundary -- a wick that
+only touches the level (high == upper, or low == lower) does not collect
+it, and there is no close requirement of any kind. A swing high /
+equal-highs level is taken when a candle's high is strictly greater than
+the level's upper boundary; a swing low / equal-lows level when a
+candle's low is strictly less than the lower boundary. The take is known
+at that candle's close. The first take consumes the level (terminal; it
+is never "taken" a second time).
 
 Reclaim: a separate, multi-candle feature evaluated only on candles after
 the take candle (never the take candle itself), within a
@@ -338,9 +340,12 @@ def _is_swing_low(candles: list[Candle], pivot_index: int, pivot_strength: int) 
 
 
 def _is_taken(level: LiquidityLevel, candle: Candle) -> bool:
+    """A level is taken only when a wick strictly *exceeds* its outer
+    boundary -- a wick that merely touches the level (high == upper /
+    low == lower) does not collect it and does not consume it."""
     if level.side == HIGH:
-        return candle.high >= level.upper
-    return candle.low <= level.lower
+        return candle.high > level.upper
+    return candle.low < level.lower
 
 
 def _check_reclaim(level: LiquidityLevel, candle: Candle, bars_after_take: int) -> ReclaimResult | None:
