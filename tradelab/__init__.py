@@ -57,6 +57,15 @@ from tradelab.sl_targets import (
     SelectedFVGConfluence,
     detect_sl_target_candidates,
 )
+from tradelab.strategy_spec import (
+    BiasPolicy,
+    SLChoice,
+    StrategySpec,
+    TPChoice,
+    iter_strategy_specs,
+    selector_fixed_direction,
+    selector_timeframe,
+)
 from tradelab.tp_targets import (
     LiquiditySourceFamily,
     MarketEntryContext,
@@ -144,4 +153,11 @@ __all__ = [
     "SLTargetCandidate",
     "SLTargetCandidateResult",
     "detect_sl_target_candidates",
+    "BiasPolicy",
+    "TPChoice",
+    "SLChoice",
+    "StrategySpec",
+    "iter_strategy_specs",
+    "selector_timeframe",
+    "selector_fixed_direction",
 ]
