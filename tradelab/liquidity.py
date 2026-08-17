@@ -20,14 +20,27 @@ the ``pivot_strength`` candles immediately to its left AND to its right
 (swing low: symmetric, strictly lower). It becomes known only once the
 last confirming candle on the right has closed.
 
-Equal highs/lows (6.2): a subtype of liquidity, not a separate confluence.
-Formed from 2+ confirmed same-side swings whose prices all fall within a
-band of at most ``2 * tick_size``. A cluster is created the moment a
-second qualifying swing appears (band = [min, max] of the two prices,
-``known_at`` = that second swing's confirmation time) and further
+Equal highs/lows (6.2): a subtype of liquidity, not a separate, parallel
+confluence. Formed from 2+ confirmed same-side swings whose prices all
+fall within a band of at most ``2 * tick_size``. A cluster is created the
+moment a second qualifying swing appears (band = [min, max] of the two
+prices, ``known_at`` = that second swing's confirmation time) and further
 qualifying swings only grow ``member_count`` and the band -- never a new,
 redundant level for the same zone. Swings may come from different days;
 there is no time-based expiry on cluster eligibility.
+
+The instant a swing becomes a cluster member (whether it forms the
+cluster or joins an already-open one), its own standalone swing level
+stops being independently active: its status becomes
+``ABSORBED_IN_EQUAL_CLUSTER`` with ``absorbed_by_level_id`` pointing at
+the cluster, it is removed from the active-level set, and from that
+point on only the cluster itself can be taken or start a reclaim watch.
+This keeps one physical price sweep from being reported as two events
+(one for the cluster, one for a member swing) -- absorbed levels remain
+in the full audit trail (``LiquidityDetectionResult.levels``) but never
+appear in ``takes`` or ``reclaims`` again. A swing that is taken before
+it ever pairs into a cluster is equally final: a taken level can never
+later be absorbed into, or used to form, an equal-highs/lows cluster.
 
 Take (6.1/6.2, mechanically confirmed here): a level is taken by the first
 later candle whose wick strictly exceeds its outer boundary -- a wick that
@@ -81,6 +94,7 @@ class LiquidityType(str, Enum):
 class LiquidityStatus(str, Enum):
     ACTIVE = "active"
     TAKEN = "taken"
+    ABSORBED_IN_EQUAL_CLUSTER = "absorbed_in_equal_cluster"
 
 
 class ReclaimOutcome(str, Enum):
@@ -98,6 +112,12 @@ class LiquidityLevel:
     equal-highs/lows cluster they are the band's bounds. ``member_timestamps``
     holds the open time of each contributing swing candle, in join order --
     one entry for a plain swing, two or more for a cluster.
+
+    ``absorbed_by_level_id`` is set only when ``status`` is
+    ``ABSORBED_IN_EQUAL_CLUSTER``: it names the ``level_id`` of the
+    equal-highs/lows cluster this swing became a member of. An absorbed
+    level stays in the full audit trail but is no longer independently
+    active -- it cannot be taken and cannot start its own reclaim watch.
     """
 
     level_id: str
@@ -111,6 +131,7 @@ class LiquidityLevel:
     formed_at: datetime  # known_at of the candle that confirmed this level
     status: LiquidityStatus
     taken_at: datetime | None
+    absorbed_by_level_id: str | None
 
 
 @dataclass(frozen=True)
@@ -259,6 +280,13 @@ def detect_liquidity(
                 if level.liquidity_type in (LiquidityType.EQUAL_HIGHS, LiquidityType.EQUAL_LOWS):
                     side_clusters = open_clusters[level.side]
                     open_clusters[level.side] = [c for c in side_clusters if c.level.level_id != level_id]
+                else:
+                    # A taken plain swing is equally terminal for clustering
+                    # purposes: it must never be pulled off the unclustered
+                    # pool to form an equal-highs/lows cluster after the
+                    # fact.
+                    side_unclustered = unclustered[level.side]
+                    unclustered[level.side] = [lv for lv in side_unclustered if lv.level_id != level_id]
         reclaim_watches.extend(newly_taken_watches)
 
         # 3. Check whether a swing is confirmed as of this candle (the
@@ -289,16 +317,18 @@ def detect_liquidity(
                     formed_at=candle.known_at,
                     status=LiquidityStatus.ACTIVE,
                     taken_at=None,
+                    absorbed_by_level_id=None,
                 )
                 active_levels[level_id] = swing_level
                 all_levels[level_id] = swing_level
 
+                # This swing may immediately become an equal-highs/lows
+                # cluster member; if so, it stops being independently
+                # active (see _join_or_form_cluster).
                 next_number = _join_or_form_cluster(
                     side=side,
                     liquidity_type=LiquidityType.EQUAL_HIGHS if side == HIGH else LiquidityType.EQUAL_LOWS,
-                    price=price,
-                    pivot_timestamp=pivot_candle.timestamp,
-                    formed_at=candle.known_at,
+                    swing_level=swing_level,
                     band_width=band_width,
                     timeframe=timeframe,
                     open_clusters=open_clusters[side],
@@ -374,13 +404,31 @@ def _check_reclaim(level: LiquidityLevel, candle: Candle, bars_after_take: int) 
     )
 
 
+def _absorb_into_cluster(
+    level_id: str,
+    absorbed_by_level_id: str,
+    active_levels: dict[str, LiquidityLevel],
+    all_levels: dict[str, LiquidityLevel],
+) -> None:
+    """A swing that has just become an equal-highs/lows cluster member
+    stops being independently active: it can no longer be taken, and it
+    can no longer start its own reclaim watch. It stays visible in the
+    full audit trail (``all_levels``) as ABSORBED_IN_EQUAL_CLUSTER, linked
+    back to the cluster that absorbed it."""
+    level = active_levels.pop(level_id)
+    absorbed_level = replace(
+        level,
+        status=LiquidityStatus.ABSORBED_IN_EQUAL_CLUSTER,
+        absorbed_by_level_id=absorbed_by_level_id,
+    )
+    all_levels[level_id] = absorbed_level
+
+
 def _join_or_form_cluster(
     *,
     side: str,
     liquidity_type: LiquidityType,
-    price: float,
-    pivot_timestamp: datetime,
-    formed_at: datetime,
+    swing_level: LiquidityLevel,
     band_width: float,
     timeframe: str,
     open_clusters: list[_OpenCluster],
@@ -389,10 +437,20 @@ def _join_or_form_cluster(
     all_levels: dict[str, LiquidityLevel],
     next_number: int,
 ) -> int:
-    """Try to join ``price`` into an existing (still-ACTIVE) cluster, else
-    try to pair it with a lone unclustered swing to form a new cluster,
-    else record it as a new lone unclustered swing. Returns the possibly-
-    incremented zone-numbering counter."""
+    """Try to join ``swing_level`` into an existing (still-ACTIVE) cluster,
+    else try to pair it with a lone unclustered swing to form a new
+    cluster, else record it as a new lone unclustered swing. Returns the
+    possibly-incremented zone-numbering counter.
+
+    Whenever ``swing_level`` (or, when a new cluster is formed, the lone
+    swing it pairs with) becomes a cluster member, that swing is absorbed
+    (see ``_absorb_into_cluster``) so the same physical level is never
+    reported as both an independent swing and a cluster.
+    """
+    price = swing_level.upper  # == .lower for a plain swing
+    pivot_timestamp = swing_level.member_timestamps[0]
+    formed_at = swing_level.formed_at
+
     for cluster in open_clusters:
         new_lower = min(cluster.lower, price)
         new_upper = max(cluster.upper, price)
@@ -410,6 +468,7 @@ def _join_or_form_cluster(
             cluster.level = updated_level
             active_levels[updated_level.level_id] = updated_level
             all_levels[updated_level.level_id] = updated_level
+            _absorb_into_cluster(swing_level.level_id, updated_level.level_id, active_levels, all_levels)
             return next_number
 
     for lone_index, lone in enumerate(unclustered):
@@ -432,6 +491,7 @@ def _join_or_form_cluster(
                 formed_at=formed_at,
                 status=LiquidityStatus.ACTIVE,
                 taken_at=None,
+                absorbed_by_level_id=None,
             )
             active_levels[level_id] = cluster_level
             all_levels[level_id] = cluster_level
@@ -445,23 +505,13 @@ def _join_or_form_cluster(
                     level=cluster_level,
                 )
             )
+            _absorb_into_cluster(lone.level_id, level_id, active_levels, all_levels)
+            _absorb_into_cluster(swing_level.level_id, level_id, active_levels, all_levels)
             return next_number
 
-    unclustered.append(
-        LiquidityLevel(
-            level_id="",  # a lone candidate is never published as its own level; placeholder only
-            timeframe=timeframe,
-            liquidity_type=liquidity_type,
-            side=side,
-            lower=price,
-            upper=price,
-            member_count=1,
-            member_timestamps=(pivot_timestamp,),
-            formed_at=formed_at,
-            status=LiquidityStatus.ACTIVE,
-            taken_at=None,
-        )
-    )
+    # No match: this swing remains a standalone ACTIVE level and becomes
+    # the new lone candidate for a future pairing.
+    unclustered.append(swing_level)
     return next_number
 
 
