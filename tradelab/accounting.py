@@ -70,6 +70,7 @@ opened and then somehow avoided its own entry fee.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 
 from tradelab.backtest import BacktestResult, ExecutedTrade, TradeExitReason
@@ -131,12 +132,22 @@ class AccountedTrade:
     contract sizing and USD P&L applied. ``gross_pnl_usd``/``net_pnl_
     usd`` are ``None`` only when the underlying trade's own ``exit_
     reason`` is ``OPEN_UNRESOLVED`` -- ``entry_cost_usd`` is still
-    charged either way (see module docstring)."""
+    charged either way (see module docstring).
+
+    ``entry_timestamp``/``exit_timestamp`` are copied straight from the
+    underlying ``ExecutedTrade`` (``exit_timestamp`` is ``None`` for the
+    same ``OPEN_UNRESOLVED`` case) -- audit fields only, added so
+    ``tradelab.equity`` can build a cash-flow timeline without any
+    further lookup back into the original ``BacktestResult``. Nothing
+    about the sizing/P&L computation above changes because of them.
+    """
 
     trade_id: str
     strategy_id: str
     direction: str
     instrument: Instrument
+    entry_timestamp: datetime
+    exit_timestamp: datetime | None
     entry_price: float
     sl_price: float
     tp_price: float
@@ -221,6 +232,8 @@ def apply_accounting(backtest_result: BacktestResult, instrument: Instrument, ri
                 strategy_id=trade.strategy_id,
                 direction=trade.direction,
                 instrument=instrument,
+                entry_timestamp=trade.entry_timestamp,
+                exit_timestamp=trade.exit_timestamp,
                 entry_price=trade.entry_price,
                 sl_price=trade.sl_price,
                 tp_price=trade.tp_price,

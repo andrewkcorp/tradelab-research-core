@@ -44,6 +44,13 @@ from tradelab.entry_signal_timeline import (
     build_entry_signal_timeline,
     query_active_signals,
 )
+from tradelab.equity import (
+    EquityConfig,
+    EquityEventType,
+    EquityPoint,
+    EquityResult,
+    build_equity_curve,
+)
 from tradelab.fvg import Candle, FVGDetectionResult, FVGEvent, FVGStatus, FVGZone, detect_fvgs, from_aggregated_bar, from_bar1m
 from tradelab.fvg_entry import FVGEntryCandidate, FVGEntryCandidateResult, SourceType, detect_fvg_entry_candidates
 from tradelab.fvg_touch import FVGContactType, FVGTouchDetectionResult, FVGTouchEvent, detect_fvg_touch_events
@@ -210,4 +217,9 @@ __all__ = [
     "TradeStatus",
     "TradeExecutionResult",
     "simulate_trade",
+    "EquityConfig",
+    "EquityEventType",
+    "EquityPoint",
+    "EquityResult",
+    "build_equity_curve",
 ]
