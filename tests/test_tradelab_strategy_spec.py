@@ -14,6 +14,7 @@ import itertools
 import json
 import types
 import unittest
+from unittest import mock
 
 from tradelab.sl_targets import SLSourceType
 from tradelab.tp_targets import TPSourceType
@@ -300,6 +301,42 @@ class GeneratorLazinessTests(unittest.TestCase):
         self.assertTrue(specs)
         for s in specs:
             self.assertEqual(s.required_confluence_selectors, ())
+
+    def test_first_result_pulled_without_enumerating_the_full_confluence_combination_space(self):
+        """Proves the fix for the eager confluence_combos materialization
+        bug: a 30-selector pool with max_required_confluences=15 alone has
+        C(30, 15) ~ 155 million size-15 subsets. If iter_strategy_specs
+        still built the full combination set (any size) before yielding
+        its first result, this would have to actually construct an
+        enormous number of itertools.combinations items up front. We wrap
+        the module's own `combinations` with a counting proxy and assert
+        only a handful of items were ever produced to reach result #1."""
+        real_combinations = itertools.combinations
+        yielded = {"count": 0}
+
+        def counting_combinations(iterable, r):
+            for item in real_combinations(iterable, r):
+                yielded["count"] += 1
+                yield item
+
+        large_pool = tuple(f"pool-item-{i}" for i in range(30))
+        with mock.patch("tradelab.strategy_spec.combinations", counting_combinations):
+            gen = iter_strategy_specs(
+                directions=[LONG],
+                primary_entry_selectors=[FVG_1M_TOUCH],
+                confluence_selector_pool=large_pool,
+                max_required_confluences=15,
+                bias_policies=[BiasPolicy.IGNORE],
+                tp_choices=[tp_liq(1)],
+                sl_choices=[sl_liq(1)],
+            )
+            first = next(gen)
+
+        self.assertEqual(first.required_confluence_selectors, ())
+        # Only the trivial size-0 combination (the empty tuple) was needed
+        # to reach the first result -- nowhere near the full C(30, 15)
+        # (or even C(30, 1)) combination space.
+        self.assertLess(yielded["count"], 10)
 
 
 class GeneratorDeterminismTests(unittest.TestCase):

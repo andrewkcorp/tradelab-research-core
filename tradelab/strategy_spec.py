@@ -341,6 +341,20 @@ class StrategySpec:
         }
 
 
+def _confluence_combinations(pool: tuple[str, ...], max_required: int) -> Iterator[tuple[str, ...]]:
+    """Lazily yield every subset of ``pool``, size 0 (``()``) first, then
+    every size-1 subset, then size-2, and so on up to ``max_required`` --
+    one ``itertools.combinations`` generator at a time, via ``yield
+    from``, so a caller pulling only the first few results never forces
+    this to build the full combination set. For a large pool and a large
+    ``max_required`` that full set can be astronomically large even
+    though no materialized list of it is ever kept -- e.g. a 30-selector
+    pool with ``max_required=15`` alone is ``C(30, 15)`` (~155 million)
+    combinations of that one size."""
+    for k in range(0, max_required + 1):
+        yield from combinations(pool, k)
+
+
 def _build_strategy_id(
     direction: str,
     primary_entry_selector: str,
@@ -397,26 +411,32 @@ def iter_strategy_specs(
     tp_choices = tuple(tp_choices)
     sl_choices = tuple(sl_choices)
 
-    confluence_combos: list[tuple[str, ...]] = []
-    for k in range(0, max_required_confluences + 1):
-        confluence_combos.extend(combinations(pool, k))
-
-    for direction, primary, confluence, bias_policy, tp_choice, sl_choice in product(
-        directions, primary_entry_selectors, confluence_combos, bias_policies, tp_choices, sl_choices
-    ):
-        if primary in confluence:
-            continue
-        try:
-            strategy_id = _build_strategy_id(direction, primary, confluence, bias_policy, tp_choice, sl_choice)
-            spec = StrategySpec(
-                strategy_id=strategy_id,
-                direction=direction,
-                primary_entry_selector=primary,
-                required_confluence_selectors=confluence,
-                bias_policy=bias_policy,
-                tp_choice=tp_choice,
-                sl_choice=sl_choice,
-            )
-        except ValueError:
-            continue
-        yield spec
+    # itertools.product materializes every one of its own arguments into a
+    # tuple up front (it has to, since it replays each pool once per outer
+    # combination) -- so the confluence dimension is deliberately kept out
+    # of any product() call and walked with its own lazy generator instead,
+    # in an explicit nested loop. The remaining five dimensions are always
+    # meant to be small, bounded parameter spaces (directions, selectors,
+    # bias policies, TP/SL choices), so materializing *those* into tuples
+    # is expected and harmless -- only the confluence subset space can
+    # realistically explode combinatorially.
+    for direction in directions:
+        for primary in primary_entry_selectors:
+            for confluence in _confluence_combinations(pool, max_required_confluences):
+                if primary in confluence:
+                    continue
+                for bias_policy, tp_choice, sl_choice in product(bias_policies, tp_choices, sl_choices):
+                    try:
+                        strategy_id = _build_strategy_id(direction, primary, confluence, bias_policy, tp_choice, sl_choice)
+                        spec = StrategySpec(
+                            strategy_id=strategy_id,
+                            direction=direction,
+                            primary_entry_selector=primary,
+                            required_confluence_selectors=confluence,
+                            bias_policy=bias_policy,
+                            tp_choice=tp_choice,
+                            sl_choice=sl_choice,
+                        )
+                    except ValueError:
+                        continue
+                    yield spec
