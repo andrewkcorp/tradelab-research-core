@@ -74,6 +74,13 @@ from tradelab.tp_targets import (
     TPTargetCandidateResult,
     detect_tp_target_candidates,
 )
+from tradelab.trade_execution import (
+    MarketTradeRequest,
+    TickPriceEvent,
+    TradeExecutionResult,
+    TradeStatus,
+    simulate_trade,
+)
 from tradelab.validation import MissingMinutesGap, ValidationResult, validate_bars
 
 __all__ = [
@@ -160,4 +167,9 @@ __all__ = [
     "iter_strategy_specs",
     "selector_timeframe",
     "selector_fixed_direction",
+    "TickPriceEvent",
+    "MarketTradeRequest",
+    "TradeStatus",
+    "TradeExecutionResult",
+    "simulate_trade",
 ]
