@@ -285,6 +285,41 @@ class NoLookaheadAndKnownAtTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             detect_fvgs([c0, c1, c2, out_of_order], "1m")
 
+    def test_increasing_timestamps_with_decreasing_known_at_is_rejected(self):
+        # Each candle individually has known_at > its own timestamp, but the
+        # second candle's known_at is earlier than the first's -- timestamps
+        # alone increasing is not enough to rule out lookahead.
+        c1 = candle(0, 100.0, 100.0, 99.0, 99.5, known_offset_minutes=10)
+        c2 = candle(1, 100.5, 101.0, 100.2, 100.8, known_offset_minutes=2)
+        with self.assertRaises(ValueError):
+            detect_fvgs([c1, c2], "1m")
+
+    def test_third_candle_known_far_in_future_then_earlier_known_at_is_rejected(self):
+        # Regression: the third candle forms an FVG but is (malformed-input)
+        # known far in the future; the next candle has an earlier known_at.
+        # The detector must reject this outright rather than evaluate the
+        # zone's lifecycle against a candle "known" before the zone itself.
+        c1 = candle(0, 100.0, 100.0, 99.0, 99.5, known_offset_minutes=1)
+        c2 = candle(1, 100.5, 101.0, 100.2, 100.8, known_offset_minutes=2)
+        c3 = candle(2, 101.55, 101.75, 101.25, 101.6, known_offset_minutes=100)  # forms zone, known far ahead
+        c4 = candle(3, 100.8, 100.9, 99.9, 99.5, known_offset_minutes=4)  # would invert the zone, if evaluated
+        with self.assertRaises(ValueError):
+            detect_fvgs([c1, c2, c3, c4], "1m")
+
+
+class CandleKnownAtValidationTests(unittest.TestCase):
+    def test_known_at_equal_to_timestamp_is_rejected(self):
+        with self.assertRaises(ValueError):
+            Candle(T0, 100.0, 100.5, 99.5, 100.0, T0)
+
+    def test_known_at_before_timestamp_is_rejected(self):
+        with self.assertRaises(ValueError):
+            Candle(T0, 100.0, 100.5, 99.5, 100.0, T0 - timedelta(minutes=1))
+
+    def test_known_at_after_timestamp_is_accepted(self):
+        c = Candle(T0, 100.0, 100.5, 99.5, 100.0, T0 + timedelta(minutes=1))
+        self.assertGreater(c.known_at, c.timestamp)
+
 
 if __name__ == "__main__":
     unittest.main()

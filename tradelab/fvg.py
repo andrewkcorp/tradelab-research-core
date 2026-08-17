@@ -108,6 +108,11 @@ class Candle:
             raise ValueError(f"Candle.known_at must be timezone-aware: {self.known_at!r}")
         object.__setattr__(self, "timestamp", self.timestamp.astimezone(timezone.utc))
         object.__setattr__(self, "known_at", self.known_at.astimezone(timezone.utc))
+        if self.known_at <= self.timestamp:
+            raise ValueError(
+                f"Candle.known_at ({self.known_at!r}) must be strictly after timestamp "
+                f"({self.timestamp!r}): a candle cannot be known before or at its own open"
+            )
 
 
 def from_bar1m(bar) -> Candle:
@@ -186,10 +191,15 @@ def detect_fvgs(candles: list[Candle], timeframe: str, *, tick_size: float = DEF
     """Detect FVGs and iFVG events on a chronological series of same-timeframe candles.
 
     ``candles`` must already be a single native timeframe's closed bars in
-    strictly increasing order (by ``timestamp``); this function never
-    aggregates or mixes timeframes. Every candle is only evaluated against
-    zones that already existed before it, and a zone formed on a given
-    candle is only ever evaluated starting with the next candle.
+    strictly increasing order, both by ``timestamp`` and by ``known_at``
+    (rejecting the latter is what actually guards against lookahead: two
+    candles could have increasing open times yet an out-of-order or
+    repeated known_at in malformed/synthetic input, which would let a
+    later-confirmed candle be evaluated as if it were already knowable).
+    This function never aggregates or mixes timeframes. Every candle is
+    only evaluated against zones that already existed before it, and a
+    zone formed on a given candle is only ever evaluated starting with
+    the next candle.
     """
     if timeframe not in SUPPORTED_TIMEFRAMES:
         raise ValueError(f"Unsupported timeframe {timeframe!r}; expected one of {sorted(SUPPORTED_TIMEFRAMES)}")
@@ -202,11 +212,19 @@ def detect_fvgs(candles: list[Candle], timeframe: str, *, tick_size: float = DEF
     events: list[FVGEvent] = []
     next_zone_number = 1
     previous_timestamp: datetime | None = None
+    previous_known_at: datetime | None = None
 
     for index, candle in enumerate(candles):
         if previous_timestamp is not None and candle.timestamp <= previous_timestamp:
             raise ValueError(f"Candles must be strictly ordered by timestamp; got {candle.timestamp} after {previous_timestamp}")
+        if previous_known_at is not None and candle.known_at <= previous_known_at:
+            raise ValueError(
+                f"Candles must have strictly increasing known_at; got {candle.known_at} "
+                f"after {previous_known_at} -- this would let a later candle be evaluated "
+                "before an earlier one is actually knowable (lookahead)"
+            )
         previous_timestamp = candle.timestamp
+        previous_known_at = candle.known_at
 
         # 1. Evaluate every zone that already existed before this candle.
         #    (A zone this same candle is about to form is appended in step
@@ -295,5 +313,3 @@ def _apply_lifecycle(zone: FVGZone, candle: Candle) -> tuple[FVGZone | None, FVG
 
     resolved = replace(zone, status=FVGStatus.MITIGATED, resolved_at=candle.known_at, produced_ifvg=False)
     return resolved, None
-
-
