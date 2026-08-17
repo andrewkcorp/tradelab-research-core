@@ -49,11 +49,32 @@ different instants, not a duplicate of one.
 No lookahead of its own: this module does not walk candles -- it only
 ever copies ``timestamp``/``known_at`` already computed upstream, so a
 candidate's ``known_at`` always equals its source event's ``known_at``
-exactly. It does, however, cross-validate that its inputs are mutually
-consistent (every iFVG/touch references a real zone on the declared
-timeframe, with matching direction/bounds, and a touch's
-``contact_type``/``is_entry_trigger`` pair is internally consistent)
-rather than trusting malformed or mismatched input silently.
+exactly. It does not, however, simply trust that its input came from a
+real upstream detector call -- it re-checks the invariants that would
+otherwise only be implicit:
+
+- every iFVG/touch references a real zone on the declared timeframe,
+  with matching direction/bounds;
+- an iFVG's own ``known_at`` is strictly after its zone's ``formed_at``;
+  a touch's ``timestamp`` is strictly after the zone's forming candle
+  and its ``known_at`` is strictly after the zone's ``formed_at`` --
+  malformed input that violates either is rejected outright rather than
+  assumed impossible;
+- a touch's ``contact_type``/``is_entry_trigger`` pair is internally
+  consistent;
+- an ``inversion_ifvg`` touch always has a genuinely corresponding iFVG
+  event for the same zone and the same underlying candle (compared on
+  ``known_at``, the one instant both event types actually share --
+  ``FVGTouchEvent.timestamp`` is the candle's open while
+  ``FVGEvent.timestamp`` equals its own ``known_at`` by contract, so
+  they are never equal to each other for the same candle). Without this
+  check, a mismatched input would silently drop that zone's only
+  trigger: no ``FVG_TOUCH`` candidate (inversion is never one) and no
+  ``IFVG`` candidate either (none was found). The reverse is not
+  required -- a zone only partially touched and genuinely inverted later
+  on a different candle has no ``inversion_ifvg``-typed touch at all
+  (a zone's touch record is only ever its *first* contact), so that
+  later iFVG event needs no matching touch.
 """
 from __future__ import annotations
 
@@ -179,7 +200,7 @@ def _candidates_for_timeframe(
 
     out: list[FVGEntryCandidate] = []
 
-    seen_ifvg_zone_ids: set[str] = set()
+    ifvg_events_by_zone_id: dict[str, FVGEvent] = {}
     for event in fvg_result.events:
         if event.timeframe != timeframe:
             raise ValueError(f"FVGEvent for zone {event.zone_id!r} has timeframe {event.timeframe!r}, expected {timeframe!r}")
@@ -206,9 +227,14 @@ def _candidates_for_timeframe(
                 f"FVGEvent for zone {event.zone_id!r} has timestamp {event.timestamp!r} != known_at {event.known_at!r} "
                 "-- violates the iFVG event contract (the two are always equal)"
             )
-        if event.zone_id in seen_ifvg_zone_ids:
+        if event.known_at <= zone.formed_at:
+            raise ValueError(
+                f"FVGEvent for zone {event.zone_id!r} has known_at {event.known_at!r} not strictly after its "
+                f"zone's formed_at {zone.formed_at!r} -- an iFVG cannot be known before or at its own zone's formation"
+            )
+        if event.zone_id in ifvg_events_by_zone_id:
             raise ValueError(f"Duplicate iFVG event for zone_id {event.zone_id!r} on timeframe {timeframe!r}")
-        seen_ifvg_zone_ids.add(event.zone_id)
+        ifvg_events_by_zone_id[event.zone_id] = event
 
         out.append(
             FVGEntryCandidate(
@@ -243,12 +269,53 @@ def _candidates_for_timeframe(
                     f"FVGTouchEvent for zone {touch.zone_id!r} has bounds ({touch.lower!r}, {touch.upper!r}), "
                     f"expected ({zone.lower!r}, {zone.upper!r}) (from its FVGZone)"
                 )
+            if touch.timestamp <= zone.candle_3_timestamp:
+                raise ValueError(
+                    f"FVGTouchEvent for zone {touch.zone_id!r} has timestamp {touch.timestamp!r} not strictly after "
+                    f"its zone's forming candle ({zone.candle_3_timestamp!r}) -- a touch cannot belong to the "
+                    "forming candle itself or an earlier one"
+                )
+            if touch.known_at <= zone.formed_at:
+                raise ValueError(
+                    f"FVGTouchEvent for zone {touch.zone_id!r} has known_at {touch.known_at!r} not strictly after "
+                    f"its zone's formed_at {zone.formed_at!r} -- a touch cannot be known before or at its own "
+                    "zone's formation"
+                )
             if touch.is_entry_trigger != _EXPECTED_ENTRY_TRIGGER[touch.contact_type]:
                 raise ValueError(
                     f"FVGTouchEvent for zone {touch.zone_id!r} has contact_type {touch.contact_type!r} with "
                     f"is_entry_trigger={touch.is_entry_trigger!r}, expected {_EXPECTED_ENTRY_TRIGGER[touch.contact_type]!r} "
                     "-- inversion_ifvg must never be an FVG-touch entry trigger"
                 )
+            if touch.contact_type == FVGContactType.INVERSION_IFVG:
+                # An inversion touch must have a genuinely corresponding iFVG
+                # event for the same candle -- otherwise the adapter would
+                # silently drop this zone's only trigger (no FVG_TOUCH
+                # candidate, since inversion is never one; no IFVG candidate
+                # either, since none was found). The reverse is NOT required:
+                # a zone first only partially touched, and only later
+                # genuinely inverted on a different candle, has no
+                # INVERSION_IFVG-typed touch at all (touch only ever records
+                # the *first* contact) -- that FVGEvent is validated on its
+                # own above and needs no matching touch.
+                matching_event = ifvg_events_by_zone_id.get(touch.zone_id)
+                if matching_event is None:
+                    raise ValueError(
+                        f"FVGTouchEvent for zone {touch.zone_id!r} has contact_type=inversion_ifvg but no matching "
+                        f"FVGEvent was found on timeframe {timeframe!r} -- an inversion touch must have a "
+                        "corresponding iFVG event, or the trigger it represents would be silently lost"
+                    )
+                # Compared on known_at, not timestamp: FVGTouchEvent.timestamp
+                # is the candle's open, while FVGEvent.timestamp equals its
+                # own known_at (the candle's close) by contract -- known_at
+                # is the one instant both event types actually share for the
+                # same underlying candle.
+                if matching_event.known_at != touch.known_at:
+                    raise ValueError(
+                        f"FVGTouchEvent for zone {touch.zone_id!r} (inversion_ifvg) has known_at {touch.known_at!r}, "
+                        f"but its matching FVGEvent has known_at {matching_event.known_at!r} -- they must refer to "
+                        "the same candle"
+                    )
             if touch.zone_id in seen_touch_zone_ids:
                 raise ValueError(f"Duplicate FVGTouchEvent for zone_id {touch.zone_id!r} on timeframe {timeframe!r}")
             seen_touch_zone_ids.add(touch.zone_id)

@@ -360,6 +360,65 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             detect_fvg_entry_candidates({"1m": fvg_result}, {"1m": touch_result})
 
+    # -- No-lookahead: iFVG/touch timing relative to their zone's own facts --
+
+    def test_ifvg_known_at_equal_to_or_before_formed_at_is_rejected(self):
+        # zone().formed_at == T0 + 3min
+        for known_at in (T0 + timedelta(minutes=3), T0 + timedelta(minutes=2, seconds=30)):
+            with self.subTest(known_at=known_at):
+                fvg_result = fvg_result_with([zone(direction=BULLISH)], [ifvg_event(known_at=known_at)])
+                with self.assertRaises(ValueError):
+                    detect_fvg_entry_candidates({"1m": fvg_result}, {})
+
+    def test_touch_timestamp_on_the_forming_candle_is_rejected(self):
+        # zone().candle_3_timestamp == T0 + 2min
+        fvg_result = fvg_result_with([zone(direction=BULLISH)], [])
+        touch_result = touch_result_with([touch_event(timestamp=T0 + timedelta(minutes=2))])
+        with self.assertRaises(ValueError):
+            detect_fvg_entry_candidates({"1m": fvg_result}, {"1m": touch_result})
+
+    def test_touch_timestamp_before_the_forming_candle_is_rejected(self):
+        fvg_result = fvg_result_with([zone(direction=BULLISH)], [])
+        touch_result = touch_result_with([touch_event(timestamp=T0 + timedelta(minutes=1))])
+        with self.assertRaises(ValueError):
+            detect_fvg_entry_candidates({"1m": fvg_result}, {"1m": touch_result})
+
+    def test_touch_known_at_equal_to_or_before_formed_at_is_rejected(self):
+        # zone().formed_at == T0 + 3min; timestamp kept valid (after candle_3) in isolation.
+        for known_at in (T0 + timedelta(minutes=3), T0 + timedelta(minutes=2, seconds=30)):
+            with self.subTest(known_at=known_at):
+                fvg_result = fvg_result_with([zone(direction=BULLISH)], [])
+                touch_result = touch_result_with([touch_event(timestamp=T0 + timedelta(minutes=4), known_at=known_at)])
+                with self.assertRaises(ValueError):
+                    detect_fvg_entry_candidates({"1m": fvg_result}, {"1m": touch_result})
+
+    # -- Inversion touch <-> iFVG event consistency --
+
+    def test_inversion_touch_without_matching_ifvg_event_is_rejected(self):
+        fvg_result = fvg_result_with([zone(direction=BULLISH)], [])  # no iFVG event at all
+        touch_result = touch_result_with([touch_event(contact_type=FVGContactType.INVERSION_IFVG)])
+        with self.assertRaises(ValueError):
+            detect_fvg_entry_candidates({"1m": fvg_result}, {"1m": touch_result})
+
+    def test_inversion_touch_with_matching_ifvg_event_at_a_different_time_is_rejected(self):
+        fvg_result = fvg_result_with([zone(direction=BULLISH)], [ifvg_event(known_at=T0 + timedelta(minutes=5))])
+        touch_result = touch_result_with(
+            [touch_event(contact_type=FVGContactType.INVERSION_IFVG, known_at=T0 + timedelta(minutes=6))]
+        )
+        with self.assertRaises(ValueError):
+            detect_fvg_entry_candidates({"1m": fvg_result}, {"1m": touch_result})
+
+    def test_inversion_touch_with_a_correctly_matching_ifvg_event_is_accepted(self):
+        # Sanity companion: same zone_id and same known_at must NOT raise.
+        fvg_result = fvg_result_with([zone(direction=BULLISH)], [ifvg_event(known_at=T0 + timedelta(minutes=5))])
+        touch_result = touch_result_with(
+            [touch_event(contact_type=FVGContactType.INVERSION_IFVG, known_at=T0 + timedelta(minutes=5))]
+        )
+        entry_result = detect_fvg_entry_candidates({"1m": fvg_result}, {"1m": touch_result})
+        # only the IFVG candidate -- inversion never also produces FVG_TOUCH
+        self.assertEqual(len(entry_result.candidates), 1)
+        self.assertEqual(entry_result.candidates[0].source_type, SourceType.IFVG)
+
     def test_duplicate_ifvg_event_for_same_zone_is_rejected(self):
         fvg_result = fvg_result_with([zone(direction=BULLISH)], [ifvg_event(), ifvg_event()])
         with self.assertRaises(ValueError):
