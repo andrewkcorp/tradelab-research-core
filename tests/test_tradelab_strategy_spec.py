@@ -53,8 +53,8 @@ def sl_liq(rank: int = 1) -> SLChoice:
     return SLChoice(source_type=SLSourceType.LIQUIDITY, rank=rank)
 
 
-def sl_fvg(selector: str = FVG_5M_IFVG) -> SLChoice:
-    return SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=selector)
+def sl_fvg(selector: str = FVG_5M_IFVG, variant: int = 1) -> SLChoice:
+    return SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=selector, fvg_variant_number=variant)
 
 
 def spec(
@@ -147,23 +147,43 @@ class SLChoiceTests(unittest.TestCase):
             SLChoice(source_type=SLSourceType.LIQUIDITY, rank=1, fvg_link_selector=FVG_5M_IFVG)
 
     def test_fvg_boundary_requires_link_and_no_rank(self):
-        SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=FVG_5M_IFVG)  # no raise
+        SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=FVG_5M_IFVG, fvg_variant_number=1)  # no raise
         with self.assertRaises(ValueError):
-            SLChoice(source_type=SLSourceType.FVG_BOUNDARY, rank=1, fvg_link_selector=FVG_5M_IFVG)
+            SLChoice(source_type=SLSourceType.FVG_BOUNDARY, rank=1, fvg_link_selector=FVG_5M_IFVG, fvg_variant_number=1)
         with self.assertRaises(ValueError):
-            SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=None)
+            SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=None, fvg_variant_number=1)
 
     def test_fvg_boundary_rejects_disallowed_timeframe(self):
         with self.assertRaises(ValueError):
-            SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=FVG_1M_TOUCH)
+            SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=FVG_1M_TOUCH, fvg_variant_number=1)
 
     def test_fvg_boundary_accepts_5m_and_15m(self):
-        SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=FVG_5M_IFVG)
-        SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=FVG_15M_TOUCH)
+        SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=FVG_5M_IFVG, fvg_variant_number=1)
+        SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=FVG_15M_TOUCH, fvg_variant_number=1)
 
     def test_data_wick_rejected_as_sl_source_type(self):
         with self.assertRaises(ValueError):
             SLChoice(source_type=TPSourceType.DATA_WICK)
+
+    def test_fvg_boundary_requires_fvg_variant_number(self):
+        with self.assertRaises(ValueError):
+            SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=FVG_5M_IFVG)
+        with self.assertRaises(ValueError):
+            SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=FVG_5M_IFVG, fvg_variant_number=None)
+
+    def test_fvg_boundary_rejects_non_positive_variant_number(self):
+        with self.assertRaises(ValueError):
+            SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=FVG_5M_IFVG, fvg_variant_number=0)
+        with self.assertRaises(ValueError):
+            SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=FVG_5M_IFVG, fvg_variant_number=-1)
+
+    def test_fvg_boundary_has_no_upper_bound_on_variant_number(self):
+        SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=FVG_5M_IFVG, fvg_variant_number=1)
+        SLChoice(source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector=FVG_5M_IFVG, fvg_variant_number=999)
+
+    def test_liquidity_rejects_fvg_variant_number(self):
+        with self.assertRaises(ValueError):
+            SLChoice(source_type=SLSourceType.LIQUIDITY, rank=1, fvg_variant_number=1)
 
 
 class StrategySpecValidationTests(unittest.TestCase):
@@ -261,7 +281,7 @@ class SerializationTests(unittest.TestCase):
         self.assertEqual(round_tripped["tp_choice"], {"source_type": "data_wick", "rank": None})
         self.assertEqual(
             round_tripped["sl_choice"],
-            {"source_type": "fvg_boundary", "rank": None, "fvg_link_selector": FVG_5M_IFVG},
+            {"source_type": "fvg_boundary", "rank": None, "fvg_link_selector": FVG_5M_IFVG, "fvg_variant_number": 1},
         )
 
 
@@ -366,6 +386,22 @@ class GeneratorDeterminismTests(unittest.TestCase):
         self.assertIsInstance(s.strategy_id, str)
         self.assertTrue(s.strategy_id.startswith("strategy-"))
 
+    def test_different_fvg_variant_numbers_produce_different_strategy_ids(self):
+        specs = list(
+            iter_strategy_specs(
+                directions=[LONG],
+                primary_entry_selectors=[FVG_5M_IFVG],
+                bias_policies=[BiasPolicy.IGNORE],
+                tp_choices=[tp_liq(1)],
+                sl_choices=[sl_fvg(FVG_5M_IFVG, variant=1), sl_fvg(FVG_5M_IFVG, variant=2)],
+            )
+        )
+        self.assertEqual(len(specs), 2)
+        ids = {s.strategy_id for s in specs}
+        self.assertEqual(len(ids), 2)
+        variants = {s.sl_choice.fvg_variant_number: s.strategy_id for s in specs}
+        self.assertNotEqual(variants[1], variants[2])
+
 
 class GeneratorFullCoverageTests(unittest.TestCase):
     """A small, synthetic parameter space, brute-force-verified against
@@ -406,7 +442,20 @@ class GeneratorFullCoverageTests(unittest.TestCase):
                 )
             except ValueError:
                 continue
-            expected.add((direction, primary, confluence, bias_policy, tp_choice.source_type, tp_choice.rank, sl_choice.source_type, sl_choice.rank, sl_choice.fvg_link_selector))
+            expected.add(
+                (
+                    direction,
+                    primary,
+                    confluence,
+                    bias_policy,
+                    tp_choice.source_type,
+                    tp_choice.rank,
+                    sl_choice.source_type,
+                    sl_choice.rank,
+                    sl_choice.fvg_link_selector,
+                    sl_choice.fvg_variant_number,
+                )
+            )
             del s
         return expected
 
@@ -436,6 +485,7 @@ class GeneratorFullCoverageTests(unittest.TestCase):
                 s.sl_choice.source_type,
                 s.sl_choice.rank,
                 s.sl_choice.fvg_link_selector,
+                s.sl_choice.fvg_variant_number,
             )
             for s in generated
         }

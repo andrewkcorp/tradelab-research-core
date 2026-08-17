@@ -34,20 +34,31 @@ existing ``global_bias`` values, never a second bias computation.
 
 **This module does not compute TP/SL prices, entry fills, or anything
 data-driven** -- ``TPChoice``/``SLChoice`` only *declare* which
-``tp_targets``/``sl_targets`` candidate kind and rank a future backtest
-step will pull (``LIQUIDITY`` ranks 1..3, nearest-first, matching
-``TPTargetCandidate.rank``/``SLTargetCandidate.rank`` exactly;
-``DATA_WICK`` TP and ``FVG_BOUNDARY`` SL are never ranked upstream
-either, so their ``rank`` must be ``None`` here too). An ``FVG_BOUNDARY``
-SL additionally names, via ``fvg_link_selector``, which of *this
-strategy's own* fvg-* selectors will supply the linked confluence at
-simulation time (``tradelab.sl_targets.SelectedFVGConfluence``) --
-never an arbitrary, unrelated FVG zone: ``StrategySpec.__post_init__``
-requires that selector to be the strategy's own ``primary_entry_
-selector`` or one of its own ``required_confluence_selectors``, and
-``SLChoice.__post_init__`` requires its timeframe to be ``5m``/``15m``
-(``tradelab.sl_targets.FVG_SL_TIMEFRAMES``), exactly mirroring that
-module's own restriction.
+``tp_targets``/``sl_targets`` candidate kind a future backtest step will
+pull. ``LIQUIDITY`` (TP or SL) ranks 1..3, nearest-first, matching
+``TPTargetCandidate.rank``/``SLTargetCandidate.rank`` exactly.
+``DATA_WICK`` TP is never ranked upstream (``tp_targets`` always returns
+it uncapped, nearest-first) -- a backtest step always takes the nearest
+one, so ``rank`` must be ``None`` there. ``FVG_BOUNDARY`` SL is likewise
+never ranked upstream (``sl_targets`` returns *every* qualifying linked
+boundary, uncapped) -- but unlike data-wick TP, this module does
+**not** silently pick "nearest" for it. Instead ``fvg_variant_number``
+(mandatory, positive, no upper bound) says explicitly *which* qualifying
+boundary this strategy uses, in ``sl_targets``' own deterministic order
+(ascending distance from entry, then ``known_at``, then the stable
+``sl_target_id``): ``1`` is the first, ``2`` the second, and so on. Two
+``StrategySpec``s that differ only in ``fvg_variant_number`` are two
+separately auditable strategies with two different ``strategy_id``s --
+"test every qualifying FVG-SL variant" is a job for a future enumerator
+sweeping variant numbers, never a choice this module makes on its own.
+``fvg_link_selector`` additionally names which of *this strategy's own*
+fvg-* selectors will supply the linked confluence at simulation time
+(``tradelab.sl_targets.SelectedFVGConfluence``) -- never an arbitrary,
+unrelated FVG zone: ``StrategySpec.__post_init__`` requires that
+selector to be the strategy's own ``primary_entry_selector`` or one of
+its own ``required_confluence_selectors``, and ``SLChoice.__post_init__``
+requires its timeframe to be ``5m``/``15m`` (``tradelab.sl_targets.
+FVG_SL_TIMEFRAMES``), exactly mirroring that module's own restriction.
 
 **Direction consistency.** A liquidity selector's ``entry_mode`` plus
 the ``high``/``low`` side implied by its ``liquidity_type`` pin it to
@@ -218,18 +229,33 @@ class TPChoice:
 class SLChoice:
     """Which ``sl_targets`` candidate this strategy will pull. ``LIQUIDITY``
     ranks 1..3, exactly like ``TPChoice``. ``FVG_BOUNDARY`` is never
-    ranked (``sl_targets`` never sets a rank for it either) and instead
-    names, via ``fvg_link_selector``, which of the strategy's own
-    ``fvg-*`` selectors supplies the linked confluence -- never an
-    arbitrary FVG zone (``StrategySpec.__post_init__`` additionally
-    requires that selector to actually belong to the strategy). Data wick
-    can never be an SL source at all: ``SLSourceType`` has no such
-    member, so passing one (e.g. ``tradelab.tp_targets.TPSourceType.
-    DATA_WICK``) fails the ``isinstance`` check below."""
+    ranked by ``sl_targets`` itself (it returns *every* qualifying linked
+    boundary, uncapped) -- instead, ``fvg_variant_number`` (mandatory,
+    positive, no upper bound) picks *which* qualifying boundary this
+    strategy uses: ``1`` is the first in ``sl_targets``' own deterministic
+    order (ascending distance from entry, then ``known_at``, then the
+    stable ``sl_target_id`` -- exactly ``detect_sl_target_candidates``'
+    own sort on ``fvg_targets``, never re-derived here), ``2`` the
+    second, and so on. This makes every distinct variant number its own,
+    separately auditable strategy (two variants of the same otherwise-
+    identical spec never collide on ``strategy_id`` -- see
+    ``_build_strategy_id``), and keeps this module from silently
+    special-casing "nearest" the way an earlier version of this module
+    once did: a future enumerator sweeps every variant number from 1 up
+    to however many qualifying boundaries actually exist in a given
+    dataset, this module does not pick one on its own. ``fvg_link_selector``
+    names which of the strategy's own ``fvg-*`` selectors supplies the
+    linked confluence -- never an arbitrary FVG zone
+    (``StrategySpec.__post_init__`` additionally requires that selector
+    to actually belong to the strategy). Data wick can never be an SL
+    source at all: ``SLSourceType`` has no such member, so passing one
+    (e.g. ``tradelab.tp_targets.TPSourceType.DATA_WICK``) fails the
+    ``isinstance`` check below."""
 
     source_type: SLSourceType
     rank: int | None = None
     fvg_link_selector: str | None = None
+    fvg_variant_number: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_type, SLSourceType):
@@ -239,6 +265,8 @@ class SLChoice:
                 raise ValueError(f"SLChoice.rank must be one of {sorted(_LIQUIDITY_SL_RANKS)} for LIQUIDITY, got {self.rank!r}")
             if self.fvg_link_selector is not None:
                 raise ValueError("SLChoice.fvg_link_selector must be None for LIQUIDITY")
+            if self.fvg_variant_number is not None:
+                raise ValueError("SLChoice.fvg_variant_number must be None for LIQUIDITY")
         else:  # FVG_BOUNDARY
             if self.rank is not None:
                 raise ValueError(f"SLChoice.rank must be None for FVG_BOUNDARY, got {self.rank!r}")
@@ -249,6 +277,11 @@ class SLChoice:
                 raise ValueError(
                     f"SLChoice.fvg_link_selector {self.fvg_link_selector!r} has timeframe {timeframe!r}; "
                     f"only {sorted(FVG_SL_TIMEFRAMES)} qualify for FVG boundary SL"
+                )
+            if not isinstance(self.fvg_variant_number, int) or isinstance(self.fvg_variant_number, bool) or self.fvg_variant_number < 1:
+                raise ValueError(
+                    f"SLChoice.fvg_variant_number is required for FVG_BOUNDARY and must be a positive integer, "
+                    f"got {self.fvg_variant_number!r}"
                 )
 
 
@@ -337,6 +370,7 @@ class StrategySpec:
                 "source_type": self.sl_choice.source_type.value,
                 "rank": self.sl_choice.rank,
                 "fvg_link_selector": self.sl_choice.fvg_link_selector,
+                "fvg_variant_number": self.sl_choice.fvg_variant_number,
             },
         }
 
@@ -368,7 +402,7 @@ def _build_strategy_id(
     confluence_part = "+".join(sorted(required_confluence_selectors)) if required_confluence_selectors else "none"
     tp_part = tp_choice.source_type.value if tp_choice.rank is None else f"{tp_choice.source_type.value}{tp_choice.rank}"
     if sl_choice.source_type == SLSourceType.FVG_BOUNDARY:
-        sl_part = f"{sl_choice.source_type.value}[{sl_choice.fvg_link_selector}]"
+        sl_part = f"{sl_choice.source_type.value}[{sl_choice.fvg_link_selector}]#{sl_choice.fvg_variant_number}"
     else:
         sl_part = sl_choice.source_type.value if sl_choice.rank is None else f"{sl_choice.source_type.value}{sl_choice.rank}"
     return f"strategy-{direction}-{primary_entry_selector}-{confluence_part}-{bias_policy.value}-tp_{tp_part}-sl_{sl_part}"

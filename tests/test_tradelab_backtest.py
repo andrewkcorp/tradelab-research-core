@@ -4,19 +4,25 @@ the next 1m candle's open, TP hit, SL hit (with a gap straight through
 the level), same-candle TP+SL conflict resolved SL-first, red-folder
 news block (boundaries inclusive), single active position (a second
 signal is skipped), missing required confluence, bias mismatch, missing
-TP/SL target, no lookahead, and BacktestResult's own aggregate counts.
+TP/SL target, no lookahead, FVG-boundary SL variant selection, data-wick
+TP nearest selection, and BacktestResult's own aggregate counts.
 
-All fixtures are small, synthetic 1-minute bar series built from flat
+Most fixtures are small, synthetic 1-minute bar series built from flat
 "resting" candles (repeated identical OHLC, which can never register as
 a swing pivot or an FVG gap) punctuated by isolated spike candles that
 deliberately form exactly one swing high/low at a time -- this keeps
 every liquidity level in each fixture fully deliberate, with no
-incidental extra levels competing for TP/SL rank #1. Every fixture is
-far too short to complete a single 5m/15m/1H/4H/1D bucket (the smallest,
-5m, still needs a fully aligned run of 1-minute bars), so higher
-timeframes never contribute a level or a bias change here -- tests that
-care about that (bias mismatch, missing confluence) rely on exactly
-this fact rather than constructing HTF data.
+incidental extra levels competing for TP/SL rank #1. Most of them are
+also far too short to complete a single 5m/15m/1H/4H/1D bucket (the
+smallest, 5m, still needs a fully aligned run of 1-minute bars), so
+higher timeframes never contribute a level or a bias change there --
+tests that care about that (bias mismatch, missing confluence) rely on
+exactly this fact rather than constructing HTF data. The FVG-boundary
+SL tests are the exception: they deliberately build complete 5m buckets
+(this file's ``T0`` is 09:30 NY, already 5m/15m-aligned) using flat,
+multi-bar plateaus to form exactly two 5m FVG zones with no incidental
+extra ones -- see ``fvg_boundary_variant_bars()`` for the construction
+notes.
 """
 from __future__ import annotations
 
@@ -370,6 +376,204 @@ class BacktestResultAggregateTests(unittest.TestCase):
         self.assertEqual(result.strategy_id, "my-strategy")
         self.assertEqual(result.trade_count, len(result.trades))
         self.assertEqual(result.tp_hit_count + result.sl_hit_count + result.open_unresolved_count, result.trade_count)
+
+
+def flat_group(start_idx: int, price: float, n: int = 5) -> list[Bar1m]:
+    return [flat(start_idx + k, price) for k in range(n)]
+
+
+def spike_bucket(start_idx: int, baseline: float, spike: tuple, spike_pos: int = 2) -> list[Bar1m]:
+    """One 5m-aligned bucket (5 bars) of ``baseline`` flat bars with a
+    single ``spike`` bar (o, h, l, c) at position ``spike_pos`` -- the
+    spike's own high/low only ever extends *one* side of ``baseline``
+    (this file's spikes never cross both), so this bucket's own 5m
+    aggregate high or low moves but the other stays pinned at
+    ``baseline``, exactly like every other flat-bucket boundary in this
+    file: never enough to register an incidental FVG gap two buckets
+    away."""
+    bars = []
+    for k in range(5):
+        if k == spike_pos:
+            bars.append(bar(start_idx + k, *spike))
+        else:
+            bars.append(flat(start_idx + k, baseline))
+    return bars
+
+
+def fvg_boundary_variant_bars() -> list[Bar1m]:
+    """A complete, 5m-aligned fixture with exactly two 5m bullish FVG
+    zones, both touched (``is_entry_trigger=True``, both LONG) and still
+    simultaneously active at entry -- built entirely from multi-bar flat
+    plateaus (>=2 identical bars each), which structurally cannot
+    register a 1m-level swing pivot (a strict pivot needs a candle
+    strictly better than *both* neighbors; an identical same-plateau
+    neighbor always fails that strictly).
+
+    Zone A [100, 110] forms from buckets 0/1/2 (14:30-14:45), touched by
+    bucket 3 (a shallow 109.9 dip -- shallow enough that looking two
+    buckets back never crosses the 5-tick FVG threshold and forms an
+    unwanted extra gap). Zone B [110, 118] forms similarly from buckets
+    5/6/7, touched by bucket 8. Bucket 10 then *rises* (118 -> 200) to a
+    much higher baseline for the liquidity trigger structure -- rising
+    (rather than dropping back toward zone A/B's own price range) can
+    only ever form extra *bullish* (same-direction, harmless) gaps,
+    never a bearish one that could invalidate the two real zones' LONG
+    touch signals before entry (an earlier version of this fixture
+    dropped back to the original 100 baseline instead, and an incidental
+    bearish gap from that drop ended up getting touched by the liquidity
+    swing spikes' own 5m aggregates, invalidating both real zones before
+    entry -- rising avoids the whole failure mode structurally).
+
+    The liquidity trigger (SL anchor / TP anchor / trigger swing / take
+    / entry) then follows around the new 200 baseline, each spike
+    isolated in its own 5m bucket via ``spike_bucket`` so no bucket ever
+    moves both its high and low away from baseline at once.
+    """
+    bars: list[Bar1m] = []
+    bars += flat_group(0, 100)
+    bars += flat_group(5, 100)
+    bars += flat_group(10, 110)  # zone A candle_3 -> [100, 110]
+    bars += flat_group(15, 109.9)  # touch zone A (shallow)
+    bars += flat_group(20, 110)  # recover
+    bars += flat_group(25, 110)  # zone B candle_1
+    bars += flat_group(30, 110)  # zone B candle_2
+    bars += flat_group(35, 118)  # zone B candle_3 -> [110, 118]
+    bars += flat_group(40, 117.9)  # touch zone B (shallow)
+    bars += flat_group(45, 118)  # recover
+    bars += flat_group(50, 200)  # rise to the liquidity baseline (harmless bullish gap only)
+    bars += flat_group(55, 200)  # buffer
+    bars += spike_bucket(60, 200, (190.5, 191, 190, 190.5))  # SL anchor swing low = 190
+    bars += flat_group(65, 200)
+    bars += spike_bucket(70, 200, (219.5, 220, 219, 219.5))  # TP anchor swing high = 220
+    bars += flat_group(75, 200)
+    bars += spike_bucket(80, 200, (195.5, 196, 195, 195.5))  # trigger swing low = 195
+    bars.append(bar(85, 199, 200.5, 194, 194.5))  # take candle (low=194 < 195)
+    bars.append(bar(86, 199, 200, 198, 199.5))  # entry candle (open=199 == entry_price)
+    bars += flat_group(87, 200)
+    return bars
+
+
+FVG_VARIANT_ENTRY_TIMESTAMP = T0 + timedelta(minutes=86)
+
+
+def fvg_boundary_strategy(fvg_variant_number: int, strategy_id: str = "s-fvg-sl") -> StrategySpec:
+    return StrategySpec(
+        strategy_id=strategy_id,
+        direction=LONG,
+        primary_entry_selector="liquidity-1m-swing_equal-swing_low-take-reversal",
+        required_confluence_selectors=("fvg-5m-fvg_touch",),
+        bias_policy=BiasPolicy.IGNORE,
+        tp_choice=TPChoice(source_type=TPSourceType.LIQUIDITY, rank=1),
+        sl_choice=SLChoice(
+            source_type=SLSourceType.FVG_BOUNDARY, fvg_link_selector="fvg-5m-fvg_touch", fvg_variant_number=fvg_variant_number
+        ),
+    )
+
+
+class FVGBoundaryVariantSelectionTests(unittest.TestCase):
+    """Proves the review fix: FVG-boundary SL no longer silently picks
+    the nearest qualifying boundary -- it picks exactly the position
+    ``fvg_variant_number`` names in sl_targets' own deterministic order
+    (ascending distance, then known_at, then sl_target_id), and a
+    variant number with no matching position is MISSING_TARGET, not a
+    silent fallback to "nearest" or a crash."""
+
+    def test_variant_1_and_variant_2_select_different_boundaries(self):
+        bars = fvg_boundary_variant_bars()
+        result_v1 = run(fvg_boundary_strategy(1), bars)
+        result_v2 = run(fvg_boundary_strategy(2), bars)
+
+        self.assertEqual(result_v1.trade_count, 1)
+        self.assertEqual(result_v2.trade_count, 1)
+        trade_v1 = result_v1.trades[0]
+        trade_v2 = result_v2.trades[0]
+
+        self.assertEqual(trade_v1.sl_source_type, "fvg_boundary")
+        self.assertEqual(trade_v2.sl_source_type, "fvg_boundary")
+        self.assertNotEqual(trade_v1.sl_price, trade_v2.sl_price)
+        self.assertNotEqual(trade_v1.sl_source_id, trade_v2.sl_source_id)
+        # variant 1 is nearer to entry_price than variant 2 (sl_targets'
+        # own ascending-distance order) -- entry_price is 199 for both.
+        self.assertLess(abs(trade_v1.entry_price - trade_v1.sl_price), abs(trade_v2.entry_price - trade_v2.sl_price))
+
+    def test_nonexistent_variant_number_is_missing_target(self):
+        bars = fvg_boundary_variant_bars()
+        result = run(fvg_boundary_strategy(99), bars)
+        self.assertEqual(result.trade_count, 0)
+        self.assertEqual(len(result.skipped_signals), 1)
+        self.assertEqual(result.skipped_signals[0].reason, SkipReason.MISSING_TARGET)
+        self.assertEqual(result.skipped_signals[0].timestamp, FVG_VARIANT_ENTRY_TIMESTAMP)
+
+    def test_variant_1_result_is_deterministic_across_runs(self):
+        bars = fvg_boundary_variant_bars()
+        result_a = run(fvg_boundary_strategy(1), bars)
+        result_b = run(fvg_boundary_strategy(1), bars)
+        self.assertEqual(result_a.trades[0].sl_price, result_b.trades[0].sl_price)
+        self.assertEqual(result_a.trades[0].sl_source_id, result_b.trades[0].sl_source_id)
+
+
+def data_wick_tp_bars() -> list[Bar1m]:
+    """60 flat baseline candles (data_wicks' own mandatory, gapless
+    60-candle baseline run -- with every range 0, the baseline median is
+    0, so any candle with a real range trivially clears the 2x-baseline
+    qualification threshold), then two upper-wick candles -- each inside
+    its own news event's [T, T+5min] window -- at two different
+    distances from the eventual entry_price, then the same isolated-
+    spike liquidity trigger structure used throughout this file."""
+    bars = [flat(i) for i in range(60)]
+    bars.append(bar(60, 100, 115, 100, 101))  # far upper wick, level=115
+    bars.append(bar(61, 100, 108, 100, 100.5))  # near upper wick, level=108
+    bars += [flat(i) for i in range(62, 65)]
+    bars.append(bar(65, 100, 100, 90, 100))  # SL anchor swing low = 90
+    bars += [flat(i) for i in range(66, 68)]
+    bars.append(bar(68, 95.5, 96, 95, 95.5))  # trigger swing low = 95
+    bars += [flat(i) for i in range(69, 71)]
+    bars.append(bar(71, 99, 100.5, 94, 94.5))  # take candle (low=94 < 95)
+    bars.append(bar(72, 99, 100, 98, 99.5))  # entry candle
+    bars += [flat(i) for i in range(73, 76)]
+    return bars
+
+
+def _news_event(event_id: str, minutes_from_t0: int, event_type: str = "CPI") -> NewsEvent:
+    return NewsEvent(
+        event_id=event_id,
+        scheduled_at=T0 + timedelta(minutes=minutes_from_t0),
+        country="United States",
+        currency="USD",
+        event_type=event_type,
+        source_agency="BLS",
+        source_url="https://bls.gov/x",
+        source_reference=f"ref-{event_id}",
+        time_is_exact=True,
+        schema_version="1.0",
+    )
+
+
+class DataWickTPRegressionTests(unittest.TestCase):
+    """Confirms the FVG-boundary SL fix left data-wick TP selection
+    untouched: it still always takes the single nearest qualifying data
+    wick (tp_targets already returns data_wick_targets sorted nearest-
+    first, uncapped -- this module never ranks it, matching TPChoice's
+    own contract, unlike the FVG-boundary SL fix above)."""
+
+    def test_nearest_qualifying_data_wick_is_selected_over_a_farther_one(self):
+        bars = data_wick_tp_bars()
+        events = [_news_event("EV1", 60), _news_event("EV2", 61, event_type="PPI")]
+        strategy = StrategySpec(
+            strategy_id="s-wick",
+            direction=LONG,
+            primary_entry_selector="liquidity-1m-swing_equal-swing_low-take-reversal",
+            required_confluence_selectors=(),
+            bias_policy=BiasPolicy.IGNORE,
+            tp_choice=TPChoice(source_type=TPSourceType.DATA_WICK),
+            sl_choice=SLChoice(source_type=SLSourceType.LIQUIDITY, rank=1),
+        )
+        result = run(strategy, bars, news_events=events)
+        self.assertEqual(result.trade_count, 1)
+        trade = result.trades[0]
+        self.assertEqual(trade.tp_source_type, "data_wick")
+        self.assertEqual(trade.tp_price, 108.0)  # the nearer wick (115 is farther from entry_price=99)
+        self.assertNotEqual(trade.tp_price, 115.0)
 
 
 if __name__ == "__main__":

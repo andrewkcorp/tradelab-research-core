@@ -413,7 +413,15 @@ def _select_tp_candidate(tp_choice: TPChoice, tp_result) -> TPTargetCandidate | 
 def _select_sl_candidate(sl_choice: SLChoice, sl_result) -> SLTargetCandidate | None:
     if sl_choice.source_type == SLSourceType.LIQUIDITY:
         return _pick_by_rank(sl_result.liquidity_targets, sl_choice.rank)
-    return sl_result.fvg_targets[0] if sl_result.fvg_targets else None  # nearest-first already
+    # FVG_BOUNDARY: sl_targets never ranks these -- fvg_targets is already
+    # sorted in sl_targets' own deterministic order (ascending distance,
+    # then known_at, then sl_target_id), and fvg_variant_number picks
+    # exactly one position in that order (1-based); this module never
+    # picks "nearest" on its own (see SLChoice's own docstring). A
+    # variant number with no matching position -- fewer qualifying
+    # boundaries exist for this entry than the strategy asked for -- is
+    # a MISSING_TARGET, same as any other absent candidate.
+    return _pick_by_position(sl_result.fvg_targets, sl_choice.fvg_variant_number)
 
 
 def _pick_by_rank(candidates: list, rank: int | None):
@@ -421,6 +429,12 @@ def _pick_by_rank(candidates: list, rank: int | None):
         if candidate.rank == rank:
             return candidate
     return None
+
+
+def _pick_by_position(candidates: list, position: int | None):
+    if position is None or position < 1 or position > len(candidates):
+        return None
+    return candidates[position - 1]
 
 
 def _build_selected_fvg_confluence(
