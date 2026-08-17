@@ -4,6 +4,19 @@ Research-only. No broker connectivity, no live execution, no network calls.
 """
 from tradelab.bar import Bar1m
 from tradelab.aggregate import AggregatedBar, aggregate_bars
+from tradelab.accounting import (
+    INSTRUMENT_TICK_SIZE,
+    POINT_VALUE_USD,
+    AccountBacktestResult,
+    AccountedTrade,
+    Instrument,
+    RiskConfig,
+    UntradeableReason,
+    UntradeableTrade,
+    apply_accounting,
+    instrument_tick_size,
+    point_value_usd,
+)
 from tradelab.backtest import (
     BacktestResult,
     ExecutedTrade,
@@ -95,6 +108,17 @@ __all__ = [
     "Bar1m",
     "AggregatedBar",
     "aggregate_bars",
+    "Instrument",
+    "POINT_VALUE_USD",
+    "INSTRUMENT_TICK_SIZE",
+    "point_value_usd",
+    "instrument_tick_size",
+    "RiskConfig",
+    "UntradeableReason",
+    "AccountedTrade",
+    "UntradeableTrade",
+    "AccountBacktestResult",
+    "apply_accounting",
     "BacktestResult",
     "ExecutedTrade",
     "SkipReason",
