@@ -3,8 +3,6 @@
 A neutral, auditable feature module, matching spec section 6.3. It knows
 nothing about FVG/iFVG, bias, entries, TP/SL, the backtester, swing/equal
 liquidity, or the strategy enumerator -- those are separate, later steps.
-It operates on a single native timeframe at a time, exactly like
-``tradelab.liquidity`` and ``tradelab.fvg``.
 
 Unlike ``tradelab.fvg`` vs. ``tradelab.liquidity`` (deliberately fully
 independent of each other), this module intentionally reuses
@@ -18,7 +16,7 @@ reimplementing them, because the spec requires session take/reclaim to be
 *identical* to swing/equal-highs take/reclaim (strict wick-only take, the
 same four-outcome reclaim) -- importing the tested implementation
 guarantees that identity instead of merely aiming for it. Session
-*detection* itself (the time-window state machine below) is independent
+*detection* itself (the completeness/window logic below) is independent
 new logic; nothing here changes swing/equal-highs behavior.
 
 Sessions (spec 6.3), all in ``America/New_York`` wall-clock time via
@@ -40,39 +38,62 @@ Overnight    18:00-09:30
 Sessions may overlap in time (Asia is fully contained in Overnight) --
 that is deliberate: each window produces its own high and its own low,
 each with its own ``liquidity_type`` and ``level_id``, even when the
-price happens to coincide.
+price happens to coincide, and each has its own independent take/reclaim
+(a wick breaking the narrower window is not automatically a break of the
+wider one).
 
-A session instance (one occurrence of one window, e.g. "Monday's Asia
-session") accumulates high/low from every candle whose *open* time falls
-in ``[start, end)`` for that occurrence. It becomes known -- two
-``LiquidityLevel`` records are created, ACTIVE, one per side -- only once
-a later candle confirms the window has actually closed (its open time no
-longer belongs to that occurrence). ``formed_at`` is the ``known_at`` of
-the session's own last member candle, not the later confirming candle,
-so it reflects exactly when the high/low was actually last updated. No
-lookahead: the confirming candle is never assumed, only observed, and
-the two new levels are never evaluated against the very candle that
-confirmed them (evaluation starts on the next one) -- the same ordering
-already used for swing/FVG confirmation.
+**Supported timeframes: only ``1m``, ``5m``, ``15m``** -- deliberately
+narrower than ``tradelab.liquidity``'s six. Session boundaries (e.g.
+Pre-NY 08:30-09:30) do not generally align with higher-timeframe bucket
+edges (1H/4H/1D); computing a session high/low from a candle that is only
+*partially* inside the window would silently mix in price action from
+outside it and produce a wrong extreme. 1m/5m/15m candles evenly divide
+every one of the windows above (all of them are whole multiples of 15
+minutes, including across a DST shift, since the shift itself is always
+a whole multiple of 60 minutes), so this constraint is never a real
+limitation at those timeframes.
 
-A session with zero member candles never produces a level. A session
-still open when the input data ends (no later candle ever confirmed its
-close) is incomplete and also never produces a level -- this module
-never fabricates a boundary or interpolates missing minutes to force a
-result; see spec 6.3/6.4 and the module's own docstring conventions
-already used by ``tradelab.liquidity``.
+**Completeness.** A session occurrence's high/low is derived only from
+the *complete*, contiguous set of candles the calendar grid actually
+expects inside its window: every timeframe-sized slot from the window's
+NY-local start (converted to UTC, so a DST shift changes the count of
+expected slots exactly the way it changes the real elapsed time) up to
+its end. If even one expected slot has no matching candle -- ``timestamp``
+matches exactly nothing in the input -- the whole occurrence is
+incomplete and produces **no level at all** (neither high nor low), never
+a level computed from a partial subset. An occurrence with zero candles
+is the same case (every expected slot missing) and needs no separate
+handling.
+
+**Availability (``formed_at`` / take eligibility).** A level's
+``formed_at`` is the ``known_at`` of the occurrence's own last expected
+member candle -- the instant its high/low was actually last updated.
+Because completeness has already been fully determined once the window
+closes, the level is genuinely knowable from that instant on, with no
+extra waiting period: unlike swing/FVG confirmation (where the
+*confirming* candle is deliberately exempt from evaluating what it just
+confirmed, because it is structurally part of establishing the fact), a
+session's confirming candle is an ordinary, unrelated candle that starts
+strictly after the level was already fully known -- so it is itself
+already eligible to take that level, not skipped. Concretely: this
+module finalizes a just-closed occurrence *before* running that same
+candle's take-check, so the first candle after the session is a normal
+take candidate, exactly like every candle after it. Levels are still
+never evaluated on any candle at or before ``formed_at`` (no lookahead in
+either direction): completeness is only ever decided once a later candle
+in the input has actually been observed to fall outside the window,
+never assumed from the window's nominal boundary alone.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from datetime import date, datetime, time, timedelta
+from dataclasses import replace
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from tradelab.fvg import Candle, from_aggregated_bar, from_bar1m  # noqa: F401  (re-exported)
 from tradelab.liquidity import (
     HIGH,
     LOW,
-    SUPPORTED_TIMEFRAMES,
     LiquidityDetectionResult,
     LiquidityLevel,
     LiquidityStatus,
@@ -87,6 +108,16 @@ from tradelab.liquidity import (
 )
 
 NY = ZoneInfo("America/New_York")
+UTC = timezone.utc
+
+# Execution/setup-trigger timeframes only (spec 2. Interwały setupu/triggera:
+# 15m, 5m, 1m) -- see module docstring for why 1H/4H/1D are excluded.
+_TIMEFRAME_DELTAS: dict[str, timedelta] = {
+    "1m": timedelta(minutes=1),
+    "5m": timedelta(minutes=5),
+    "15m": timedelta(minutes=15),
+}
+SUPPORTED_TIMEFRAMES = frozenset(_TIMEFRAME_DELTAS)
 
 # (start_hour, start_minute, end_hour, end_minute) in NY wall-clock time,
 # start inclusive / end exclusive. A window "wraps" past midnight when its
@@ -112,16 +143,6 @@ _SESSION_LIQUIDITY_TYPES: dict[str, tuple[LiquidityType, LiquidityType]] = {
 }
 
 
-@dataclass
-class _OpenSessionInstance:
-    anchor: date
-    high: float
-    low: float
-    member_count: int
-    member_timestamps: list[datetime]
-    last_known_at: datetime
-
-
 def _session_anchor(local_dt: datetime, window: tuple[int, int, int, int]) -> date | None:
     """Which occurrence (identified by its NY calendar start date)
     ``local_dt`` belongs to for this window, or ``None`` if it belongs to
@@ -140,6 +161,24 @@ def _session_anchor(local_dt: datetime, window: tuple[int, int, int, int]) -> da
     if t < end_t:
         return local_dt.date() - timedelta(days=1)
     return None
+
+
+def _expected_utc_timestamps(anchor: date, window: tuple[int, int, int, int], delta: timedelta) -> list[datetime]:
+    """Every timeframe-sized slot start (in UTC) the calendar grid expects
+    inside this occurrence's window, computed from the NY-local wall-clock
+    boundaries so a DST shift changes the count exactly as it changes the
+    real elapsed time -- never a fixed-offset approximation."""
+    start_h, start_m, end_h, end_m = window
+    wraps = time(end_h, end_m) <= time(start_h, start_m)
+    end_anchor = anchor + timedelta(days=1) if wraps else anchor
+    start_utc = datetime(anchor.year, anchor.month, anchor.day, start_h, start_m, tzinfo=NY).astimezone(UTC)
+    end_utc = datetime(end_anchor.year, end_anchor.month, end_anchor.day, end_h, end_m, tzinfo=NY).astimezone(UTC)
+    expected = []
+    t = start_utc
+    while t < end_utc:
+        expected.append(t)
+        t += delta
+    return expected
 
 
 def detect_session_liquidity(
@@ -161,16 +200,37 @@ def detect_session_liquidity(
         raise ValueError(f"reclaim_window_bars must be a positive integer, got {reclaim_window_bars!r}")
 
     _validate_chronology(candles)
+    delta = _TIMEFRAME_DELTAS[timeframe]
+    candles_by_timestamp = {c.timestamp: c for c in candles}
 
     active_levels: dict[str, LiquidityLevel] = {}
     all_levels: dict[str, LiquidityLevel] = {}
     takes: list[LiquidityTakeEvent] = []
     reclaims: list[ReclaimResult] = []
     reclaim_watches: list[_ReclaimWatch] = []
-    open_instances: dict[str, _OpenSessionInstance | None] = {key: None for key in _SESSION_WINDOWS}
+    open_anchors: dict[str, date | None] = {key: None for key in _SESSION_WINDOWS}
     next_number = 1
 
     for candle in candles:
+        local_dt = candle.timestamp.astimezone(NY)
+
+        # 0. Finalize any session window this candle has now exited. Unlike
+        #    swing/FVG confirmation, the just-closed level(s) are NOT
+        #    exempt from this same candle's take-check below: completeness
+        #    was already fully determined at the session's own last member
+        #    candle (formed_at, set inside _finalize_session_window), which
+        #    is strictly earlier than this candle -- so this candle is a
+        #    perfectly ordinary, already-eligible take candidate, and
+        #    skipping it here would just be an artificial extra delay.
+        for key, window in _SESSION_WINDOWS.items():
+            anchor = _session_anchor(local_dt, window)
+            open_anchor = open_anchors[key]
+            if open_anchor is not None and anchor != open_anchor:
+                next_number = _finalize_session_window(
+                    key, open_anchor, timeframe, delta, candles_by_timestamp, active_levels, all_levels, next_number
+                )
+                open_anchors[key] = None
+
         # 1. Advance every reclaim window already open *before* this candle,
         #    same ordering as tradelab.liquidity: this always runs before
         #    step 2 below can add a new watch, so a level taken by this
@@ -222,40 +282,20 @@ def detect_session_liquidity(
                 newly_taken_watches.append(_ReclaimWatch(level=taken_level, take_event=take_event))
         reclaim_watches.extend(newly_taken_watches)
 
-        # 3. Update every session window's currently-open instance with
-        #    this candle (checked by the candle's *open* time in NY, same
-        #    "membership by bucket start" convention as
-        #    tradelab.session_calendar). Windows are independent and may
-        #    overlap (Asia inside Overnight): each is tracked separately.
-        local_dt = candle.timestamp.astimezone(NY)
+        # 3. Record which occurrence this candle opens or extends (checked
+        #    by the candle's *open* time in NY, same "membership by bucket
+        #    start" convention as tradelab.session_calendar). This only
+        #    tracks *which anchor* is in progress per window -- the actual
+        #    high/low/completeness is derived from the full candle set at
+        #    finalization time (step 0 above), not accumulated here.
         for key, window in _SESSION_WINDOWS.items():
             anchor = _session_anchor(local_dt, window)
-            instance = open_instances[key]
-            if instance is not None and (anchor is None or anchor != instance.anchor):
-                next_number = _finalize_session_instance(key, instance, timeframe, active_levels, all_levels, next_number)
-                open_instances[key] = None
-                instance = None
-            if anchor is None:
-                continue
-            if instance is None:
-                open_instances[key] = _OpenSessionInstance(
-                    anchor=anchor,
-                    high=candle.high,
-                    low=candle.low,
-                    member_count=1,
-                    member_timestamps=[candle.timestamp],
-                    last_known_at=candle.known_at,
-                )
-            else:
-                instance.high = max(instance.high, candle.high)
-                instance.low = min(instance.low, candle.low)
-                instance.member_count += 1
-                instance.member_timestamps.append(candle.timestamp)
-                instance.last_known_at = candle.known_at
+            if anchor is not None:
+                open_anchors[key] = anchor
 
-    # Any instance still open at the end of the data never had its close
+    # Any occurrence still open at the end of the data never had its close
     # confirmed by a later candle -- incomplete, so it produces no level
-    # (spec 6.3/6.4: never fabricate a boundary from missing data).
+    # (spec 6.3/6.4/6.5: never fabricate a boundary from missing data).
 
     # Anything still open at the end of the data is PENDING, not a guess.
     for watch in reclaim_watches:
@@ -274,19 +314,36 @@ def detect_session_liquidity(
     return LiquidityDetectionResult(levels=ordered_levels, takes=takes, reclaims=reclaims)
 
 
-def _finalize_session_instance(
+def _finalize_session_window(
     key: str,
-    instance: _OpenSessionInstance,
+    anchor: date,
     timeframe: str,
+    delta: timedelta,
+    candles_by_timestamp: dict[datetime, Candle],
     active_levels: dict[str, LiquidityLevel],
     all_levels: dict[str, LiquidityLevel],
     next_number: int,
 ) -> int:
+    """Build this occurrence's high/low levels only if every expected slot
+    in its window has a matching candle; otherwise produce nothing at all
+    (neither high nor low) for it."""
+    window = _SESSION_WINDOWS[key]
+    expected = _expected_utc_timestamps(anchor, window, delta)
+    members: list[Candle] = []
+    for ts in expected:
+        member = candles_by_timestamp.get(ts)
+        if member is None:
+            return next_number  # incomplete: at least one expected candle is missing
+        members.append(member)
+
+    high = max(c.high for c in members)
+    low = min(c.low for c in members)
+    formed_at = members[-1].known_at
+    member_timestamps = tuple(c.timestamp for c in members)
+    member_count = len(members)
+
     high_type, low_type = _SESSION_LIQUIDITY_TYPES[key]
-    for liquidity_type, side, price in (
-        (high_type, HIGH, instance.high),
-        (low_type, LOW, instance.low),
-    ):
+    for liquidity_type, side, price in ((high_type, HIGH, high), (low_type, LOW, low)):
         level_id = f"{timeframe}-{liquidity_type.value}-{next_number}"
         next_number += 1
         level = LiquidityLevel(
@@ -296,9 +353,9 @@ def _finalize_session_instance(
             side=side,
             lower=price,
             upper=price,
-            member_count=instance.member_count,
-            member_timestamps=tuple(instance.member_timestamps),
-            formed_at=instance.last_known_at,
+            member_count=member_count,
+            member_timestamps=member_timestamps,
+            formed_at=formed_at,
             status=LiquidityStatus.ACTIVE,
             taken_at=None,
             absorbed_by_level_id=None,
