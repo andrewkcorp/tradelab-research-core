@@ -89,6 +89,24 @@ class LiquidityType(str, Enum):
     SWING_LOW = "swing_low"
     EQUAL_HIGHS = "equal_highs"
     EQUAL_LOWS = "equal_lows"
+    # Session highs/lows (spec 6.3, implemented in tradelab.session_liquidity):
+    # each session window is its own type, even where windows overlap
+    # (e.g. Asia is fully contained in Overnight) -- see that module's
+    # docstring for why these live here rather than being redefined there.
+    SESSION_ASIA_HIGH = "session_asia_high"
+    SESSION_ASIA_LOW = "session_asia_low"
+    SESSION_LONDON_HIGH = "session_london_high"
+    SESSION_LONDON_LOW = "session_london_low"
+    SESSION_PRE_NY_HIGH = "session_pre_ny_high"
+    SESSION_PRE_NY_LOW = "session_pre_ny_low"
+    SESSION_NY_AM_HIGH = "session_ny_am_high"
+    SESSION_NY_AM_LOW = "session_ny_am_low"
+    SESSION_NY_LUNCH_HIGH = "session_ny_lunch_high"
+    SESSION_NY_LUNCH_LOW = "session_ny_lunch_low"
+    SESSION_NY_PM_HIGH = "session_ny_pm_high"
+    SESSION_NY_PM_LOW = "session_ny_pm_low"
+    SESSION_OVERNIGHT_HIGH = "session_overnight_high"
+    SESSION_OVERNIGHT_LOW = "session_overnight_low"
 
 
 class LiquidityStatus(str, Enum):
