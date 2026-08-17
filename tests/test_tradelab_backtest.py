@@ -26,7 +26,6 @@ notes.
 """
 from __future__ import annotations
 
-import copy
 import unittest
 import unittest.mock
 from datetime import datetime, timedelta, timezone
@@ -657,6 +656,30 @@ class PreparedContextEquivalenceTests(unittest.TestCase):
         self.assertEqual(via_wrapper.trades[0].tp_source_type, "data_wick")
 
 
+def _snapshot_context(context: PreparedBacktestContext) -> dict:
+    """A plain, value-comparable snapshot of every PreparedBacktestContext
+    field -- dict(...) over its read-only mapping fields (a mappingproxy
+    itself isn't deepcopy/pickle-compatible), plain values everywhere
+    else. Two snapshots taken before/after some operation compare equal
+    iff no field's *value* changed."""
+    return {
+        "bars_1m": context.bars_1m,
+        "news_events": context.news_events,
+        "tick_size": context.tick_size,
+        "pivot_strength": context.pivot_strength,
+        "reclaim_window_bars": context.reclaim_window_bars,
+        "fvg_results": dict(context.fvg_results),
+        "fvg_touch_results": dict(context.fvg_touch_results),
+        "fvg_entry_result": context.fvg_entry_result,
+        "swing_equal_liquidity_results": dict(context.swing_equal_liquidity_results),
+        "session_liquidity_results": dict(context.session_liquidity_results),
+        "liquidity_entry_result": context.liquidity_entry_result,
+        "data_wick_result": context.data_wick_result,
+        "htf_bias_result": context.htf_bias_result,
+        "timeline": context.timeline,
+    }
+
+
 class SharedContextMultiStrategyTests(unittest.TestCase):
     """One prepared context, several different strategies -- proves no
     cross-contamination and no dependence on call order."""
@@ -702,15 +725,73 @@ class SharedContextMultiStrategyTests(unittest.TestCase):
         self.assertEqual(forward_2, reverse_2)
 
     def test_context_fields_are_unchanged_after_backtesting_several_strategies(self):
+        # context's own dict fields are MappingProxyType (not deepcopy-able
+        # -- Python's copy module can't pickle a mappingproxy), so this
+        # snapshots by value instead: dict(...) over each read-only mapping,
+        # plain equality over everything else. That is exactly what this
+        # test needs to prove -- no field's *value* changed -- without
+        # requiring context itself to be deepcopy-compatible.
         bars = fvg_boundary_variant_bars()
         context = prepare_backtest_context(bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
-        snapshot = copy.deepcopy(context)
+        snapshot = _snapshot_context(context)
 
         backtest_prepared_strategy(long_strategy(), context)
         backtest_prepared_strategy(fvg_boundary_strategy(1), context)
         backtest_prepared_strategy(fvg_boundary_strategy(2), context)
 
-        self.assertEqual(context, snapshot)
+        self.assertEqual(_snapshot_context(context), snapshot)
+
+
+class ContextImmutabilityTests(unittest.TestCase):
+    """Proves the review fix: PreparedBacktestContext takes an immutable
+    snapshot of its inputs (bars_1m/news_events as tuples, built before
+    any detection runs) and exposes its dict-shaped results as genuinely
+    read-only mappings -- a caller mutating the list they originally
+    passed to prepare_backtest_context can never desynchronize an
+    already-built context from the facts it describes, and nothing can
+    write into its mapping fields after the fact."""
+
+    def test_mutating_the_original_bars_list_after_preparation_does_not_affect_the_context(self):
+        bars = long_base_bars() + [bar(13, 115, 121, 114, 120)]
+        original_bars_snapshot = tuple(bars)
+        context = prepare_backtest_context(bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+
+        bars.append(bar(14, 200, 200, 200, 200))
+        bars.clear()  # even a full clear of the caller's own list
+
+        self.assertEqual(context.bars_1m, original_bars_snapshot)
+        result = backtest_prepared_strategy(long_strategy(), context)
+        self.assertEqual(result.trade_count, 1)
+        self.assertEqual(result.trades[0].exit_reason, TradeExitReason.TP_HIT)
+
+    def test_mutating_the_original_news_list_after_preparation_does_not_affect_the_context(self):
+        bars = long_base_bars() + [bar(13, 99, 101, 97, 100)]
+        events = [_news_event("EV1", 27)]  # blocks the entry bar (T-15 boundary)
+        context = prepare_backtest_context(bars, events, pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+
+        events.clear()
+        events.append(_news_event("EV2", 1000))
+
+        self.assertEqual(len(context.news_events), 1)
+        self.assertEqual(context.news_events[0].event_id, "EV1")
+        result = backtest_prepared_strategy(long_strategy(), context)
+        # if news_events had been aliased instead of snapshotted, clearing
+        # the original list would have silently unblocked this entry.
+        self.assertEqual(result.trade_count, 0)
+        self.assertEqual(result.skipped_signals[0].reason, SkipReason.NEWS_BLOCK)
+
+    def test_assigning_into_a_context_result_mapping_is_rejected(self):
+        bars = long_base_bars() + [bar(13, 99, 101, 97, 100)]
+        context = prepare_backtest_context(bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+
+        with self.assertRaises(TypeError):
+            context.fvg_results["1m"] = None
+        with self.assertRaises(TypeError):
+            context.fvg_touch_results["1m"] = None
+        with self.assertRaises(TypeError):
+            context.swing_equal_liquidity_results["1m"] = None
+        with self.assertRaises(TypeError):
+            context.session_liquidity_results["1m"] = None
 
 
 class DetectorsRunOnceTests(unittest.TestCase):

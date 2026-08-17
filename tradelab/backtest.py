@@ -157,6 +157,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from types import MappingProxyType
+from typing import Mapping
 
 from tradelab.aggregate import SUPPORTED_TIMEFRAMES as _AGGREGATE_TIMEFRAMES
 from tradelab.aggregate import aggregate_bars
@@ -271,18 +273,49 @@ class PreparedBacktestContext:
     ``session_liquidity_results`` by session_liquidity.
     SUPPORTED_TIMEFRAMES (1m/5m/15m) -- the same two-dict convention
     every detector-adapter module in this package already uses.
+
+    **What "frozen" actually covers here.** ``@dataclass(frozen=True)``
+    only stops *this dataclass's own fields* from being reassigned --
+    it says nothing about the mutability of the objects those fields
+    point to, and a plain ``list``/``dict`` handed straight through from
+    a caller-supplied argument would still alias that caller's own,
+    still-mutable object. Two deliberate steps close that gap without
+    pretending every detection model in this package is now deeply
+    immutable (it isn't, and this module doesn't need it to be, since it
+    never mutates any of it):
+
+    - ``bars_1m``/``news_events`` are stored as **tuples**, built once
+      at the start of ``prepare_backtest_context`` -- a snapshot taken
+      before validation/detection ever runs, so a caller later mutating
+      the original list they passed in (appending a bar, clearing it,
+      whatever) can never retroactively change what this context
+      describes or desynchronize it from the FVG/liquidity/bias facts
+      already computed from the original data.
+    - ``fvg_results``/``fvg_touch_results``/``swing_equal_liquidity_
+      results``/``session_liquidity_results`` are exposed as
+      ``types.MappingProxyType`` -- a genuinely read-only view (``d[k]
+      = v`` raises ``TypeError``) over the dict this module built
+      internally, not the dict itself.
+
+    ``fvg_entry_result``/``liquidity_entry_result``/``data_wick_
+    result``/``htf_bias_result``/``timeline`` are already-frozen
+    dataclasses from their own detector modules (as they were before
+    this context existed) -- this module does not additionally deep-
+    freeze the plain lists nested *inside* them (e.g. ``FVGDetectionResult
+    .zones``); it simply never mutates any of it, which is the only
+    guarantee ``backtest_prepared_strategy`` actually relies on.
     """
 
-    bars_1m: list[Bar1m]
-    news_events: list[NewsEvent]
+    bars_1m: tuple[Bar1m, ...]
+    news_events: tuple[NewsEvent, ...]
     tick_size: float
     pivot_strength: int
     reclaim_window_bars: int
-    fvg_results: dict[str, FVGDetectionResult]
-    fvg_touch_results: dict[str, FVGTouchDetectionResult]
+    fvg_results: Mapping[str, FVGDetectionResult]
+    fvg_touch_results: Mapping[str, FVGTouchDetectionResult]
     fvg_entry_result: FVGEntryCandidateResult
-    swing_equal_liquidity_results: dict[str, LiquidityDetectionResult]
-    session_liquidity_results: dict[str, LiquidityDetectionResult]
+    swing_equal_liquidity_results: Mapping[str, LiquidityDetectionResult]
+    session_liquidity_results: Mapping[str, LiquidityDetectionResult]
     liquidity_entry_result: LiquidityEntryCandidateResult
     data_wick_result: DataWickDetectionResult
     htf_bias_result: HTFBiasResult
@@ -327,6 +360,14 @@ def prepare_backtest_context(
     if not isinstance(reclaim_window_bars, int) or reclaim_window_bars < 1:
         raise ValueError(f"reclaim_window_bars must be a positive integer, got {reclaim_window_bars!r}")
 
+    # Snapshot the inputs into tuples *before* anything else runs, so a
+    # caller mutating the list they originally passed in can never
+    # retroactively change what this context describes or desynchronize
+    # it from the facts already computed from the original data (see
+    # PreparedBacktestContext's own docstring).
+    bars_1m = tuple(bars_1m)
+    news_events = tuple(news_events)
+
     validate_bars(bars_1m)
     candles = _build_candles(bars_1m)
 
@@ -363,11 +404,11 @@ def prepare_backtest_context(
         tick_size=tick_size,
         pivot_strength=pivot_strength,
         reclaim_window_bars=reclaim_window_bars,
-        fvg_results=fvg_results,
-        fvg_touch_results=touch_results,
+        fvg_results=MappingProxyType(fvg_results),
+        fvg_touch_results=MappingProxyType(touch_results),
         fvg_entry_result=fvg_entry_result,
-        swing_equal_liquidity_results=swing_equal_results,
-        session_liquidity_results=session_results,
+        swing_equal_liquidity_results=MappingProxyType(swing_equal_results),
+        session_liquidity_results=MappingProxyType(session_results),
         liquidity_entry_result=liquidity_entry_result,
         data_wick_result=data_wick_result,
         htf_bias_result=htf_bias_result,
@@ -462,7 +503,7 @@ def backtest_prepared_strategy(strategy: StrategySpec, context: PreparedBacktest
     )
 
 
-def _build_candles(bars_1m: list[Bar1m]) -> dict[str, list]:
+def _build_candles(bars_1m: tuple[Bar1m, ...]) -> dict[str, list]:
     # tradelab.aggregate.SUPPORTED_TIMEFRAMES is exactly {"5m","15m","1H",
     # "4H","1D"} -- every native FVG/liquidity timeframe except 1m, which
     # aggregate_bars does not (and cannot) produce from itself.
@@ -478,9 +519,9 @@ def _evaluate_entry(
     bar: Bar1m,
     timeline,
     htf_bias_result,
-    news_events: list[NewsEvent],
-    swing_equal_results: dict[str, LiquidityDetectionResult],
-    session_results: dict[str, LiquidityDetectionResult],
+    news_events: tuple[NewsEvent, ...],
+    swing_equal_results: Mapping[str, LiquidityDetectionResult],
+    session_results: Mapping[str, LiquidityDetectionResult],
     data_wick_result: DataWickDetectionResult,
 ) -> _OpenPosition | SkippedSignal:
     selectors = {strategy.primary_entry_selector, *strategy.required_confluence_selectors}
