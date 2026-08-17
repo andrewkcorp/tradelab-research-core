@@ -56,10 +56,24 @@ No lookahead of its own: this module does not walk candles or reconcile
 timing -- it only ever copies ``known_at``/``resolved_at`` already
 computed by the upstream detectors, so its own correctness reduces to
 theirs. It does, however, cross-validate that its two inputs are
-mutually consistent (every take/reclaim references a real level on the
-declared timeframe from the declared source family, and no level_id or
-take/reclaim is duplicated within one source) rather than trusting
-malformed or mismatched input silently.
+mutually consistent rather than trusting malformed or mismatched input
+silently:
+
+- every take/reclaim references a real level, on the declared timeframe,
+  filed under the correct source family;
+- a take's ``liquidity_type``, ``side``, ``lower``/``upper``, and
+  ``timestamp == known_at`` all agree with its own level (the contract
+  every upstream detector already guarantees for real output -- checked
+  here anyway, since this module cannot assume its input came from a
+  real detector call);
+- a reclaim's ``take_timestamp`` matches its matching take's own
+  ``timestamp`` exactly;
+- ``PENDING`` always has ``resolved_at is None``; every terminal outcome
+  (``RECLAIM_WICK``/``RECLAIM_CLOSE``/``NO_RECLAIM_IN_WINDOW``) always
+  has a ``resolved_at`` strictly after its take's ``known_at`` -- these
+  are checked unconditionally, even for a ``PENDING`` reclaim that will
+  never itself produce a candidate;
+- no ``level_id``, take, or reclaim is duplicated within one source.
 """
 from __future__ import annotations
 
@@ -197,6 +211,26 @@ def _candidates_for_source(source_family: SourceFamily, timeframe: str, result: 
             raise ValueError(f"LiquidityTakeEvent for level {take.level_id!r} has timeframe {take.timeframe!r}, expected {timeframe!r}")
         if take.level_id not in levels_by_id:
             raise ValueError(f"LiquidityTakeEvent references unknown level_id {take.level_id!r} in {source_family.value!r}/{timeframe!r}")
+        level = levels_by_id[take.level_id]
+        if take.liquidity_type != level.liquidity_type:
+            raise ValueError(
+                f"LiquidityTakeEvent for level {take.level_id!r} has liquidity_type {take.liquidity_type!r}, "
+                f"expected {level.liquidity_type!r} (from its LiquidityLevel)"
+            )
+        if take.side != level.side:
+            raise ValueError(
+                f"LiquidityTakeEvent for level {take.level_id!r} has side {take.side!r}, expected {level.side!r} (from its LiquidityLevel)"
+            )
+        if take.lower != level.lower or take.upper != level.upper:
+            raise ValueError(
+                f"LiquidityTakeEvent for level {take.level_id!r} has bounds ({take.lower!r}, {take.upper!r}), "
+                f"expected ({level.lower!r}, {level.upper!r}) (from its LiquidityLevel)"
+            )
+        if take.timestamp != take.known_at:
+            raise ValueError(
+                f"LiquidityTakeEvent for level {take.level_id!r} has timestamp {take.timestamp!r} != known_at "
+                f"{take.known_at!r} -- violates the take-event contract (the two are always equal)"
+            )
         if take.level_id in takes_by_level_id:
             raise ValueError(f"Duplicate take for level_id {take.level_id!r} in {source_family.value!r}/{timeframe!r}")
         takes_by_level_id[take.level_id] = take
@@ -205,8 +239,32 @@ def _candidates_for_source(source_family: SourceFamily, timeframe: str, result: 
     for reclaim in result.reclaims:
         if reclaim.timeframe != timeframe:
             raise ValueError(f"ReclaimResult for level {reclaim.level_id!r} has timeframe {reclaim.timeframe!r}, expected {timeframe!r}")
-        if reclaim.level_id not in takes_by_level_id:
+        take = takes_by_level_id.get(reclaim.level_id)
+        if take is None:
             raise ValueError(f"ReclaimResult references level_id {reclaim.level_id!r} with no matching take in {source_family.value!r}/{timeframe!r}")
+        if reclaim.take_timestamp != take.timestamp:
+            raise ValueError(
+                f"ReclaimResult for level {reclaim.level_id!r} has take_timestamp {reclaim.take_timestamp!r}, "
+                f"expected {take.timestamp!r} (its matching take's own timestamp)"
+            )
+        if reclaim.outcome == ReclaimOutcome.PENDING:
+            if reclaim.resolved_at is not None:
+                raise ValueError(
+                    f"ReclaimResult for level {reclaim.level_id!r} is PENDING but has resolved_at {reclaim.resolved_at!r} "
+                    "set -- PENDING means the outcome is not yet known, so resolved_at must be None"
+                )
+        else:
+            if reclaim.resolved_at is None:
+                raise ValueError(
+                    f"ReclaimResult for level {reclaim.level_id!r} has terminal outcome {reclaim.outcome!r} but "
+                    "resolved_at is None -- every terminal outcome must carry the instant it was resolved"
+                )
+            if reclaim.resolved_at <= take.known_at:
+                raise ValueError(
+                    f"ReclaimResult for level {reclaim.level_id!r} has resolved_at {reclaim.resolved_at!r} not "
+                    f"strictly after its take's known_at {take.known_at!r} -- a reclaim cannot be known before or "
+                    "at the moment of its own take"
+                )
         if reclaim.level_id in reclaims_by_level_id:
             raise ValueError(f"Duplicate reclaim for level_id {reclaim.level_id!r} in {source_family.value!r}/{timeframe!r}")
         reclaims_by_level_id[reclaim.level_id] = reclaim

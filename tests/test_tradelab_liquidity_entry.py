@@ -66,15 +66,26 @@ def level(
     )
 
 
-def take_event(level_id: str = "1m-swing_high-1", timeframe: str = "1m", side: str = HIGH, known_at: datetime = T0 + timedelta(minutes=5)) -> LiquidityTakeEvent:
+def take_event(
+    level_id: str = "1m-swing_high-1",
+    timeframe: str = "1m",
+    liquidity_type: LiquidityType | None = None,
+    side: str = HIGH,
+    lower: float = 100.0,
+    upper: float = 100.0,
+    timestamp: datetime | None = None,
+    known_at: datetime = T0 + timedelta(minutes=5),
+) -> LiquidityTakeEvent:
+    if liquidity_type is None:
+        liquidity_type = LiquidityType.SWING_HIGH if side == HIGH else LiquidityType.SWING_LOW
     return LiquidityTakeEvent(
         level_id=level_id,
         timeframe=timeframe,
-        liquidity_type=LiquidityType.SWING_HIGH if side == HIGH else LiquidityType.SWING_LOW,
+        liquidity_type=liquidity_type,
         side=side,
-        lower=100.0,
-        upper=100.0,
-        timestamp=known_at,
+        lower=lower,
+        upper=upper,
+        timestamp=known_at if timestamp is None else timestamp,
         known_at=known_at,
     )
 
@@ -85,11 +96,12 @@ def reclaim_result(
     outcome: ReclaimOutcome = ReclaimOutcome.RECLAIM_CLOSE,
     resolved_at: datetime | None = T0 + timedelta(minutes=6),
     bars_after_take: int | None = 1,
+    take_timestamp: datetime = T0 + timedelta(minutes=5),
 ) -> ReclaimResult:
     return ReclaimResult(
         level_id=level_id,
         timeframe=timeframe,
-        take_timestamp=T0 + timedelta(minutes=5),
+        take_timestamp=take_timestamp,
         outcome=outcome,
         resolved_at=resolved_at,
         bars_after_take=bars_after_take,
@@ -347,6 +359,71 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             detect_liquidity_entry_candidates({}, {"1m": result})
 
+    # -- Mutations of an otherwise-valid take+reclaim, one field at a time --
+
+    def test_reclaim_with_take_timestamp_not_matching_its_take_is_rejected(self):
+        take_known_at = T0 + timedelta(minutes=5)
+        result = result_with(
+            [level()],
+            [take_event(known_at=take_known_at)],
+            [reclaim_result(take_timestamp=take_known_at + timedelta(minutes=1))],  # same level_id, wrong take_timestamp
+        )
+        with self.assertRaises(ValueError):
+            detect_liquidity_entry_candidates({"1m": result}, {})
+
+    def test_terminal_reclaim_missing_resolved_at_is_rejected(self):
+        for outcome in (ReclaimOutcome.RECLAIM_WICK, ReclaimOutcome.RECLAIM_CLOSE, ReclaimOutcome.NO_RECLAIM_IN_WINDOW):
+            with self.subTest(outcome=outcome):
+                result = result_with([level()], [take_event()], [reclaim_result(outcome=outcome, resolved_at=None)])
+                with self.assertRaises(ValueError):
+                    detect_liquidity_entry_candidates({"1m": result}, {})
+
+    def test_pending_reclaim_with_a_resolved_at_is_rejected(self):
+        result = result_with(
+            [level()], [take_event()], [reclaim_result(outcome=ReclaimOutcome.PENDING, resolved_at=T0 + timedelta(minutes=6), bars_after_take=None)]
+        )
+        with self.assertRaises(ValueError):
+            detect_liquidity_entry_candidates({"1m": result}, {})
+
+    def test_take_with_wrong_side_is_rejected(self):
+        # level says HIGH; take claims LOW (liquidity_type kept consistent
+        # with the level so only `side` itself is the mismatch).
+        result = result_with(
+            [level(side=HIGH, liquidity_type=LiquidityType.SWING_HIGH)],
+            [take_event(side=LOW, liquidity_type=LiquidityType.SWING_HIGH)],
+            [],
+        )
+        with self.assertRaises(ValueError):
+            detect_liquidity_entry_candidates({"1m": result}, {})
+
+    def test_take_with_wrong_liquidity_type_is_rejected(self):
+        result = result_with(
+            [level(liquidity_type=LiquidityType.SWING_HIGH, side=HIGH)],
+            [take_event(liquidity_type=LiquidityType.EQUAL_HIGHS, side=HIGH)],
+            [],
+        )
+        with self.assertRaises(ValueError):
+            detect_liquidity_entry_candidates({"1m": result}, {})
+
+    def test_take_with_wrong_bounds_is_rejected(self):
+        result = result_with([level(lower=100.0, upper=100.0)], [take_event(lower=99.0, upper=99.0)], [])
+        with self.assertRaises(ValueError):
+            detect_liquidity_entry_candidates({"1m": result}, {})
+
+    def test_reclaim_known_at_or_before_its_take_is_rejected(self):
+        take_known_at = T0 + timedelta(minutes=5)
+        at_take = result_with([level()], [take_event(known_at=take_known_at)], [reclaim_result(take_timestamp=take_known_at, resolved_at=take_known_at)])
+        with self.assertRaises(ValueError):
+            detect_liquidity_entry_candidates({"1m": at_take}, {})
+
+        before_take = result_with(
+            [level()],
+            [take_event(known_at=take_known_at)],
+            [reclaim_result(take_timestamp=take_known_at, resolved_at=take_known_at - timedelta(minutes=1))],
+        )
+        with self.assertRaises(ValueError):
+            detect_liquidity_entry_candidates({"1m": before_take}, {})
+
 
 class NoDuplicatesTests(unittest.TestCase):
     def test_candidate_ids_are_unique_across_a_full_result(self):
@@ -371,7 +448,7 @@ class NoDuplicatesTests(unittest.TestCase):
 class AuditTests(unittest.TestCase):
     def test_candidate_retains_full_level_audit_fields(self):
         lvl = level(lower=99.5, upper=100.5)
-        result = result_with([lvl], [take_event()], [])
+        result = result_with([lvl], [take_event(lower=99.5, upper=100.5)], [])
         out = detect_liquidity_entry_candidates({"1m": result}, {})
         for c in out.candidates:
             self.assertEqual(c.level_id, lvl.level_id)
