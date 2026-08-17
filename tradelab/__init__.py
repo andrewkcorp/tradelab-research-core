@@ -26,6 +26,14 @@ from tradelab.liquidity import (
     ReclaimResult,
     detect_liquidity,
 )
+from tradelab.liquidity_entry import (
+    CandidatePhase,
+    EntryMode,
+    LiquidityEntryCandidate,
+    LiquidityEntryCandidateResult,
+    SourceFamily,
+    detect_liquidity_entry_candidates,
+)
 from tradelab.loaders import read_csv_bars, read_parquet_bars
 from tradelab.news import NewsEvent, is_entry_blocked, validate_news_events
 from tradelab.news_loaders import read_news_events_csv, read_news_events_parquet
@@ -81,4 +89,10 @@ __all__ = [
     "FVGTouchEvent",
     "FVGTouchDetectionResult",
     "detect_fvg_touch_events",
+    "SourceFamily",
+    "CandidatePhase",
+    "EntryMode",
+    "LiquidityEntryCandidate",
+    "LiquidityEntryCandidateResult",
+    "detect_liquidity_entry_candidates",
 ]
