@@ -118,6 +118,20 @@ class SelectorHelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             selector_timeframe("liquidity-1m-swing_equal-swing_high-take-sideways")
 
+    def test_swing_type_under_session_family_rejected(self):
+        # swing_high is never a session type -- component-wise valid, combination impossible.
+        with self.assertRaises(ValueError):
+            selector_timeframe("liquidity-1m-session-swing_high-take-reversal")
+        with self.assertRaises(ValueError):
+            selector_fixed_direction("liquidity-1m-session-swing_high-take-reversal")
+
+    def test_session_type_under_swing_equal_family_rejected(self):
+        # session_london_high is never a swing_equal type -- component-wise valid, combination impossible.
+        with self.assertRaises(ValueError):
+            selector_timeframe("liquidity-5m-swing_equal-session_london_high-take-reversal")
+        with self.assertRaises(ValueError):
+            selector_fixed_direction("liquidity-5m-swing_equal-session_london_high-take-reversal")
+
 
 class TPChoiceTests(unittest.TestCase):
     def test_liquidity_requires_rank_1_2_or_3(self):
@@ -226,6 +240,14 @@ class StrategySpecValidationTests(unittest.TestCase):
     def test_invalid_direction_rejected(self):
         with self.assertRaises(ValueError):
             spec(direction="up")
+
+    def test_semantically_impossible_swing_type_under_session_family_rejected_as_primary(self):
+        with self.assertRaises(ValueError):
+            spec(direction=SHORT, primary="liquidity-1m-session-swing_high-take-reversal")
+
+    def test_semantically_impossible_session_type_under_swing_equal_family_rejected_as_primary(self):
+        with self.assertRaises(ValueError):
+            spec(direction=SHORT, primary="liquidity-5m-swing_equal-session_london_high-take-reversal")
 
     def test_bias_policy_must_be_enum_member(self):
         with self.assertRaises(ValueError):

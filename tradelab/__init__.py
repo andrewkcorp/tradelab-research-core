@@ -78,6 +78,12 @@ from tradelab.liquidity_entry import (
 from tradelab.loaders import read_csv_bars, read_parquet_bars
 from tradelab.news import NewsEvent, is_entry_blocked, validate_news_events
 from tradelab.news_loaders import read_news_events_csv, read_news_events_parquet
+from tradelab.selector_catalog import (
+    ALL_CANONICAL_ENTRY_SELECTORS,
+    CANONICAL_FVG_SELECTORS,
+    CANONICAL_LIQUIDITY_SELECTORS,
+    is_canonical_selector,
+)
 from tradelab.session_calendar import expected_open_minutes, is_regular_session_open
 from tradelab.session_liquidity import detect_session_liquidity
 from tradelab.sl_targets import (
@@ -211,6 +217,10 @@ __all__ = [
     "SLTargetCandidate",
     "SLTargetCandidateResult",
     "detect_sl_target_candidates",
+    "CANONICAL_FVG_SELECTORS",
+    "CANONICAL_LIQUIDITY_SELECTORS",
+    "ALL_CANONICAL_ENTRY_SELECTORS",
+    "is_canonical_selector",
     "BiasPolicy",
     "TPChoice",
     "SLChoice",

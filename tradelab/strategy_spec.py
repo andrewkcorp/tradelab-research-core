@@ -23,6 +23,21 @@ invalidates the strategy; a later, opposite-direction signal of the
 existing rule -- this module adds no new invalidation mechanism, it only
 chooses which selector strings a strategy asks that mechanism about.
 
+**Selector validation is entirely ``tradelab.selector_catalog``'s job,
+never this module's own.** ``selector_timeframe``/``selector_fixed_
+direction``/``is_canonical_selector`` (imported here, not redefined) all
+validate against ``ALL_CANONICAL_ENTRY_SELECTORS`` -- the exhaustive,
+enumerated set of every selector string this package's detectors can
+actually produce -- rather than checking each ``-``-separated component
+independently. That distinction matters: a selector like ``liquidity-
+1m-session-swing_high-take-reversal`` has a valid timeframe, a valid
+``source_family`` value, and a valid ``liquidity_type`` value in
+isolation, but ``swing_high`` is never a session type, so no real
+``LiquidityEntryCandidate`` can ever carry that selector -- component-
+wise validation used to accept it anyway. Catalog-membership validation
+cannot make that mistake, since an impossible combination was simply
+never enumerated into the set in the first place.
+
 **Data wicks are never usable as SL, never an entry condition, never
 bias.** ``tradelab.sl_targets.SLSourceType`` has no ``DATA_WICK`` member
 at all, so an ``SLChoice`` can never reference one (``SLChoice.__post_
@@ -87,11 +102,10 @@ from enum import Enum
 from itertools import combinations, product
 from typing import Iterable, Iterator
 
-from tradelab.fvg_entry import SourceType as FVGSourceType
-from tradelab.fvg_entry import SUPPORTED_TIMEFRAMES as _FVG_ENTRY_TIMEFRAMES
-from tradelab.liquidity import LiquidityType
-from tradelab.liquidity_entry import CandidatePhase, EntryMode, SourceFamily
-from tradelab.liquidity_entry import SUPPORTED_TIMEFRAMES as _LIQUIDITY_ENTRY_TIMEFRAMES
+from tradelab.selector_catalog import CANONICAL_FVG_SELECTORS  # noqa: F401 (re-exported)
+from tradelab.selector_catalog import is_canonical_selector  # noqa: F401 (re-exported)
+from tradelab.selector_catalog import selector_fixed_direction  # noqa: F401 (re-exported)
+from tradelab.selector_catalog import selector_timeframe  # noqa: F401 (re-exported)
 from tradelab.sl_targets import FVG_SL_TIMEFRAMES, MAX_LIQUIDITY_SL_TARGETS, SLSourceType
 from tradelab.tp_targets import MAX_LIQUIDITY_TARGETS, TPSourceType
 
@@ -102,106 +116,11 @@ _DIRECTIONS = frozenset({LONG, SHORT})
 _LIQUIDITY_RANKS = frozenset(range(1, MAX_LIQUIDITY_TARGETS + 1))
 _LIQUIDITY_SL_RANKS = frozenset(range(1, MAX_LIQUIDITY_SL_TARGETS + 1))
 
-_LIQUIDITY_DIRECTION = {
-    ("high", EntryMode.REVERSAL): SHORT,
-    ("high", EntryMode.CONTINUATION): LONG,
-    ("low", EntryMode.REVERSAL): LONG,
-    ("low", EntryMode.CONTINUATION): SHORT,
-}
-
 
 class BiasPolicy(str, Enum):
     IGNORE = "ignore"
     REQUIRE_ALIGNED = "require_aligned"
     REQUIRE_NEUTRAL = "require_neutral"
-
-
-def _split_selector(selector: str) -> list[str]:
-    if not isinstance(selector, str) or not selector:
-        raise ValueError(f"selector must be a non-empty string, got {selector!r}")
-    return selector.split("-")
-
-
-def _validate_fvg_selector(selector: str) -> str:
-    """Validate `selector` is a canonical ``fvg-{timeframe}-{source_type}``
-    selector (``tradelab.entry_signal_timeline``'s own format); return its
-    timeframe."""
-    parts = _split_selector(selector)
-    if len(parts) != 3 or parts[0] != "fvg":
-        raise ValueError(f"Malformed fvg selector {selector!r}; expected 'fvg-{{timeframe}}-{{source_type}}'")
-    _, timeframe, source_type = parts
-    if timeframe not in _FVG_ENTRY_TIMEFRAMES:
-        raise ValueError(
-            f"Unsupported FVG entry timeframe {timeframe!r} in selector {selector!r}; expected one of {sorted(_FVG_ENTRY_TIMEFRAMES)}"
-        )
-    valid_source_types = {t.value for t in FVGSourceType}
-    if source_type not in valid_source_types:
-        raise ValueError(f"Unknown FVG source_type {source_type!r} in selector {selector!r}; expected one of {sorted(valid_source_types)}")
-    return timeframe
-
-
-def _validate_liquidity_selector(selector: str) -> tuple[str, str]:
-    """Validate `selector` is a canonical ``liquidity-{timeframe}-
-    {source_family}-{liquidity_type}-{trigger_phase}-{entry_mode}``
-    selector; return ``(timeframe, fixed_direction)`` -- a liquidity
-    selector's entry_mode and implied side always pin it to exactly one
-    direction (the same table ``tradelab.liquidity_entry`` uses)."""
-    parts = _split_selector(selector)
-    if len(parts) != 6 or parts[0] != "liquidity":
-        raise ValueError(
-            f"Malformed liquidity selector {selector!r}; expected "
-            "'liquidity-{timeframe}-{source_family}-{liquidity_type}-{trigger_phase}-{entry_mode}'"
-        )
-    _, timeframe, source_family, liquidity_type, trigger_phase, entry_mode = parts
-    if timeframe not in _LIQUIDITY_ENTRY_TIMEFRAMES:
-        raise ValueError(
-            f"Unsupported liquidity entry timeframe {timeframe!r} in selector {selector!r}; "
-            f"expected one of {sorted(_LIQUIDITY_ENTRY_TIMEFRAMES)}"
-        )
-    if source_family not in {f.value for f in SourceFamily}:
-        raise ValueError(f"Unknown liquidity source_family {source_family!r} in selector {selector!r}")
-    if liquidity_type not in {t.value for t in LiquidityType}:
-        raise ValueError(f"Unknown liquidity_type {liquidity_type!r} in selector {selector!r}")
-    if trigger_phase not in {p.value for p in CandidatePhase}:
-        raise ValueError(f"Unknown trigger_phase {trigger_phase!r} in selector {selector!r}")
-    if entry_mode not in {m.value for m in EntryMode}:
-        raise ValueError(f"Unknown entry_mode {entry_mode!r} in selector {selector!r}")
-
-    if liquidity_type.endswith("_high"):
-        side = "high"
-    elif liquidity_type.endswith("_low"):
-        side = "low"
-    else:
-        raise ValueError(f"liquidity_type {liquidity_type!r} in selector {selector!r} has no recognizable high/low side")
-
-    direction = _LIQUIDITY_DIRECTION[(side, EntryMode(entry_mode))]
-    return timeframe, direction
-
-
-def selector_timeframe(selector: str) -> str:
-    """The timeframe encoded in a canonical ``fvg-*``/``liquidity-*``
-    selector; raises ``ValueError`` for anything else."""
-    parts = _split_selector(selector)
-    if parts[0] == "fvg":
-        return _validate_fvg_selector(selector)
-    if parts[0] == "liquidity":
-        return _validate_liquidity_selector(selector)[0]
-    raise ValueError(f"selector {selector!r} does not start with 'fvg-' or 'liquidity-'")
-
-
-def selector_fixed_direction(selector: str) -> str | None:
-    """The single direction a selector is pinned to, or ``None`` if it is
-    direction-agnostic. Every ``fvg-*`` selector (``fvg_touch``/``ifvg``)
-    spans both directions -- direction lives on the individual
-    ``EntrySignal``, not the selector. Every ``liquidity-*`` selector is
-    pinned to exactly one direction by its ``entry_mode``/implied side."""
-    parts = _split_selector(selector)
-    if parts[0] == "fvg":
-        _validate_fvg_selector(selector)
-        return None
-    if parts[0] == "liquidity":
-        return _validate_liquidity_selector(selector)[1]
-    raise ValueError(f"selector {selector!r} does not start with 'fvg-' or 'liquidity-'")
 
 
 @dataclass(frozen=True)
@@ -272,7 +191,12 @@ class SLChoice:
                 raise ValueError(f"SLChoice.rank must be None for FVG_BOUNDARY, got {self.rank!r}")
             if not self.fvg_link_selector:
                 raise ValueError("SLChoice.fvg_link_selector is required for FVG_BOUNDARY")
-            timeframe = _validate_fvg_selector(self.fvg_link_selector)
+            if self.fvg_link_selector not in CANONICAL_FVG_SELECTORS:
+                raise ValueError(
+                    f"SLChoice.fvg_link_selector {self.fvg_link_selector!r} must be a canonical fvg-* selector "
+                    "(see tradelab.selector_catalog.CANONICAL_FVG_SELECTORS)"
+                )
+            timeframe = selector_timeframe(self.fvg_link_selector)
             if timeframe not in FVG_SL_TIMEFRAMES:
                 raise ValueError(
                     f"SLChoice.fvg_link_selector {self.fvg_link_selector!r} has timeframe {timeframe!r}; "
