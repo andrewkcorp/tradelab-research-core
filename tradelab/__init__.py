@@ -78,6 +78,14 @@ from tradelab.liquidity_entry import (
 from tradelab.loaders import read_csv_bars, read_parquet_bars
 from tradelab.news import NewsEvent, is_entry_blocked, validate_news_events
 from tradelab.news_loaders import read_news_events_csv, read_news_events_parquet
+from tradelab.research_runner import (
+    RejectionReason,
+    ResearchConfig,
+    ResearchEvaluation,
+    ResearchWindow,
+    WindowTradeCount,
+    iter_research_evaluations,
+)
 from tradelab.selector_catalog import (
     ALL_CANONICAL_ENTRY_SELECTORS,
     CANONICAL_FVG_SELECTORS,
@@ -238,4 +246,10 @@ __all__ = [
     "EquityPoint",
     "EquityResult",
     "build_equity_curve",
+    "ResearchWindow",
+    "ResearchConfig",
+    "WindowTradeCount",
+    "RejectionReason",
+    "ResearchEvaluation",
+    "iter_research_evaluations",
 ]
