@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""Entry signal timeline tests: FVG/liquidity normalization, known_at/
+no-lookahead, expiry exactly at 17:00 NY, new trading day from 18:00 NY,
+DST correctness, no cross-trading-day combination, unselected liquidity
+variants never invalidating the selected one, same-selector opposite-
+direction invalidation, same-direction refresh (no duplication), and
+deterministic selector keys with full audit."""
+from __future__ import annotations
+
+import unittest
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from tradelab.entry_signal_timeline import (
+    LONG,
+    SHORT,
+    SourceKind,
+    build_entry_signal_timeline,
+    query_active_signals,
+)
+from tradelab.fvg_entry import FVGEntryCandidate, FVGEntryCandidateResult, SourceType
+from tradelab.liquidity import HIGH, LOW, LiquidityType
+from tradelab.liquidity_entry import (
+    CandidatePhase,
+    EntryMode,
+    LiquidityEntryCandidate,
+    LiquidityEntryCandidateResult,
+    SourceFamily,
+)
+
+NY = ZoneInfo("America/New_York")
+UTC = timezone.utc
+
+
+def ny_dt(year: int, month: int, day: int, hour: int, minute: int) -> datetime:
+    return datetime(year, month, day, hour, minute, tzinfo=NY).astimezone(UTC)
+
+
+def fvg_candidate(
+    zone_id: str = "1m-FVG-1",
+    timeframe: str = "1m",
+    source_type: SourceType = SourceType.FVG_TOUCH,
+    direction: str = LONG,
+    known_at: datetime = ny_dt(2026, 1, 5, 10, 1),
+    timestamp: datetime | None = None,
+) -> FVGEntryCandidate:
+    return FVGEntryCandidate(
+        candidate_id=f"{timeframe}-{source_type.value}-{zone_id}",
+        source_type=source_type,
+        direction=direction,
+        timeframe=timeframe,
+        zone_id=zone_id,
+        lower=100.0,
+        upper=102.0,
+        contact_type=None,
+        timestamp=known_at - timedelta(minutes=1) if timestamp is None else timestamp,
+        known_at=known_at,
+    )
+
+
+def liquidity_candidate(
+    level_id: str = "1m-swing_high-1",
+    timeframe: str = "1m",
+    source_family: SourceFamily = SourceFamily.SWING_EQUAL,
+    liquidity_type: LiquidityType = LiquidityType.SWING_HIGH,
+    side: str = HIGH,
+    trigger_phase: CandidatePhase = CandidatePhase.TAKE,
+    entry_mode: EntryMode = EntryMode.REVERSAL,
+    known_at: datetime = ny_dt(2026, 1, 5, 10, 1),
+) -> LiquidityEntryCandidate:
+    direction = {
+        (HIGH, EntryMode.REVERSAL): SHORT,
+        (HIGH, EntryMode.CONTINUATION): LONG,
+        (LOW, EntryMode.REVERSAL): LONG,
+        (LOW, EntryMode.CONTINUATION): SHORT,
+    }[(side, entry_mode)]
+    return LiquidityEntryCandidate(
+        candidate_id=f"{timeframe}-{source_family.value}-{level_id}-{trigger_phase.value}-{entry_mode.value}",
+        source_family=source_family,
+        timeframe=timeframe,
+        level_id=level_id,
+        liquidity_type=liquidity_type,
+        side=side,
+        lower=100.0,
+        upper=100.0,
+        trigger_phase=trigger_phase,
+        entry_mode=entry_mode,
+        direction=direction,
+        timestamp=known_at,
+        known_at=known_at,
+    )
+
+
+def fvg_result(*candidates: FVGEntryCandidate) -> FVGEntryCandidateResult:
+    return FVGEntryCandidateResult(candidates=list(candidates))
+
+
+def liquidity_result(*candidates: LiquidityEntryCandidate) -> LiquidityEntryCandidateResult:
+    return LiquidityEntryCandidateResult(candidates=list(candidates))
+
+
+EMPTY_FVG = fvg_result()
+EMPTY_LIQUIDITY = liquidity_result()
+
+
+class NormalizationTests(unittest.TestCase):
+    def test_fvg_candidate_normalizes_with_correct_selector_and_source_kind(self):
+        c = fvg_candidate(source_type=SourceType.FVG_TOUCH, timeframe="5m")
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        self.assertEqual(len(timeline.signals), 1)
+        signal = timeline.signals[0]
+        self.assertEqual(signal.source_kind, SourceKind.FVG)
+        self.assertEqual(signal.selector, "fvg-5m-fvg_touch")
+        self.assertEqual(signal.candidate_id, c.candidate_id)
+        self.assertIs(signal.source, c)
+
+    def test_ifvg_candidate_normalizes_with_its_own_selector(self):
+        c = fvg_candidate(source_type=SourceType.IFVG)
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        self.assertEqual(timeline.signals[0].selector, "fvg-1m-ifvg")
+
+    def test_liquidity_candidate_normalizes_with_correct_selector_and_source_kind(self):
+        c = liquidity_candidate(source_family=SourceFamily.SWING_EQUAL, liquidity_type=LiquidityType.SWING_HIGH, trigger_phase=CandidatePhase.TAKE, entry_mode=EntryMode.REVERSAL)
+        timeline = build_entry_signal_timeline(EMPTY_FVG, liquidity_result(c))
+        signal = timeline.signals[0]
+        self.assertEqual(signal.source_kind, SourceKind.LIQUIDITY)
+        self.assertEqual(signal.selector, "liquidity-1m-swing_equal-swing_high-take-reversal")
+        self.assertIs(signal.source, c)
+
+    def test_session_liquidity_candidate_selector_includes_its_subtype(self):
+        c = liquidity_candidate(
+            level_id="1m-session_asia_high-1",
+            source_family=SourceFamily.SESSION,
+            liquidity_type=LiquidityType.SESSION_ASIA_HIGH,
+            trigger_phase=CandidatePhase.RECLAIM_CLOSE,
+            entry_mode=EntryMode.CONTINUATION,
+        )
+        timeline = build_entry_signal_timeline(EMPTY_FVG, liquidity_result(c))
+        self.assertEqual(timeline.signals[0].selector, "liquidity-1m-session-session_asia_high-reclaim_close-continuation")
+
+    def test_combined_timeline_holds_both_kinds_sorted_by_known_at(self):
+        f = fvg_candidate(known_at=ny_dt(2026, 1, 5, 10, 0))
+        l = liquidity_candidate(known_at=ny_dt(2026, 1, 5, 9, 0))
+        timeline = build_entry_signal_timeline(fvg_result(f), liquidity_result(l))
+        self.assertEqual([s.candidate_id for s in timeline.signals], [l.candidate_id, f.candidate_id])
+
+    def test_duplicate_candidate_id_across_sources_is_rejected(self):
+        f = fvg_candidate(zone_id="X")
+        l = liquidity_candidate(level_id="Y")
+        # force a collision
+        object.__setattr__(l, "candidate_id", f.candidate_id)
+        with self.assertRaises(ValueError):
+            build_entry_signal_timeline(fvg_result(f), liquidity_result(l))
+
+
+class KnownAtNoLookaheadTests(unittest.TestCase):
+    def test_signal_known_at_and_timestamp_match_the_source_exactly(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 10, 1), timestamp=ny_dt(2026, 1, 5, 10, 0))
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        signal = timeline.signals[0]
+        self.assertEqual(signal.known_at, c.known_at)
+        self.assertEqual(signal.timestamp, c.timestamp)
+
+    def test_query_before_known_at_never_returns_the_signal(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 10, 1))
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        result = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 1, 5, 10, 0))
+        self.assertEqual(result.active_signals, [])
+
+    def test_query_exactly_at_known_at_returns_the_signal(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 10, 1))
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        result = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 1, 5, 10, 1))
+        self.assertEqual(len(result.active_signals), 1)
+
+
+class ExpiryTests(unittest.TestCase):
+    def test_signal_valid_just_before_1700_ny_same_trading_day(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 10, 0))
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        result = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 1, 5, 16, 59))
+        self.assertEqual(len(result.active_signals), 1)
+
+    def test_signal_expired_exactly_at_1700_ny(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 10, 0))
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        result = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 1, 5, 17, 0))
+        self.assertEqual(result.active_signals, [])
+
+    def test_signal_expired_well_after_1700_ny(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 10, 0))
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        result = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 1, 5, 20, 0))
+        self.assertEqual(result.active_signals, [])
+
+
+class NewTradingDayTests(unittest.TestCase):
+    def test_signal_known_before_1700_belongs_to_the_day_that_started_the_evening_before(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 10, 0))  # NY 10:00 belongs to the day that opened 2026-01-04 18:00
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        self.assertEqual(timeline.signals[0].trading_day_id, "2026-01-04")
+        self.assertEqual(timeline.signals[0].valid_until, ny_dt(2026, 1, 5, 17, 0))
+
+    def test_signal_known_exactly_at_1800_starts_a_new_trading_day(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 18, 0))
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        self.assertEqual(timeline.signals[0].trading_day_id, "2026-01-05")
+        self.assertEqual(timeline.signals[0].valid_until, ny_dt(2026, 1, 6, 17, 0))
+
+    def test_signal_known_just_after_1800_is_in_the_new_trading_day(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 18, 1))
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        self.assertEqual(timeline.signals[0].trading_day_id, "2026-01-05")
+
+    def test_signal_known_exactly_at_1700_is_rejected(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 17, 0))
+        with self.assertRaises(ValueError):
+            build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+
+    def test_signal_known_inside_the_break_is_rejected(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 17, 30))
+        with self.assertRaises(ValueError):
+            build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+
+    def test_signal_known_just_before_1800_still_belongs_to_the_previous_days_window(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 17, 59))
+        with self.assertRaises(ValueError):
+            build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+
+
+class DSTTests(unittest.TestCase):
+    def test_spring_forward_valid_until_is_the_correct_utc_instant(self):
+        # 2026-03-08: NY clocks jump 02:00 -> 03:00 (spring forward).
+        # A signal known well before that, still on 2026-03-07 EST.
+        c = fvg_candidate(known_at=ny_dt(2026, 3, 7, 20, 0))  # trading day started 2026-03-07 18:00
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        signal = timeline.signals[0]
+        self.assertEqual(signal.trading_day_id, "2026-03-07")
+        # 2026-03-08 17:00 NY is EDT (UTC-4) after the transition -> 21:00 UTC.
+        local_valid_until = datetime(2026, 3, 8, 17, 0, tzinfo=NY)
+        self.assertEqual(local_valid_until.utcoffset(), timedelta(hours=-4))
+        self.assertEqual(signal.valid_until, local_valid_until.astimezone(UTC))
+        self.assertEqual(signal.valid_until, datetime(2026, 3, 8, 21, 0, tzinfo=UTC))
+
+    def test_fall_back_valid_until_is_the_correct_utc_instant(self):
+        # 2026-11-01: NY clocks fall back 02:00 -> 01:00.
+        c = fvg_candidate(known_at=ny_dt(2026, 10, 31, 20, 0))  # trading day started 2026-10-31 18:00
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        signal = timeline.signals[0]
+        self.assertEqual(signal.trading_day_id, "2026-10-31")
+        # 2026-11-01 17:00 NY is EST (UTC-5) after the transition -> 22:00 UTC.
+        local_valid_until = datetime(2026, 11, 1, 17, 0, tzinfo=NY)
+        self.assertEqual(local_valid_until.utcoffset(), timedelta(hours=-5))
+        self.assertEqual(signal.valid_until, local_valid_until.astimezone(UTC))
+        self.assertEqual(signal.valid_until, datetime(2026, 11, 1, 22, 0, tzinfo=UTC))
+
+    def test_query_across_the_dst_transition_still_respects_expiry(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 3, 7, 20, 0))
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        just_before = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 3, 8, 16, 59))
+        at_expiry = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 3, 8, 17, 0))
+        self.assertEqual(len(just_before.active_signals), 1)
+        self.assertEqual(at_expiry.active_signals, [])
+
+
+class CrossTradingDayTests(unittest.TestCase):
+    def test_signals_from_different_trading_days_do_not_combine(self):
+        day1_signal = fvg_candidate(zone_id="1m-FVG-1", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        day2_signal = fvg_candidate(zone_id="1m-FVG-2", direction=SHORT, known_at=ny_dt(2026, 1, 6, 10, 0))
+        timeline = build_entry_signal_timeline(fvg_result(day1_signal, day2_signal), EMPTY_LIQUIDITY)
+        self.assertNotEqual(timeline.signals[0].trading_day_id, timeline.signals[1].trading_day_id)
+        # querying while day1's signal is still valid never sees day2's (not yet known)
+        result = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 1, 5, 16, 0))
+        self.assertEqual([s.candidate_id for s in result.active_signals], [day1_signal.candidate_id])
+
+    def test_a_next_day_opposite_signal_never_invalidates_the_prior_expired_day(self):
+        day1_signal = fvg_candidate(zone_id="1m-FVG-1", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        day2_signal = fvg_candidate(zone_id="1m-FVG-2", direction=SHORT, known_at=ny_dt(2026, 1, 6, 10, 0))
+        timeline = build_entry_signal_timeline(fvg_result(day1_signal, day2_signal), EMPTY_LIQUIDITY)
+        result = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 1, 6, 11, 0))
+        # day1's LONG signal is gone because it EXPIRED (17:00 on day1), not because it was invalidated.
+        self.assertEqual(result.active_signals, [])
+        self.assertEqual(result.invalidations, [])
+
+
+class UnselectedVariantTests(unittest.TestCase):
+    def test_unselected_continuation_variant_never_invalidates_selected_reversal(self):
+        reversal = liquidity_candidate(
+            level_id="1m-swing_high-1", side=HIGH, trigger_phase=CandidatePhase.TAKE,
+            entry_mode=EntryMode.REVERSAL, known_at=ny_dt(2026, 1, 5, 10, 0),
+        )
+        continuation = liquidity_candidate(
+            level_id="1m-swing_high-1", side=HIGH, trigger_phase=CandidatePhase.TAKE,
+            entry_mode=EntryMode.CONTINUATION, known_at=ny_dt(2026, 1, 5, 10, 0),
+        )
+        timeline = build_entry_signal_timeline(EMPTY_FVG, liquidity_result(reversal, continuation))
+        self.assertNotEqual(reversal.direction, continuation.direction)
+        # only the reversal selector is chosen by the strategy
+        result = query_active_signals(
+            timeline, {"liquidity-1m-swing_equal-swing_high-take-reversal"}, reversal.direction, ny_dt(2026, 1, 5, 12, 0)
+        )
+        self.assertEqual([s.candidate_id for s in result.active_signals], [reversal.candidate_id])
+        self.assertEqual(result.invalidations, [])
+
+
+class InvalidationTests(unittest.TestCase):
+    def test_later_opposite_signal_in_the_same_selector_invalidates_the_earlier_one(self):
+        first = fvg_candidate(zone_id="1m-FVG-1", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        later = fvg_candidate(zone_id="1m-FVG-2", direction=SHORT, known_at=ny_dt(2026, 1, 5, 12, 0))
+        timeline = build_entry_signal_timeline(fvg_result(first, later), EMPTY_LIQUIDITY)
+
+        result = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 1, 5, 13, 0))
+        self.assertEqual(result.active_signals, [])
+        self.assertEqual(len(result.invalidations), 1)
+        self.assertEqual(result.invalidations[0].signal.candidate_id, first.candidate_id)
+        self.assertEqual(result.invalidations[0].invalidated_by.candidate_id, later.candidate_id)
+
+    def test_the_earlier_signal_is_still_active_before_the_invalidator_is_known(self):
+        first = fvg_candidate(zone_id="1m-FVG-1", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        later = fvg_candidate(zone_id="1m-FVG-2", direction=SHORT, known_at=ny_dt(2026, 1, 5, 12, 0))
+        timeline = build_entry_signal_timeline(fvg_result(first, later), EMPTY_LIQUIDITY)
+
+        result = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 1, 5, 11, 0))
+        self.assertEqual([s.candidate_id for s in result.active_signals], [first.candidate_id])
+        self.assertEqual(result.invalidations, [])
+
+    def test_selected_opposite_signal_invalidates_the_correct_category_only(self):
+        # a same-time opposite signal in a DIFFERENT selector must not interfere
+        touch_long = fvg_candidate(zone_id="1m-FVG-1", source_type=SourceType.FVG_TOUCH, direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        touch_short_later = fvg_candidate(zone_id="1m-FVG-2", source_type=SourceType.FVG_TOUCH, direction=SHORT, known_at=ny_dt(2026, 1, 5, 12, 0))
+        ifvg_short_later = fvg_candidate(zone_id="1m-FVG-3", source_type=SourceType.IFVG, direction=SHORT, known_at=ny_dt(2026, 1, 5, 11, 0))
+        timeline = build_entry_signal_timeline(fvg_result(touch_long, touch_short_later, ifvg_short_later), EMPTY_LIQUIDITY)
+
+        result = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 1, 5, 11, 30))
+        # the ifvg-selector short signal (known at 11:00) must NOT invalidate touch_long,
+        # since it belongs to a different selector.
+        self.assertEqual([s.candidate_id for s in result.active_signals], [touch_long.candidate_id])
+
+
+class SameDirectionRefreshTests(unittest.TestCase):
+    def test_later_same_direction_signal_does_not_invalidate_and_both_remain_active(self):
+        first = fvg_candidate(zone_id="1m-FVG-1", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        second = fvg_candidate(zone_id="1m-FVG-2", direction=LONG, known_at=ny_dt(2026, 1, 5, 12, 0))
+        timeline = build_entry_signal_timeline(fvg_result(first, second), EMPTY_LIQUIDITY)
+
+        result = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 1, 5, 13, 0))
+        self.assertEqual(
+            sorted(s.candidate_id for s in result.active_signals),
+            sorted([first.candidate_id, second.candidate_id]),
+        )
+        self.assertEqual(result.invalidations, [])
+
+    def test_no_duplicate_active_instance_for_the_same_candidate(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 10, 0))
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        result = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 1, 5, 12, 0))
+        self.assertEqual(len(result.active_signals), 1)
+
+
+class SelectorKeyAndAuditTests(unittest.TestCase):
+    def test_selector_keys_are_plain_strings_deterministic_and_stable(self):
+        c = liquidity_candidate()
+        timeline_1 = build_entry_signal_timeline(EMPTY_FVG, liquidity_result(c))
+        timeline_2 = build_entry_signal_timeline(EMPTY_FVG, liquidity_result(c))
+        self.assertIsInstance(timeline_1.signals[0].selector, str)
+        self.assertEqual(timeline_1.signals[0].selector, timeline_2.signals[0].selector)
+
+    def test_trading_day_id_is_a_plain_serializable_string(self):
+        c = fvg_candidate()
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        self.assertIsInstance(timeline.signals[0].trading_day_id, str)
+        # round-trips through date.fromisoformat without error
+        date.fromisoformat(timeline.signals[0].trading_day_id)
+
+    def test_signal_retains_full_source_candidate_for_future_tp_sl(self):
+        c = fvg_candidate()
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        signal = timeline.signals[0]
+        self.assertEqual(signal.source.lower, c.lower)
+        self.assertEqual(signal.source.upper, c.upper)
+        self.assertEqual(signal.source.zone_id, c.zone_id)
+
+    def test_query_rejects_naive_ts_utc(self):
+        c = fvg_candidate()
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        with self.assertRaises(ValueError):
+            query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, datetime(2026, 1, 5, 12, 0))
+
+    def test_query_rejects_invalid_direction(self):
+        c = fvg_candidate()
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        with self.assertRaises(ValueError):
+            query_active_signals(timeline, {"fvg-1m-fvg_touch"}, "up", ny_dt(2026, 1, 5, 12, 0))
+
+    def test_selectors_not_present_in_the_timeline_yield_nothing_not_an_error(self):
+        c = fvg_candidate()
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        result = query_active_signals(timeline, {"fvg-15m-ifvg"}, LONG, ny_dt(2026, 1, 5, 12, 0))
+        self.assertEqual(result.active_signals, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

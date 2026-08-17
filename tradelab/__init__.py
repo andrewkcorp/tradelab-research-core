@@ -14,6 +14,15 @@ from tradelab.bias import (
     compute_htf_bias,
 )
 from tradelab.data_wicks import DataWickDetectionResult, DataWickEvent, DataWickDirection, detect_data_wicks
+from tradelab.entry_signal_timeline import (
+    EntrySignal,
+    EntrySignalQueryResult,
+    EntrySignalTimeline,
+    SignalInvalidation,
+    SourceKind,
+    build_entry_signal_timeline,
+    query_active_signals,
+)
 from tradelab.fvg import Candle, FVGDetectionResult, FVGEvent, FVGStatus, FVGZone, detect_fvgs, from_aggregated_bar, from_bar1m
 from tradelab.fvg_entry import FVGEntryCandidate, FVGEntryCandidateResult, SourceType, detect_fvg_entry_candidates
 from tradelab.fvg_touch import FVGContactType, FVGTouchDetectionResult, FVGTouchEvent, detect_fvg_touch_events
@@ -100,4 +109,11 @@ __all__ = [
     "FVGEntryCandidate",
     "FVGEntryCandidateResult",
     "detect_fvg_entry_candidates",
+    "SourceKind",
+    "EntrySignal",
+    "EntrySignalTimeline",
+    "SignalInvalidation",
+    "EntrySignalQueryResult",
+    "build_entry_signal_timeline",
+    "query_active_signals",
 ]
