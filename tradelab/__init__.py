@@ -49,6 +49,14 @@ from tradelab.news import NewsEvent, is_entry_blocked, validate_news_events
 from tradelab.news_loaders import read_news_events_csv, read_news_events_parquet
 from tradelab.session_calendar import expected_open_minutes, is_regular_session_open
 from tradelab.session_liquidity import detect_session_liquidity
+from tradelab.sl_targets import (
+    FVG_SL_TIMEFRAMES,
+    SLSourceType,
+    SLTargetCandidate,
+    SLTargetCandidateResult,
+    SelectedFVGConfluence,
+    detect_sl_target_candidates,
+)
 from tradelab.tp_targets import (
     LiquiditySourceFamily,
     MarketEntryContext,
@@ -130,4 +138,10 @@ __all__ = [
     "TPTargetCandidate",
     "TPTargetCandidateResult",
     "detect_tp_target_candidates",
+    "FVG_SL_TIMEFRAMES",
+    "SLSourceType",
+    "SelectedFVGConfluence",
+    "SLTargetCandidate",
+    "SLTargetCandidateResult",
+    "detect_sl_target_candidates",
 ]
