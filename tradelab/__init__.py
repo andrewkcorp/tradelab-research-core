@@ -49,6 +49,14 @@ from tradelab.news import NewsEvent, is_entry_blocked, validate_news_events
 from tradelab.news_loaders import read_news_events_csv, read_news_events_parquet
 from tradelab.session_calendar import expected_open_minutes, is_regular_session_open
 from tradelab.session_liquidity import detect_session_liquidity
+from tradelab.tp_targets import (
+    LiquiditySourceFamily,
+    MarketEntryContext,
+    TPSourceType,
+    TPTargetCandidate,
+    TPTargetCandidateResult,
+    detect_tp_target_candidates,
+)
 from tradelab.validation import MissingMinutesGap, ValidationResult, validate_bars
 
 __all__ = [
@@ -116,4 +124,10 @@ __all__ = [
     "EntrySignalQueryResult",
     "build_entry_signal_timeline",
     "query_active_signals",
+    "TPSourceType",
+    "LiquiditySourceFamily",
+    "MarketEntryContext",
+    "TPTargetCandidate",
+    "TPTargetCandidateResult",
+    "detect_tp_target_candidates",
 ]
