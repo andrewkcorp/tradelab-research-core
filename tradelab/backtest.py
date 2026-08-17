@@ -7,11 +7,28 @@ Not the full researchengine: this module backtests exactly **one**
 ``StrategySpec`` at a time, never enumerates the space
 ``tradelab.strategy_spec.iter_strategy_specs`` can produce, and never
 runs multiple trades concurrently. Also explicitly out of scope, on
-purpose, for this first version: USD P&L, the flat $20 round-trip cost,
-position sizing/contract count, an equity curve, drawdown, and any
-cross-strategy ranking -- ``BacktestResult`` reports gross P&L in
-**points** only; everything account-level is a later layer built on top
-of this one.
+purpose, for this first version: the minimum-100-trades-per-year filter,
+strategy ranking, result persistence, and parallel execution -- those
+are later layers built on top of this one.
+
+**Two phases, deliberately split** (spec, this task): everything that
+depends only on ``bars_1m``/``news_events``/``tick_size``/
+``pivot_strength``/``reclaim_window_bars`` -- validation, aggregation,
+every confluence detector, HTF bias, the unified entry timeline -- is
+expensive and, crucially, does not depend on any particular
+``StrategySpec`` at all. ``prepare_backtest_context`` runs that work
+exactly once and returns it as an auditable ``PreparedBacktestContext``;
+``backtest_prepared_strategy`` then backtests one ``StrategySpec``
+against an already-prepared context, touching none of the expensive
+detectors again. This is what lets a future exhaustive research pass
+(enumerating many ``StrategySpec``s over the same market data) prepare
+the data once and reuse it for every strategy, instead of paying the
+full detection cost per strategy -- see the module-level "Preparation
+vs. execution" section below for the exact contract. ``backtest_
+strategy`` remains the simple, one-call public entry point: it is now a
+thin wrapper that prepares a context and immediately backtests one
+strategy against it, with an unchanged signature and identical results
+to before this split.
 
 **Data flow** (spec 2.2/2.1/3.x, reusing every existing detector
 unchanged -- this module defines no new confluence and re-detects
@@ -34,8 +51,14 @@ nothing that already has a canonical detector):
    ``news_events``. HTF bias (``tradelab.bias``) from the 1H/4H/1D FVG
    results. The unified entry timeline (``tradelab.entry_signal_
    timeline``) from the FVG and liquidity entry candidates.
+
+   All of step 3 (and validation/aggregation) is exactly the work
+   ``prepare_backtest_context`` does, once, regardless of how many
+   strategies will later be tested against its result.
 4. A single forward walk over the 1-minute bars drives execution --
-   see "1-minute OHLCV execution adapter" below.
+   see "1-minute OHLCV execution adapter" below. This is exactly
+   ``backtest_prepared_strategy``'s own work: nothing above it is
+   touched again.
 
 **Signal-driven entry, not bar-polling.** A candidate entry is
 evaluated exactly once, at the earliest bar it can possibly fire: the
@@ -108,6 +131,26 @@ bar's own ``timestamp`` (the entry fill instant), and each underlying
 detector already guarantees its own output never reveals a fact before
 its true ``known_at``. This module adds no lookahead of its own on top
 of that.
+
+**Preparation vs. execution.** ``PreparedBacktestContext`` is a plain,
+already-frozen bundle of every fact ``prepare_backtest_context`` computed
+-- ``fvg_results``, ``fvg_touch_results``, ``fvg_entry_result``,
+``swing_equal_liquidity_results``, ``session_liquidity_results``,
+``liquidity_entry_result``, ``data_wick_result``, ``htf_bias_result``,
+``timeline``, plus the exact inputs it was built from (``bars_1m``,
+``news_events``, ``tick_size``, ``pivot_strength``,
+``reclaim_window_bars``) for audit/reproducibility. Every one of its
+fields is itself an immutable value (frozen dataclasses and plain
+dict/list containers that nothing in this module ever mutates in
+place) -- ``backtest_prepared_strategy`` only ever *reads* from a
+context, whether called once or a thousand times, for one strategy or
+many, in any order: none of those calls can affect any other, and a
+context is never mutated by the act of backtesting a strategy against
+it. This is exactly the property a future exhaustive research pass
+needs to prepare one dataset once and safely reuse it for every
+``StrategySpec`` in a large parameter sweep (and, later, to apply a
+minimum-100-trades-per-year filter across that sweep's results) without
+re-running a single detector per strategy.
 """
 from __future__ import annotations
 
@@ -118,19 +161,24 @@ from enum import Enum
 from tradelab.aggregate import SUPPORTED_TIMEFRAMES as _AGGREGATE_TIMEFRAMES
 from tradelab.aggregate import aggregate_bars
 from tradelab.bar import Bar1m
-from tradelab.bias import BEARISH, BULLISH, NEUTRAL, bias_at, compute_htf_bias
+from tradelab.bias import BEARISH, BULLISH, NEUTRAL, HTFBiasResult, bias_at, compute_htf_bias
 from tradelab.bias import SUPPORTED_TIMEFRAMES as _BIAS_TIMEFRAMES
 from tradelab.data_wicks import DataWickDetectionResult, detect_data_wicks
-from tradelab.entry_signal_timeline import EntrySignal, build_entry_signal_timeline, query_active_signals
+from tradelab.entry_signal_timeline import (
+    EntrySignal,
+    EntrySignalTimeline,
+    build_entry_signal_timeline,
+    query_active_signals,
+)
 from tradelab.fvg import DEFAULT_TICK_SIZE, FVGDetectionResult, detect_fvgs, from_aggregated_bar, from_bar1m
 from tradelab.fvg import SUPPORTED_TIMEFRAMES as _FVG_TIMEFRAMES
 from tradelab.fvg_entry import SUPPORTED_TIMEFRAMES as _FVG_ENTRY_TIMEFRAMES
-from tradelab.fvg_entry import detect_fvg_entry_candidates
-from tradelab.fvg_touch import detect_fvg_touch_events
+from tradelab.fvg_entry import FVGEntryCandidateResult, detect_fvg_entry_candidates
+from tradelab.fvg_touch import FVGTouchDetectionResult, detect_fvg_touch_events
 from tradelab.liquidity import LiquidityDetectionResult, detect_liquidity
 from tradelab.liquidity import SUPPORTED_TIMEFRAMES as _LIQUIDITY_TIMEFRAMES
 from tradelab.liquidity_entry import SUPPORTED_TIMEFRAMES as _LIQUIDITY_ENTRY_TIMEFRAMES
-from tradelab.liquidity_entry import detect_liquidity_entry_candidates
+from tradelab.liquidity_entry import LiquidityEntryCandidateResult, detect_liquidity_entry_candidates
 from tradelab.news import NewsEvent, is_entry_blocked
 from tradelab.session_liquidity import SUPPORTED_TIMEFRAMES as _SESSION_TIMEFRAMES
 from tradelab.session_liquidity import detect_session_liquidity
@@ -203,6 +251,45 @@ class BacktestResult:
 
 
 @dataclass(frozen=True)
+class PreparedBacktestContext:
+    """Every fact that depends only on ``bars_1m``/``news_events``/
+    ``tick_size``/``pivot_strength``/``reclaim_window_bars`` -- never on
+    any particular ``StrategySpec`` -- computed exactly once by
+    ``prepare_backtest_context``. See the module docstring's
+    "Preparation vs. execution" section for the full contract:
+    ``backtest_prepared_strategy`` only ever reads from a context, so
+    the same one may be reused, safely and in any order, for as many
+    strategies as needed.
+
+    ``bars_1m``/``news_events``/``tick_size``/``pivot_strength``/
+    ``reclaim_window_bars`` are the exact inputs this context was built
+    from -- kept here for audit/reproducibility, not recomputed from
+    anything else. ``fvg_results``/``fvg_touch_results`` are keyed by
+    every native FVG timeframe (fvg_touch_results only 1m/5m/15m,
+    fvg_entry.SUPPORTED_TIMEFRAMES); ``swing_equal_liquidity_results``
+    is keyed by every native liquidity timeframe;
+    ``session_liquidity_results`` by session_liquidity.
+    SUPPORTED_TIMEFRAMES (1m/5m/15m) -- the same two-dict convention
+    every detector-adapter module in this package already uses.
+    """
+
+    bars_1m: list[Bar1m]
+    news_events: list[NewsEvent]
+    tick_size: float
+    pivot_strength: int
+    reclaim_window_bars: int
+    fvg_results: dict[str, FVGDetectionResult]
+    fvg_touch_results: dict[str, FVGTouchDetectionResult]
+    fvg_entry_result: FVGEntryCandidateResult
+    swing_equal_liquidity_results: dict[str, LiquidityDetectionResult]
+    session_liquidity_results: dict[str, LiquidityDetectionResult]
+    liquidity_entry_result: LiquidityEntryCandidateResult
+    data_wick_result: DataWickDetectionResult
+    htf_bias_result: HTFBiasResult
+    timeline: EntrySignalTimeline
+
+
+@dataclass(frozen=True)
 class _OpenPosition:
     trade_id: str
     strategy_id: str
@@ -214,17 +301,17 @@ class _OpenPosition:
     sl_candidate: SLTargetCandidate
 
 
-def backtest_strategy(
-    strategy: StrategySpec,
+def prepare_backtest_context(
     bars_1m: list[Bar1m],
     news_events: list[NewsEvent],
     *,
     tick_size: float = DEFAULT_TICK_SIZE,
     pivot_strength: int,
     reclaim_window_bars: int,
-) -> BacktestResult:
-    """Backtest exactly one ``StrategySpec`` against a 1-minute OHLCV
-    series and a set of red-folder news events.
+) -> PreparedBacktestContext:
+    """Validate ``bars_1m`` and run every strategy-independent detector
+    exactly once, returning the result as an auditable, reusable
+    ``PreparedBacktestContext`` -- see the module docstring.
 
     ``tick_size`` (default ``tradelab.fvg.DEFAULT_TICK_SIZE``, 0.25 for
     NQ/MNQ), ``pivot_strength``, and ``reclaim_window_bars`` (both
@@ -270,9 +357,57 @@ def backtest_strategy(
 
     timeline = build_entry_signal_timeline(fvg_entry_result, liquidity_entry_result)
 
+    return PreparedBacktestContext(
+        bars_1m=bars_1m,
+        news_events=news_events,
+        tick_size=tick_size,
+        pivot_strength=pivot_strength,
+        reclaim_window_bars=reclaim_window_bars,
+        fvg_results=fvg_results,
+        fvg_touch_results=touch_results,
+        fvg_entry_result=fvg_entry_result,
+        swing_equal_liquidity_results=swing_equal_results,
+        session_liquidity_results=session_results,
+        liquidity_entry_result=liquidity_entry_result,
+        data_wick_result=data_wick_result,
+        htf_bias_result=htf_bias_result,
+        timeline=timeline,
+    )
+
+
+def backtest_strategy(
+    strategy: StrategySpec,
+    bars_1m: list[Bar1m],
+    news_events: list[NewsEvent],
+    *,
+    tick_size: float = DEFAULT_TICK_SIZE,
+    pivot_strength: int,
+    reclaim_window_bars: int,
+) -> BacktestResult:
+    """Backtest exactly one ``StrategySpec`` against a 1-minute OHLCV
+    series and a set of red-folder news events -- a thin convenience
+    wrapper around ``prepare_backtest_context`` + ``backtest_prepared_
+    strategy`` for the common one-strategy case. Preparing a context and
+    calling ``backtest_prepared_strategy`` directly is the way to
+    backtest *several* strategies against the same market data without
+    paying the detection cost more than once (see the module docstring).
+    """
+    context = prepare_backtest_context(
+        bars_1m, news_events, tick_size=tick_size, pivot_strength=pivot_strength, reclaim_window_bars=reclaim_window_bars
+    )
+    return backtest_prepared_strategy(strategy, context)
+
+
+def backtest_prepared_strategy(strategy: StrategySpec, context: PreparedBacktestContext) -> BacktestResult:
+    """Backtest exactly one ``StrategySpec`` against an already-prepared
+    ``PreparedBacktestContext`` -- never touches any of the detectors
+    ``prepare_backtest_context`` already ran, and never mutates
+    ``context`` itself, so the same context may be reused for any number
+    of further strategies, in any order, with no cross-contamination.
+    """
     trigger_known_ats = {
         signal.known_at
-        for signal in timeline.signals_by_selector.get(strategy.primary_entry_selector, [])
+        for signal in context.timeline.signals_by_selector.get(strategy.primary_entry_selector, [])
         if signal.direction == strategy.direction
     }
 
@@ -280,7 +415,7 @@ def backtest_strategy(
     skipped_signals: list[SkippedSignal] = []
     position: _OpenPosition | None = None
 
-    for bar in bars_1m:
+    for bar in context.bars_1m:
         if bar.timestamp in trigger_known_ats:
             if position is not None:
                 skipped_signals.append(SkippedSignal(timestamp=bar.timestamp, reason=SkipReason.ACTIVE_POSITION))
@@ -288,12 +423,12 @@ def backtest_strategy(
                 outcome = _evaluate_entry(
                     strategy=strategy,
                     bar=bar,
-                    timeline=timeline,
-                    htf_bias_result=htf_bias_result,
-                    news_events=news_events,
-                    swing_equal_results=swing_equal_results,
-                    session_results=session_results,
-                    data_wick_result=data_wick_result,
+                    timeline=context.timeline,
+                    htf_bias_result=context.htf_bias_result,
+                    news_events=context.news_events,
+                    swing_equal_results=context.swing_equal_liquidity_results,
+                    session_results=context.session_liquidity_results,
+                    data_wick_result=context.data_wick_result,
                 )
                 if isinstance(outcome, SkippedSignal):
                     skipped_signals.append(outcome)

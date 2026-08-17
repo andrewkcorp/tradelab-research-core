@@ -26,7 +26,9 @@ notes.
 """
 from __future__ import annotations
 
+import copy
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 
 from tradelab.bar import Bar1m
@@ -34,7 +36,15 @@ from tradelab.news import NewsEvent
 from tradelab.sl_targets import SLSourceType
 from tradelab.strategy_spec import LONG, SHORT, BiasPolicy, SLChoice, StrategySpec, TPChoice
 from tradelab.tp_targets import TPSourceType
-from tradelab.backtest import SkipReason, TradeExitReason, backtest_strategy
+from tradelab import backtest as backtest_module
+from tradelab.backtest import (
+    PreparedBacktestContext,
+    SkipReason,
+    TradeExitReason,
+    backtest_prepared_strategy,
+    backtest_strategy,
+    prepare_backtest_context,
+)
 
 UTC = timezone.utc
 T0 = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
@@ -574,6 +584,206 @@ class DataWickTPRegressionTests(unittest.TestCase):
         self.assertEqual(trade.tp_source_type, "data_wick")
         self.assertEqual(trade.tp_price, 108.0)  # the nearer wick (115 is farther from entry_price=99)
         self.assertNotEqual(trade.tp_price, 115.0)
+
+
+class PreparedContextEquivalenceTests(unittest.TestCase):
+    """backtest_strategy is now a thin wrapper -- proves it still gives
+    exactly the same result as calling prepare_backtest_context() +
+    backtest_prepared_strategy() by hand, across several of this file's
+    existing scenarios."""
+
+    def test_long_tp_scenario_matches(self):
+        bars = long_base_bars() + [bar(13, 115, 121, 114, 120)]
+        strategy = long_strategy()
+        via_wrapper = backtest_strategy(strategy, bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+
+        context = prepare_backtest_context(bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+        via_split = backtest_prepared_strategy(strategy, context)
+
+        self.assertEqual(via_wrapper, via_split)
+        self.assertEqual(via_wrapper.trades[0].exit_reason, TradeExitReason.TP_HIT)
+
+    def test_short_scenario_matches(self):
+        bars = short_base_bars() + [bar(13, 95, 96, 89, 90)]
+        strategy = short_strategy()
+        via_wrapper = backtest_strategy(strategy, bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+
+        context = prepare_backtest_context(bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+        via_split = backtest_prepared_strategy(strategy, context)
+
+        self.assertEqual(via_wrapper, via_split)
+
+    def test_fvg_boundary_variant_scenario_matches(self):
+        bars = fvg_boundary_variant_bars()
+        strategy = fvg_boundary_strategy(1)
+        via_wrapper = backtest_strategy(strategy, bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+
+        context = prepare_backtest_context(bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+        via_split = backtest_prepared_strategy(strategy, context)
+
+        self.assertEqual(via_wrapper, via_split)
+        self.assertEqual(via_wrapper.trades[0].sl_source_type, "fvg_boundary")
+
+    def test_news_block_scenario_matches(self):
+        bars = long_base_bars() + [bar(13, 99, 101, 97, 100)]
+        event = _news_event("EV1", 27)
+        strategy = long_strategy()
+        via_wrapper = backtest_strategy(strategy, bars, [event], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+
+        context = prepare_backtest_context(bars, [event], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+        via_split = backtest_prepared_strategy(strategy, context)
+
+        self.assertEqual(via_wrapper, via_split)
+        self.assertEqual(via_wrapper.skipped_signals[0].reason, SkipReason.NEWS_BLOCK)
+
+    def test_data_wick_tp_scenario_matches(self):
+        bars = data_wick_tp_bars()
+        events = [_news_event("EV1", 60), _news_event("EV2", 61, event_type="PPI")]
+        strategy = StrategySpec(
+            strategy_id="s-wick",
+            direction=LONG,
+            primary_entry_selector="liquidity-1m-swing_equal-swing_low-take-reversal",
+            required_confluence_selectors=(),
+            bias_policy=BiasPolicy.IGNORE,
+            tp_choice=TPChoice(source_type=TPSourceType.DATA_WICK),
+            sl_choice=SLChoice(source_type=SLSourceType.LIQUIDITY, rank=1),
+        )
+        via_wrapper = backtest_strategy(strategy, bars, events, pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+
+        context = prepare_backtest_context(bars, events, pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+        via_split = backtest_prepared_strategy(strategy, context)
+
+        self.assertEqual(via_wrapper, via_split)
+        self.assertEqual(via_wrapper.trades[0].tp_source_type, "data_wick")
+
+
+class SharedContextMultiStrategyTests(unittest.TestCase):
+    """One prepared context, several different strategies -- proves no
+    cross-contamination and no dependence on call order."""
+
+    def test_context_is_a_prepared_backtest_context(self):
+        bars = long_base_bars() + [bar(13, 99, 101, 97, 100)]
+        context = prepare_backtest_context(bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+        self.assertIsInstance(context, PreparedBacktestContext)
+
+    def test_same_context_produces_correct_independent_results_for_two_strategies(self):
+        bars = fvg_boundary_variant_bars()
+        context = prepare_backtest_context(bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+
+        # long_strategy uses a plain LIQUIDITY SL/TP on the same primary
+        # trigger this fixture's liquidity structure already fires --
+        # a different SL source entirely from the two FVG-boundary
+        # strategies below, proving the shared context serves genuinely
+        # different strategy configurations correctly and independently.
+        result_liquidity_sl = backtest_prepared_strategy(long_strategy(), context)
+        result_variant_1 = backtest_prepared_strategy(fvg_boundary_strategy(1), context)
+        result_variant_2 = backtest_prepared_strategy(fvg_boundary_strategy(2), context)
+
+        self.assertEqual(result_liquidity_sl.trade_count, 1)
+        self.assertEqual(result_liquidity_sl.trades[0].sl_source_type, "liquidity")
+        self.assertEqual(result_variant_1.trades[0].sl_source_type, "fvg_boundary")
+        self.assertEqual(result_variant_2.trades[0].sl_source_type, "fvg_boundary")
+        self.assertNotEqual(result_variant_1.trades[0].sl_price, result_variant_2.trades[0].sl_price)
+        self.assertNotEqual(result_liquidity_sl.trades[0].sl_price, result_variant_1.trades[0].sl_price)
+
+    def test_result_does_not_depend_on_the_order_strategies_are_run_in(self):
+        bars = fvg_boundary_variant_bars()
+        context = prepare_backtest_context(bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+        strategy_1 = fvg_boundary_strategy(1)
+        strategy_2 = fvg_boundary_strategy(2)
+
+        forward_1 = backtest_prepared_strategy(strategy_1, context)
+        forward_2 = backtest_prepared_strategy(strategy_2, context)
+
+        reverse_2 = backtest_prepared_strategy(strategy_2, context)
+        reverse_1 = backtest_prepared_strategy(strategy_1, context)
+
+        self.assertEqual(forward_1, reverse_1)
+        self.assertEqual(forward_2, reverse_2)
+
+    def test_context_fields_are_unchanged_after_backtesting_several_strategies(self):
+        bars = fvg_boundary_variant_bars()
+        context = prepare_backtest_context(bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+        snapshot = copy.deepcopy(context)
+
+        backtest_prepared_strategy(long_strategy(), context)
+        backtest_prepared_strategy(fvg_boundary_strategy(1), context)
+        backtest_prepared_strategy(fvg_boundary_strategy(2), context)
+
+        self.assertEqual(context, snapshot)
+
+
+class DetectorsRunOnceTests(unittest.TestCase):
+    """Every strategy-independent detector must run exactly once per
+    prepare_backtest_context() call, never again for any number of
+    backtest_prepared_strategy() calls against that same context."""
+
+    def test_detectors_are_not_recalled_across_multiple_strategies(self):
+        bars = fvg_boundary_variant_bars()
+        originals = {
+            name: getattr(backtest_module, name)
+            for name in (
+                "aggregate_bars",
+                "detect_fvgs",
+                "detect_fvg_touch_events",
+                "detect_fvg_entry_candidates",
+                "detect_liquidity",
+                "detect_session_liquidity",
+                "detect_liquidity_entry_candidates",
+                "detect_data_wicks",
+                "compute_htf_bias",
+                "build_entry_signal_timeline",
+                "validate_bars",
+            )
+        }
+        patchers = [
+            unittest.mock.patch.object(backtest_module, name, wraps=func) for name, func in originals.items()
+        ]
+        mocks = [p.start() for p in patchers]
+        self.addCleanup(lambda: [p.stop() for p in patchers])
+
+        context = prepare_backtest_context(bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+        call_counts_after_prepare = {name: getattr(backtest_module, name).call_count for name in originals}
+
+        backtest_prepared_strategy(long_strategy(), context)
+        backtest_prepared_strategy(fvg_boundary_strategy(1), context)
+        backtest_prepared_strategy(fvg_boundary_strategy(2), context)
+
+        for name in originals:
+            current = getattr(backtest_module, name).call_count
+            self.assertEqual(
+                current,
+                call_counts_after_prepare[name],
+                f"{name} was called {current} times after 3 strategies, expected {call_counts_after_prepare[name]} (unchanged since preparation)",
+            )
+        # sanity: preparation itself did call each detector.
+        self.assertGreater(call_counts_after_prepare["detect_fvgs"], 0)
+        self.assertGreater(call_counts_after_prepare["aggregate_bars"], 0)
+
+
+class PrepareBacktestContextValidationTests(unittest.TestCase):
+    def test_non_positive_tick_size_rejected_at_preparation(self):
+        bars = long_base_bars()
+        with self.assertRaises(ValueError):
+            prepare_backtest_context(bars, [], tick_size=0, pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+
+    def test_invalid_pivot_strength_rejected_at_preparation(self):
+        bars = long_base_bars()
+        with self.assertRaises(ValueError):
+            prepare_backtest_context(bars, [], pivot_strength=0, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+        with self.assertRaises(ValueError):
+            prepare_backtest_context(bars, [], pivot_strength="1", reclaim_window_bars=RECLAIM_WINDOW_BARS)
+
+    def test_invalid_reclaim_window_bars_rejected_at_preparation(self):
+        bars = long_base_bars()
+        with self.assertRaises(ValueError):
+            prepare_backtest_context(bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=0)
+
+    def test_invalid_bars_rejected_at_preparation(self):
+        # out-of-order timestamps -- validate_bars' own hard invariant.
+        bad_bars = [bar(1, 100, 100, 100, 100), bar(0, 100, 100, 100, 100)]
+        with self.assertRaises(ValueError):
+            prepare_backtest_context(bad_bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
 
 
 if __name__ == "__main__":

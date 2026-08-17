@@ -20,10 +20,13 @@ from tradelab.accounting import (
 from tradelab.backtest import (
     BacktestResult,
     ExecutedTrade,
+    PreparedBacktestContext,
     SkipReason,
     SkippedSignal,
     TradeExitReason,
+    backtest_prepared_strategy,
     backtest_strategy,
+    prepare_backtest_context,
 )
 from tradelab.bias import (
     BiasSnapshot,
@@ -128,10 +131,13 @@ __all__ = [
     "apply_accounting",
     "BacktestResult",
     "ExecutedTrade",
+    "PreparedBacktestContext",
     "SkipReason",
     "SkippedSignal",
     "TradeExitReason",
     "backtest_strategy",
+    "backtest_prepared_strategy",
+    "prepare_backtest_context",
     "MissingMinutesGap",
     "ValidationResult",
     "validate_bars",
