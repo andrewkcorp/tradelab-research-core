@@ -44,6 +44,7 @@ from tradelab.continuous_futures import (
     build_back_adjusted_continuous_series,
 )
 from tradelab.data_wicks import DataWickDetectionResult, DataWickEvent, DataWickDirection, detect_data_wicks
+from tradelab.databento_parent_csv import DatabentoParentRecord, read_databento_parent_csv
 from tradelab.entry_signal_timeline import (
     EntrySignal,
     EntrySignalQueryResult,
@@ -145,6 +146,13 @@ from tradelab.trade_execution import (
     simulate_trade,
 )
 from tradelab.validation import MissingMinutesGap, ValidationResult, validate_bars
+from tradelab.volume_roll_continuous import (
+    RollTransition,
+    SessionSelection,
+    SymbolVolume,
+    VolumeRollContinuousResult,
+    build_volume_front_month_continuous_series,
+)
 
 __all__ = [
     "Bar1m",
@@ -284,4 +292,11 @@ __all__ = [
     "audit_market_data_artifact",
     "MarketDataSeriesResult",
     "load_market_data_series",
+    "DatabentoParentRecord",
+    "read_databento_parent_csv",
+    "SymbolVolume",
+    "SessionSelection",
+    "RollTransition",
+    "VolumeRollContinuousResult",
+    "build_volume_front_month_continuous_series",
 ]

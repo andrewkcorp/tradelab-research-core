@@ -58,6 +58,40 @@ ROLL_MANIFEST = [
     {"outgoing_contract": "NQZ24", "incoming_contract": "NQH25", "effective_at": "2024-01-02T14:32:00Z", "adjustment_points": 50.0}
 ]
 
+DATABENTO_HEADER = "ts_event,rtype,publisher_id,instrument_id,open,high,low,close,volume,symbol\n"
+# Session boundaries (EST, UTC-5): 2024-01-15 -> [2024-01-15T23:00Z, ...),
+# 2024-01-16 -> [2024-01-16T23:00Z, ...), 2024-01-17 -> [2024-01-17T23:00Z, ...).
+# S0 (warm-up): MNQZ3 wins volume (30 vs 3) -> S1 selects MNQZ3.
+# S1: MNQU3 wins volume (80 vs 20) -> S2 selects MNQU3 (transition, adjustment = 106.5-101.5 = 5.0).
+DATABENTO_PARENT_CSV = (
+    DATABENTO_HEADER
+    + "2024-01-15T23:00:00.000000000Z,33,1,1,100,100,100,100.0,20,MNQZ3\n"
+    + "2024-01-15T23:00:00.000000000Z,33,1,2,105,105,105,105.0,2,MNQU3\n"
+    + "2024-01-15T23:01:00.000000000Z,33,1,1,100.5,100.5,100.5,100.5,10,MNQZ3\n"
+    + "2024-01-15T23:01:00.000000000Z,33,1,2,105.5,105.5,105.5,105.5,1,MNQU3\n"
+    + "2024-01-16T23:00:00.000000000Z,33,1,1,101,101,101,101.0,10,MNQZ3\n"
+    + "2024-01-16T23:00:00.000000000Z,33,1,2,106,106,106,106.0,40,MNQU3\n"
+    + "2024-01-16T23:01:00.000000000Z,33,1,1,101.5,101.5,101.5,101.5,10,MNQZ3\n"
+    + "2024-01-16T23:01:00.000000000Z,33,1,2,106.5,106.5,106.5,106.5,40,MNQU3\n"
+    + "2024-01-17T23:00:00.000000000Z,33,1,2,107,107,107,107.0,50,MNQU3\n"
+)
+
+
+def databento_artifact(sha256: str, *, data_path: str = "mnq_parent.csv") -> MarketDataArtifact:
+    return MarketDataArtifact(
+        schema_version="1.0",
+        source_name="databento-export",
+        instrument_root=Instrument.MNQ,
+        bar_interval="1m",
+        timestamp_timezone="UTC",
+        series_kind=SeriesKind.DATABENTO_PARENT_CSV,
+        data_path=data_path,
+        coverage_start=datetime(2024, 1, 16, 23, 0, tzinfo=UTC),
+        coverage_end=datetime(2024, 1, 17, 23, 1, tzinfo=UTC),
+        sha256=sha256,
+        normalization_method="volume_front_month_v1",
+    )
+
 
 def write(tmp: Path, name: str, content: str) -> Path:
     path = tmp / name
@@ -428,6 +462,86 @@ class UnsupportedFileExtensionTests(unittest.TestCase):
             artifact = continuous_artifact(sha256_of(bad_path), data_path="bars.txt")
             with self.assertRaises(ValueError):
                 load_market_data_series(artifact, base_dir=tmp)
+
+
+class DatabentoParentCsvManifestValidationTests(unittest.TestCase):
+    def test_roll_manifest_path_must_be_none_for_databento_parent_csv(self):
+        with self.assertRaises(ValueError):
+            MarketDataArtifact(
+                schema_version="1.0", source_name="x", instrument_root=Instrument.MNQ, bar_interval="1m",
+                timestamp_timezone="UTC", series_kind=SeriesKind.DATABENTO_PARENT_CSV, data_path="mnq.csv",
+                coverage_start=T0, coverage_end=T0 + timedelta(minutes=1), sha256="0" * 64,
+                normalization_method="volume_front_month_v1", roll_manifest_path="rolls.json",
+            )
+
+    def test_normalization_method_required_for_databento_parent_csv(self):
+        with self.assertRaises(ValueError):
+            MarketDataArtifact(
+                schema_version="1.0", source_name="x", instrument_root=Instrument.MNQ, bar_interval="1m",
+                timestamp_timezone="UTC", series_kind=SeriesKind.DATABENTO_PARENT_CSV, data_path="mnq.csv",
+                coverage_start=T0, coverage_end=T0 + timedelta(minutes=1), sha256="0" * 64,
+            )
+
+
+class DatabentoParentCsvPipelineTests(unittest.TestCase):
+    def test_pipeline_selects_front_month_and_back_adjusts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            csv_path = write(tmp, "mnq_parent.csv", DATABENTO_PARENT_CSV)
+            artifact = databento_artifact(sha256_of(csv_path))
+
+            result = load_market_data_series(artifact, base_dir=tmp)
+
+            self.assertFalse(result.audit_report.has_critical_findings)
+            self.assertTrue(all(b.contract == "MNQ_CONTINUOUS" for b in result.bars))
+            self.assertIsNotNone(result.continuous_series_result)
+            self.assertEqual(len(result.continuous_series_result.applied_rolls), 1)
+            roll = result.continuous_series_result.applied_rolls[0]
+            self.assertEqual(roll.outgoing_contract, "MNQZ3")
+            self.assertEqual(roll.incoming_contract, "MNQU3")
+            self.assertEqual(roll.adjustment_points, 5.0)
+            # warm-up session (2024-01-15) never enters the final bars
+            self.assertTrue(all(b.timestamp >= datetime(2024, 1, 16, 23, 0, tzinfo=UTC) for b in result.bars))
+
+    def test_audit_runs_on_post_selector_bars_not_the_raw_parallel_file(self):
+        # The raw file has many same-timestamp rows across MNQZ3/MNQU3 --
+        # if the audit were run against it directly (instead of the
+        # post-selector, single-contract-per-session bars), the generic
+        # validate_bars duplicate-timestamp check would immediately fail.
+        # A clean pass here proves the audit saw the already-collapsed series.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            csv_path = write(tmp, "mnq_parent.csv", DATABENTO_PARENT_CSV)
+            artifact = databento_artifact(sha256_of(csv_path))
+            result = load_market_data_series(artifact, base_dir=tmp)
+            self.assertNotIn("bar_series_invalid", [f.category for f in result.audit_report.findings])
+            # far fewer audited bars than raw rows, since only the selected
+            # contract's own bars per session ever reach the audit.
+            self.assertLess(result.audit_report.bar_count, DATABENTO_PARENT_CSV.count("\n") - 1)
+
+    def test_bad_checksum_blocks_databento_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            write(tmp, "mnq_parent.csv", DATABENTO_PARENT_CSV)
+            artifact = databento_artifact("0" * 64)  # deliberately wrong
+            with self.assertRaises(ValueError):
+                load_market_data_series(artifact, base_dir=tmp)
+
+    def test_raw_quarterly_and_continuous_behavior_unchanged(self):
+        # Same fixtures/assertions as the pre-existing raw_quarterly/continuous
+        # tests -- guards against the new branch altering their behavior.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            csv_path = write(tmp, "bars.csv", RAW_QUARTERLY_CSV)
+            write(tmp, "rolls.json", json.dumps(ROLL_MANIFEST))
+            artifact = raw_quarterly_artifact(sha256_of(csv_path))
+            result = load_market_data_series(artifact, base_dir=tmp)
+            self.assertTrue(all(b.contract == "NQ_CONTINUOUS" for b in result.bars))
+
+            csv_path2 = write(tmp, "cont.csv", CONTINUOUS_CSV)
+            cont_artifact = continuous_artifact(sha256_of(csv_path2), data_path="cont.csv")
+            cont_result = load_market_data_series(cont_artifact, base_dir=tmp)
+            self.assertIsNone(cont_result.continuous_series_result)
 
 
 if __name__ == "__main__":

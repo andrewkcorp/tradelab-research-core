@@ -13,8 +13,7 @@ plan this module exists to support). This module's only job is to
 describe that local file precisely enough, and check it thoroughly
 enough, that a research pipeline can trust it.
 
-**Two accepted series kinds**, matching ``tradelab.continuous_futures``
-exactly:
+**Three accepted series kinds**:
 
 - ``raw_quarterly`` -- the file holds one or more raw quarterly
   contracts back to back (e.g. ``NQZ24`` then ``NQH25``), and the
@@ -29,13 +28,35 @@ exactly:
   as-is, never re-normalized. Its manifest still records
   ``normalization_method`` and, when known, the ``roll_manifest_path``
   that originally produced it -- provenance only, never re-applied.
+- ``databento_parent_csv`` -- a raw Databento parent-symbology export
+  (``tradelab.databento_parent_csv``), which is a fundamentally
+  *different* shape from ``raw_quarterly``: it holds many quarterly
+  contracts trading **in parallel**, with the same timestamp
+  legitimately repeated once per contract, not one contract at a time.
+  This module never pretends that shape is already ``raw_quarterly`` --
+  it is routed through its own explicit pipeline branch, which first
+  applies ``tradelab.volume_roll_continuous``'s deterministic,
+  audited, previous-session-volume front-month selection to collapse
+  the parallel contracts into one single-contract-at-a-time series
+  (with its own derived ``RollAdjustment``s), *then* the same
+  ``build_back_adjusted_continuous_series`` call every other series
+  kind already uses. ``normalization_method`` records which roll
+  policy version produced it (e.g. ``"volume_front_month_v1"``);
+  ``roll_manifest_path`` must be unset -- there is no manually-supplied
+  roll manifest for this path, since the rolls are derived from the
+  data itself, deterministically, by an explicit and versioned policy.
 
 **Rollover dates and adjustment sizes are never inferred, here or
-anywhere downstream.** Exactly as ``tradelab.continuous_futures``
-already requires, every ``RollAdjustment`` this module loads comes
-verbatim from an explicit rollover manifest file; this module adds no
-heuristic of its own (no volume-dropoff detection, no open-interest
-crossover, nothing) for guessing a roll date or a price adjustment.
+anywhere downstream.** For ``raw_quarterly``/``continuous``, every
+``RollAdjustment`` this module loads comes verbatim from an explicit
+rollover manifest file -- no heuristic of any kind (no volume-dropoff
+detection, no open-interest crossover) ever guesses a roll date or a
+price adjustment. For ``databento_parent_csv``, rollovers are not
+manually supplied at all, but they are still never *guessed*: they are
+deterministically materialized from one explicit, versioned,
+documented policy (``tradelab.volume_roll_continuous``) and fully
+recorded in that module's own audit trail -- a different mechanism
+from a hand-written manifest, but the same underlying guarantee.
 
 **Timestamps are UTC throughout**, matching ``tradelab.bar.Bar1m``'s own
 unconditional normalization -- the manifest's own ``timestamp_timezone``
@@ -72,8 +93,10 @@ from pathlib import Path
 from tradelab.accounting import Instrument
 from tradelab.bar import Bar1m
 from tradelab.continuous_futures import ContinuousSeriesResult, RollAdjustment, build_back_adjusted_continuous_series
+from tradelab.databento_parent_csv import read_databento_parent_csv
 from tradelab.loaders import _parse_timestamp, read_csv_bars, read_parquet_bars
 from tradelab.validation import MissingMinutesGap, validate_bars
+from tradelab.volume_roll_continuous import build_volume_front_month_continuous_series
 
 SCHEMA_VERSION = "1.0"
 SUPPORTED_BAR_INTERVAL = "1m"
@@ -86,6 +109,7 @@ _SHA256_HEX_DIGITS = frozenset("0123456789abcdef")
 class SeriesKind(str, Enum):
     RAW_QUARTERLY = "raw_quarterly"
     CONTINUOUS = "continuous"
+    DATABENTO_PARENT_CSV = "databento_parent_csv"
 
 
 @dataclass(frozen=True)
@@ -100,11 +124,17 @@ class MarketDataArtifact:
     left unset for ``series_kind=continuous`` normalization purposes --
     it may still be supplied there purely as audit provenance (the
     manifest that originally produced this already-continuous file),
-    never re-applied. ``normalization_method`` is the mirror image:
-    mandatory (non-empty) for ``continuous`` (describing how it was
-    built, e.g. ``"additive_back_adjustment"``), and must be ``None``
-    for ``raw_quarterly`` (the data has not been normalized yet -- that
-    field would be misleading before normalization has even happened).
+    never re-applied. It must also be unset for ``series_kind=
+    databento_parent_csv`` -- there is no manually-supplied roll
+    manifest on that path at all; rolls are derived deterministically
+    by ``tradelab.volume_roll_continuous``. ``normalization_method`` is
+    the mirror image: mandatory (non-empty) for ``continuous``
+    (describing how it was built, e.g. ``"additive_back_adjustment"``)
+    and for ``databento_parent_csv`` (recording which roll policy
+    version was used, e.g. ``"volume_front_month_v1"``), and must be
+    ``None`` for ``raw_quarterly`` (the data has not been normalized
+    yet -- that field would be misleading before normalization has
+    even happened).
     """
 
     schema_version: str
@@ -151,6 +181,14 @@ class MarketDataArtifact:
                 raise ValueError("MarketDataArtifact.roll_manifest_path is required for series_kind=raw_quarterly")
             if self.normalization_method is not None:
                 raise ValueError("MarketDataArtifact.normalization_method must be None for series_kind=raw_quarterly (not yet normalized)")
+        elif self.series_kind == SeriesKind.DATABENTO_PARENT_CSV:
+            if self.roll_manifest_path is not None:
+                raise ValueError(
+                    "MarketDataArtifact.roll_manifest_path must be None for series_kind=databento_parent_csv "
+                    "(rolls are derived deterministically by tradelab.volume_roll_continuous, never manually supplied)"
+                )
+            if not self.normalization_method:
+                raise ValueError("MarketDataArtifact.normalization_method is required for series_kind=databento_parent_csv")
         else:  # CONTINUOUS
             if not self.normalization_method:
                 raise ValueError("MarketDataArtifact.normalization_method is required for series_kind=continuous")
@@ -373,7 +411,7 @@ def audit_market_data_artifact(
                     message=f"series_kind=continuous but bars carry {len(distinct_contracts)} distinct contract labels: {distinct_contracts}",
                 )
             )
-    else:  # RAW_QUARTERLY -- a soft, non-rollover-related labeling sanity check only
+    else:  # RAW_QUARTERLY / DATABENTO_PARENT_CSV -- a soft, non-rollover-related labeling sanity check only
         mismatched = sorted({bar.contract for bar in bars if not bar.contract.startswith(artifact.instrument_root.value)})
         if mismatched:
             findings.append(
@@ -440,35 +478,68 @@ def load_market_data_series(
 ) -> MarketDataSeriesResult:
     """Load ``artifact``'s data file, audit it, and -- only if the audit
     found no critical finding -- return the ready-to-use bar series.
-    For ``series_kind=raw_quarterly`` this also loads ``artifact.
-    roll_manifest_path`` and calls ``tradelab.continuous_futures.
-    build_back_adjusted_continuous_series`` unchanged (``canonical_
-    contract`` defaults to ``f"{instrument_root}_CONTINUOUS"`` when not
-    given); for ``series_kind=continuous`` the loaded bars are returned
-    exactly as read, never re-normalized. Raises ``ValueError`` -- never
-    silently -- when the audit reports any critical finding; call
-    ``audit_market_data_artifact`` directly for the full report in that
-    case.
+    ``canonical_contract`` defaults to ``f"{instrument_root}_CONTINUOUS"``
+    when not given. Raises ``ValueError`` -- never silently -- when the
+    audit reports any critical finding; call ``audit_market_data_artifact``
+    directly for the full report in that case.
+
+    - ``series_kind=raw_quarterly``: loads ``artifact.roll_manifest_path``
+      and calls ``tradelab.continuous_futures.build_back_adjusted_
+      continuous_series`` unchanged.
+    - ``series_kind=continuous``: the loaded bars are returned exactly
+      as read, never re-normalized.
+    - ``series_kind=databento_parent_csv``: a genuinely separate path
+      (never treated as if it were already ``raw_quarterly``) --
+      ``tradelab.databento_parent_csv.read_databento_parent_csv`` reads
+      the raw, multi-contract-in-parallel export, then ``tradelab.
+      volume_roll_continuous.build_volume_front_month_continuous_series``
+      collapses it into one single-contract-at-a-time series (deriving
+      its own ``RollAdjustment``s) *before* the same generic audit that
+      every other series kind goes through runs against that already-
+      collapsed series -- never against the raw parallel-contract file,
+      which would immediately fail the generic duplicate-timestamp
+      check by construction.
     """
+    label = canonical_contract or f"{artifact.instrument_root.value}_CONTINUOUS"
+
+    if artifact.series_kind == SeriesKind.DATABENTO_PARENT_CSV:
+        data_path = _resolve_path(artifact.data_path, base_dir)
+        records = read_databento_parent_csv(data_path)
+        selection = build_volume_front_month_continuous_series(records, label)
+        raw_bars = list(selection.raw_bars)
+
+        audit_report = audit_market_data_artifact(artifact, raw_bars, base_dir=base_dir)
+        _raise_if_critical(artifact, audit_report)
+
+        return MarketDataSeriesResult(
+            bars=selection.continuous_series_result.normalized_bars,
+            audit_report=audit_report,
+            continuous_series_result=selection.continuous_series_result,
+        )
+
     data_path = _resolve_path(artifact.data_path, base_dir)
     bars = _read_bars(data_path)
 
     audit_report = audit_market_data_artifact(artifact, bars, base_dir=base_dir)
-    if audit_report.has_critical_findings:
-        critical_messages = [finding.message for finding in audit_report.findings if finding.severity == AuditSeverity.CRITICAL]
-        raise ValueError(
-            f"market data artifact {artifact.source_name!r} ({artifact.data_path}) failed audit with "
-            f"{len(critical_messages)} critical finding(s): {'; '.join(critical_messages)}"
-        )
+    _raise_if_critical(artifact, audit_report)
 
     if artifact.series_kind == SeriesKind.RAW_QUARTERLY:
         roll_manifest_path = _resolve_path(artifact.roll_manifest_path, base_dir)
         rolls = read_roll_manifest(roll_manifest_path)
-        label = canonical_contract or f"{artifact.instrument_root.value}_CONTINUOUS"
         continuous_result = build_back_adjusted_continuous_series(bars, rolls, label)
         return MarketDataSeriesResult(bars=continuous_result.normalized_bars, audit_report=audit_report, continuous_series_result=continuous_result)
 
     return MarketDataSeriesResult(bars=tuple(bars), audit_report=audit_report, continuous_series_result=None)
+
+
+def _raise_if_critical(artifact: MarketDataArtifact, audit_report: MarketDataArtifactAuditReport) -> None:
+    if not audit_report.has_critical_findings:
+        return
+    critical_messages = [finding.message for finding in audit_report.findings if finding.severity == AuditSeverity.CRITICAL]
+    raise ValueError(
+        f"market data artifact {artifact.source_name!r} ({artifact.data_path}) failed audit with "
+        f"{len(critical_messages)} critical finding(s): {'; '.join(critical_messages)}"
+    )
 
 
 def _resolve_path(raw_path: str, base_dir: Path | str | None) -> Path:
