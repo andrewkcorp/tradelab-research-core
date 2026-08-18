@@ -37,6 +37,12 @@ from tradelab.bias import (
     bias_at,
     compute_htf_bias,
 )
+from tradelab.continuous_futures import (
+    ContinuousSeriesResult,
+    ContractOffset,
+    RollAdjustment,
+    build_back_adjusted_continuous_series,
+)
 from tradelab.data_wicks import DataWickDetectionResult, DataWickEvent, DataWickDirection, detect_data_wicks
 from tradelab.entry_signal_timeline import (
     EntrySignal,
@@ -252,4 +258,8 @@ __all__ = [
     "RejectionReason",
     "ResearchEvaluation",
     "iter_research_evaluations",
+    "RollAdjustment",
+    "ContractOffset",
+    "ContinuousSeriesResult",
+    "build_back_adjusted_continuous_series",
 ]
