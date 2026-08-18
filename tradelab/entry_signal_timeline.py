@@ -78,12 +78,33 @@ direction, and an as-of instant:
 Not built here, on purpose (later steps): which selectors combine into a
 concrete strategy, full combination enumeration, opening positions, the
 news filter, TP/SL, or bias as a filter.
+
+**Bulk snapshotting** (``iter_active_signal_snapshots``): ``query_active_
+signals`` is a fresh, self-contained query -- fine for a handful of
+caller-chosen instants, but a caller that needs the active state at
+*every* real signal's own instant (e.g. ``tradelab.observed_strategy_
+universe``, discovering which confluence selectors were ever really
+co-active) would otherwise have to call it once per signal, each call
+itself scanning the whole timeline -- ``O(N)`` queries times ``O(N))``
+work each, ``O(N^2)`` overall for ``N`` signals, which does not scale to
+a real multi-year dataset's signal count. ``iter_active_signal_
+snapshots`` computes the exact same per-instant active state for every
+signal in one linear forward sweep instead: chronological order, an
+expiry min-heap, and immediate (same-instant) invalidation removal --
+``O(N log N)`` total. It never changes ``query_active_signals`` itself
+or any of its semantics; it is a second, equivalent way to obtain the
+same answer at every real instant instead of a handful of caller-chosen
+ones, and its own test suite verifies the two agree exactly, including
+on randomized fixtures.
 """
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from enum import Enum
+from itertools import groupby
+from typing import Iterator
 from zoneinfo import ZoneInfo
 
 from tradelab.fvg_entry import FVGEntryCandidate, FVGEntryCandidateResult
@@ -294,3 +315,107 @@ def query_active_signals(
     active.sort(key=lambda s: (s.known_at, s.candidate_id))
     invalidations.sort(key=lambda inv: (inv.signal.known_at, inv.signal.candidate_id))
     return EntrySignalQueryResult(active_signals=active, invalidations=invalidations)
+
+
+@dataclass(frozen=True)
+class SignalSnapshot:
+    """One real ``EntrySignal``'s own ``known_at`` instant, paired with
+    the full, per-selector snapshot of every signal of that *same*
+    ``signal.direction`` simultaneously active (known, unexpired, not
+    invalidated) at that exact instant -- semantically identical to
+    grouping ``query_active_signals(timeline, set(timeline.signals_by_
+    selector), signal.direction, signal.known_at).active_signals`` by
+    ``.selector``, but produced by ``iter_active_signal_snapshots`` in
+    one linear forward sweep instead of a fresh query. ``active_by_
+    selector`` always includes ``signal`` itself under its own
+    ``signal.selector`` key -- it is trivially known and unexpired at
+    its own ``known_at``, exactly as ``query_active_signals`` would also
+    report."""
+
+    signal: EntrySignal
+    active_by_selector: dict[str, tuple[EntrySignal, ...]]
+
+
+def iter_active_signal_snapshots(timeline: EntrySignalTimeline) -> Iterator[SignalSnapshot]:
+    """Yield one ``SignalSnapshot`` per real signal in ``timeline.signals``
+    (the timeline's own chronological order), each equivalent to a fresh
+    ``query_active_signals`` call at that signal's own ``known_at`` for
+    its own ``direction``, grouped by selector -- computed incrementally
+    in ``O(N log N)`` total over ``N`` signals via a forward sweep (an
+    expiry min-heap plus immediate same-instant invalidation removal),
+    instead of ``O(N)`` fresh queries each themselves scanning the whole
+    timeline. Never changes ``query_active_signals`` itself; see the
+    module docstring's "Bulk snapshotting" section.
+
+    Mirrors every one of ``query_active_signals``'s rules exactly:
+    direction filtering, ``known_at <= ts < valid_until``, invalidation
+    by a strictly *later* opposite-direction signal of the same selector
+    (two signals sharing the exact same ``known_at`` never invalidate
+    each other -- this function's invalidation step only ever removes a
+    *strictly earlier* opposite-direction signal, mirroring that
+    function's own strict ``>`` comparison), and multiple simultaneously
+    active same-selector signals never collapsing into one.
+
+    Signals are processed in ``known_at``-grouped batches, not one at a
+    time: two (or more) signals sharing the exact same ``known_at`` must
+    each see *all* of the others in that same group as already known
+    when their own snapshot is taken (``query_active_signals`` only ever
+    checks ``known_at <= ts``, so equal ``known_at`` values are always
+    mutually visible) -- processing them strictly one-by-one in
+    ``timeline.signals``'s own tie-broken order would otherwise let an
+    earlier-processed signal's snapshot miss a same-instant sibling that
+    happens to sort after it.
+    """
+    active: dict[str, dict[str, EntrySignal]] = {}
+    expiry_heap: list[tuple[datetime, str, str]] = []
+
+    for known_at, group_iter in groupby(timeline.signals, key=lambda s: s.known_at):
+        group = list(group_iter)
+
+        # 1. Expire anything whose valid_until <= this instant (query
+        #    semantics: known_at <= ts < valid_until, so valid_until == ts
+        #    is already expired, not active).
+        while expiry_heap and expiry_heap[0][0] <= known_at:
+            _, expired_selector, expired_candidate_id = heapq.heappop(expiry_heap)
+            selector_group = active.get(expired_selector)
+            if selector_group is not None:
+                selector_group.pop(expired_candidate_id, None)
+                if not selector_group:
+                    del active[expired_selector]
+
+        # 2. Invalidate, for every signal in this group, against the
+        #    pre-group active state: a still-active, *strictly earlier*
+        #    (known_at <, never ==), opposite-direction signal of the
+        #    same selector is permanently removed. Checked per group
+        #    member (not merged) so a group mixing both directions for
+        #    one selector still invalidates correctly on each side; group
+        #    members never invalidate each other (their own known_at
+        #    values are all equal, so the strict "<" never matches).
+        for signal in group:
+            selector_group = active.get(signal.selector)
+            if not selector_group:
+                continue
+            invalidated_ids = [
+                candidate_id
+                for candidate_id, other in selector_group.items()
+                if other.direction != signal.direction and other.known_at < known_at
+            ]
+            for candidate_id in invalidated_ids:
+                del selector_group[candidate_id]
+            if not selector_group:
+                del active[signal.selector]
+
+        # 3. Add every signal in this group.
+        for signal in group:
+            active.setdefault(signal.selector, {})[signal.candidate_id] = signal
+            heapq.heappush(expiry_heap, (signal.valid_until, signal.selector, signal.candidate_id))
+
+        # 4. Snapshot each group member now that the whole group (and
+        #    only the whole group, nothing from the future) is active.
+        for signal in group:
+            active_by_selector = {
+                selector: tuple(sig for sig in selector_group.values() if sig.direction == signal.direction)
+                for selector, selector_group in active.items()
+            }
+            active_by_selector = {selector: sigs for selector, sigs in active_by_selector.items() if sigs}
+            yield SignalSnapshot(signal=signal, active_by_selector=active_by_selector)

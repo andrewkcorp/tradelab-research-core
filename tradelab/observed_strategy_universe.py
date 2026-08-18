@@ -13,35 +13,80 @@ detectors can ever produce -- it says nothing about which of them were
 ever simultaneously *active* in a specific dataset. A required-
 confluence subset is only ever a real strategy candidate if every one
 of its selectors was genuinely active, in the same direction, at some
-real primary signal's own ``known_at`` -- this module discovers that
-observed co-activity directly from ``context.timeline`` (via the exact
-same ``tradelab.entry_signal_timeline.query_active_signals`` mechanism
-a real backtest already uses to evaluate confluence) rather than
-enumerating subsets of the full catalog and hoping most of them turn out
-to be reachable. In real market data, the number of selectors *actually*
-co-active at any one instant is small and sparse compared to 438, so the
-real, reachable combination space -- while it can still be large -- is
-many orders of magnitude smaller than the abstract power set. **There is
-still no artificial cap on how many required confluences a generated
-strategy may carry** (this module never sets ``max_required_confluences``
-in the sense ``tradelab.strategy_spec.iter_strategy_specs`` uses that
-parameter) -- the only bound is what the data itself ever actually
-produced.
+real primary signal's own ``known_at``. **There is still no artificial
+cap on how many required confluences a generated strategy may carry**
+(this module never sets ``max_required_confluences`` in the sense
+``tradelab.strategy_spec.iter_strategy_specs`` uses that parameter) --
+the only bound is what the data itself ever actually produced, gated by
+the same minimum-trade-frequency threshold (``min_trades_per_window``,
+default 100, in every one of two explicit full-calendar-year windows)
+``tradelab.research_runner`` already applies downstream.
+
+**Why frequent-itemset mining, not subset enumeration.** Real market
+data does not keep active pools small: signals stay valid for the
+*whole trading day* (``tradelab.entry_signal_timeline``'s own
+persistence rule), so at any one instant, dozens to over a hundred of
+the 438 selectors can be simultaneously active (measured on a real MNQ
+slice: average ~58, max 137 concurrently active selectors). Enumerating
+"every subset" of a 58-selector pool is ``2**58`` -- computationally
+impossible, not merely slow -- so this module never enumerates subsets
+directly. Instead, ``discover_observed_universe`` mines required-
+confluence subsets as **frequent itemsets**: a subset is only generated
+if its support (the count of real primary occurrences whose own active
+pool is a superset of it) meets ``min_trades_per_window`` in *every*
+explicit window -- exactly the same "raw co-occurrence count is a safe
+upper bound on real trade count" prefilter principle ``tradelab.
+research_runner`` already uses (a confluence-restricted combo can never
+accumulate more real trades than its own raw co-occurrence count, so a
+combo that can't even clear the threshold *before* a backtest runs
+could never clear it after one either). Mining uses Apriori-style
+level-wise search with anti-monotonic pruning (support can only shrink,
+never grow, as an itemset gains members, so once a subset fails the
+threshold no superset of it is ever even considered) -- proven complete
+against brute-force enumeration on synthetic data (``tests/test_
+tradelab_observed_strategy_universe.py``'s ``FrequentItemsetMining
+CompletenessTests``).
+
+**Known limitation, not yet solved: real-MNQ-scale tractability.**
+Apriori's pruning assumes support decays quickly as itemsets grow --
+true for sparse, independent data, but real MNQ confluence selectors
+are *densely correlated* (a single price-structure event routinely
+trips many selectors, timeframes, and variants at once, and whole-day
+persistence keeps them co-active for hours), so support decays far more
+slowly than classical Apriori assumes. Measured on a real 10k-bar
+slice at the default threshold (100): one single ``(primary,
+direction)`` pair alone already has 92 frequent single-item confluence
+selectors; at a relaxed threshold of 50, 134 frequent items produce
+8,911 candidate pairs, of which 6,078 (68%) are *still* frequent at the
+next level. A follow-up investigation into closed-itemset deduplication
+(collapsing itemsets that share an identical occurrence-ID set into one
+canonical representative) found the same data does not rescue this
+either: frequent items collapse into only 86 distinct occurrence-sets
+out of 92 (correlated, but not identical), and at the next level 2,011
+distinct candidate pairs converge to 2,011 distinct occurrence-sets --
+zero convergence. Mining is therefore *correct* (verified against real,
+independently-tested O(N log N) discovery and, separately, brute-force
+completeness on synthetic data) but **not yet proven tractable at full
+real-MNQ scale** -- this PR does not attempt a full real-data combo
+discovery run; that remains open follow-up work.
 
 **Two phases, deliberately split, mirroring ``tradelab.backtest``'s own
 "preparation vs. execution" split:**
 
 1. ``discover_observed_universe(context)`` -- a single, eager pass over
-   every real ``EntrySignal`` in ``context.timeline``, producing an
-   ``ObservedUniverse``: the deduplicated set of every really-observed
-   ``(direction, primary_entry_selector, required_confluence_selectors)``
-   combination (an ``ObservedConfluenceCombo``, still no TP/SL/bias
-   attached), plus the empirical FVG-boundary-SL variant bounds (see
-   below) and a few audit counts. This *is* eagerly materialized -- but
-   it is the bounded, "real observed combos" layer the module docstring
-   above distinguishes from the combinatorial explosion; it is never as
-   large as the full expanded strategy space, since it carries no TP/SL/
-   bias multiplication yet.
+   every real ``EntrySignal`` in ``context.timeline`` (via ``tradelab.
+   entry_signal_timeline.iter_active_signal_snapshots``, one linear
+   forward sweep, ``O(N log N)`` for ``N`` signals -- see that
+   function's own docstring; this pass alone was confirmed on a real
+   100k-bar MNQ slice: 107,162 signals swept in 9.7s, no ``query_
+   active_signals`` calls at all), collecting each ``(primary,
+   direction)`` pair's own real occurrences, then mining the frequent
+   required-confluence itemsets for each pair (see above), plus the
+   empirical FVG-boundary-SL variant bounds (see below) and a few audit
+   counts. Returns an ``ObservedUniverse``: the set of every really-
+   observed, frequent ``(direction, primary_entry_selector, required_
+   confluence_selectors)`` combination (an ``ObservedConfluenceCombo``,
+   still no TP/SL/bias attached).
 2. ``iter_observed_strategy_specs(universe)`` -- a lazy generator over
    that already-discovered, bounded set of combos, expanding each one
    across all three ``BiasPolicy`` values, all four TP choices
@@ -63,24 +108,26 @@ journal.ResearchJournal.run(strategy_specs, context)`` unchanged.
 **Empirical FVG-boundary-SL variant bounds** (this task's own
 requirement): ``SLChoice(source_type=FVG_BOUNDARY, fvg_variant_number=N)``
 has no *artificial* global cap on ``N`` -- but generating every ``N``
-from 1 to infinity would be nonsensical, since ``tradelab.sl_targets.
-detect_sl_target_candidates`` can never return more qualifying boundaries
-than there are currently-active ``EntrySignal``s of the linked fvg-5m/15m
-selector at any one real entry instant. For each ``(fvg_link_selector,
-direction)`` pair this module tracks, across every real primary-signal
-occurrence, the maximum number of *simultaneously active*, same-
-direction signals of that selector ever observed (via the same ``query_
-active_signals`` call already used for confluence discovery -- no extra
-detector run) -- a provably *safe upper bound*: ``len(sl_result.
-fvg_targets)`` can never exceed the count of currently-active candidates
-that feed it, so a variant number above this bound could never produce a
-qualifying boundary anywhere in this context, and every variant number up
-to and including the bound is never wrongly excluded either. This bound
-may occasionally be a little generous (a handful of the active
-candidates at a given instant might not individually qualify as an SL
-boundary, e.g. wrong side relative to entry) -- that only ever costs a
-combination that ends up ``MISSING_TARGET`` at backtest time, never a
-missed real variant and never a crash.
+from 1 to infinity would be nonsensical, so this module computes the
+*exact* maximum ``N`` that could ever actually matter, not an
+approximation. For each ``(fvg_link_selector, direction)`` pair, at
+every real instant where that selector is genuinely active (as this
+occurrence's own primary or as a confluence), this module calls
+``tradelab.sl_targets.detect_sl_target_candidates`` itself -- with the
+real entry price a backtest would actually use (``tradelab.backtest``'s
+own contract: the 1-minute bar whose own ``timestamp`` equals the
+signal's ``known_at``, its own ``open``), the real ``direction``, and
+exactly the FVG candidates genuinely active for that selector at that
+instant -- and reads ``len(sl_result.fvg_targets)`` directly: the *true*
+number of boundaries that call would accept, already filtered by
+``detect_sl_target_candidates``'s own side-relative-to-entry-price rule.
+The running maximum of that true count, across every real occurrence,
+*is* the bound -- never an approximation from merely counting active
+signals (which can overcount, since not every active FVG candidate ends
+up on the correct side of a given real entry price). A variant number
+above this bound could never produce a qualifying boundary anywhere in
+this context; every variant number up to and including it was genuinely
+observed to qualify at least once.
 
 **Never filters by historical results.** Exactly like ``tradelab.
 strategy_spec.iter_strategy_specs``, nothing here inspects P&L, win
@@ -105,15 +152,22 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from itertools import combinations
 from pathlib import Path
 from typing import Iterator, Mapping
 
 from tradelab.backtest import PreparedBacktestContext
-from tradelab.entry_signal_timeline import query_active_signals
+from tradelab.entry_signal_timeline import EntrySignal, iter_active_signal_snapshots
+from tradelab.research_runner import ResearchWindow, _count_per_window
 from tradelab.selector_catalog import ALL_CANONICAL_ENTRY_SELECTORS, selector_fixed_direction, selector_timeframe
-from tradelab.sl_targets import FVG_SL_TIMEFRAMES, MAX_LIQUIDITY_SL_TARGETS, SLSourceType
-from tradelab.strategy_spec import LONG, SHORT, BiasPolicy, SLChoice, StrategySpec, TPChoice, _build_strategy_id
+from tradelab.sl_targets import (
+    FVG_SL_TIMEFRAMES,
+    MAX_LIQUIDITY_SL_TARGETS,
+    MarketEntryContext,
+    SelectedFVGConfluence,
+    SLSourceType,
+    detect_sl_target_candidates,
+)
+from tradelab.strategy_spec import BiasPolicy, SLChoice, StrategySpec, TPChoice, _build_strategy_id
 from tradelab.tp_targets import MAX_LIQUIDITY_TARGETS, TPSourceType
 
 UNIVERSE_SCHEMA_VERSION = "1.0"
@@ -124,7 +178,18 @@ ALL_TP_CHOICES: tuple[TPChoice, ...] = tuple(
     TPChoice(source_type=TPSourceType.LIQUIDITY, rank=rank) for rank in range(1, MAX_LIQUIDITY_TARGETS + 1)
 ) + (TPChoice(source_type=TPSourceType.DATA_WICK, rank=None),)
 
-_DIRECTIONS: tuple[str, ...] = (LONG, SHORT)
+# The same two explicit, full, half-open calendar-year windows
+# tradelab.profile_research_context.PROFILE_WINDOWS already uses, and the
+# same default tradelab.research_runner.ResearchConfig.min_trades_per_window
+# already uses -- reused here as the *default* pruning threshold for
+# frequent-confluence-itemset mining (see discover_observed_universe's own
+# docstring). Both remain explicit, overridable parameters, never silently
+# hard-coded assumptions a caller cannot see or change.
+DEFAULT_PRUNING_WINDOWS: tuple[ResearchWindow, ...] = (
+    ResearchWindow("2024", datetime(2024, 1, 1, tzinfo=timezone.utc), datetime(2025, 1, 1, tzinfo=timezone.utc)),
+    ResearchWindow("2025", datetime(2025, 1, 1, tzinfo=timezone.utc), datetime(2026, 1, 1, tzinfo=timezone.utc)),
+)
+DEFAULT_MIN_TRADES_PER_WINDOW = 100
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS universe_manifest (
@@ -133,11 +198,22 @@ CREATE TABLE IF NOT EXISTS universe_manifest (
     context_artifact_id TEXT NOT NULL,
     selector_catalog_fingerprint TEXT NOT NULL,
     generator_policy_version TEXT NOT NULL,
+    min_trades_per_window INTEGER NOT NULL,
+    pruning_windows_json TEXT NOT NULL,
     primary_pair_count INTEGER NOT NULL,
     primary_occurrence_count INTEGER NOT NULL,
     combo_count INTEGER NOT NULL,
     fvg_boundary_bounds_json TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS combo_support (
+    direction TEXT NOT NULL,
+    primary_entry_selector TEXT NOT NULL,
+    required_confluence_selectors_json TEXT NOT NULL,
+    window_id TEXT NOT NULL,
+    support INTEGER NOT NULL,
+    PRIMARY KEY (direction, primary_entry_selector, required_confluence_selectors_json, window_id)
 );
 
 CREATE TABLE IF NOT EXISTS emitted_strategies (
@@ -149,109 +225,305 @@ CREATE TABLE IF NOT EXISTS emitted_strategies (
 
 @dataclass(frozen=True)
 class ObservedConfluenceCombo:
-    """One really-observed ``(direction, primary_entry_selector,
-    required_confluence_selectors)`` triple -- every selector in
-    ``required_confluence_selectors`` was genuinely active, in this same
-    ``direction``, at the ``known_at`` of at least one real primary
-    signal occurrence of ``primary_entry_selector``. No TP/SL/bias
+    """One really-observed, *frequent* ``(direction, primary_entry_
+    selector, required_confluence_selectors)`` triple -- every selector
+    in ``required_confluence_selectors`` was genuinely active, in this
+    same ``direction``, at ``dict(support_by_window)[window_id]`` many
+    real primary signal occurrences of ``primary_entry_selector`` in
+    each explicit window (never fewer than the mining threshold that
+    admitted it -- see ``discover_observed_universe``). ``support_by_
+    window`` is a sorted tuple of ``(window_id, support)`` pairs, not a
+    plain ``dict``, so this dataclass -- like every other frozen
+    dataclass in this package -- stays genuinely hashable. No TP/SL/bias
     attached yet -- that expansion is ``iter_observed_strategy_specs``'s
     job."""
 
     direction: str
     primary_entry_selector: str
     required_confluence_selectors: tuple[str, ...]
+    support_by_window: tuple[tuple[str, int], ...]
 
 
 @dataclass(frozen=True)
 class ObservedUniverse:
     """The result of one ``discover_observed_universe`` pass: the
-    deduplicated, deterministically-ordered set of every observed
-    confluence combo, the empirical FVG-boundary-SL bounds keyed by
-    ``(fvg_link_selector, direction)``, and a few audit counts. Small
-    and bounded by what the data actually contains -- never the full
-    TP/SL/bias-expanded strategy space (see module docstring)."""
+    deduplicated, deterministically-ordered set of every observed,
+    frequent confluence combo, the empirical FVG-boundary-SL bounds
+    keyed by ``(fvg_link_selector, direction)``, the pruning parameters
+    that produced this set, and a few audit counts. Small and bounded by
+    what the data actually contains -- never the full TP/SL/bias-
+    expanded strategy space (see module docstring)."""
 
     combos: tuple[ObservedConfluenceCombo, ...]
     fvg_boundary_bounds: Mapping[tuple[str, str], int]
+    windows: tuple[ResearchWindow, ...]
+    min_trades_per_window: int
     primary_pair_count: int
     primary_occurrence_count: int
     distinct_pool_count: int
 
 
-def discover_observed_universe(context: PreparedBacktestContext) -> ObservedUniverse:
+def discover_observed_universe(
+    context: PreparedBacktestContext,
+    *,
+    windows: tuple[ResearchWindow, ...] = DEFAULT_PRUNING_WINDOWS,
+    min_trades_per_window: int = DEFAULT_MIN_TRADES_PER_WINDOW,
+) -> ObservedUniverse:
     """Walk every real ``EntrySignal`` in ``context.timeline`` exactly
-    once and return the bounded, deduplicated ``ObservedUniverse`` it
-    actually supports -- see the module docstring for why this eager
-    pass is safe (it is the small, real-data-bounded layer, not the
-    combinatorial TP/SL/bias expansion) and for the empirical FVG-
-    boundary-SL bound derivation.
+    once and return the bounded ``ObservedUniverse`` it actually
+    supports -- see the module docstring for why this eager pass is safe
+    (it is the small, real-data-bounded layer, not the combinatorial
+    TP/SL/bias expansion), for the ``O(N log N)`` sweep this uses instead
+    of one ``query_active_signals`` call per signal, for the empirical
+    FVG-boundary-SL bound derivation, and for why required-confluence
+    subsets are *mined*, not enumerated (real active pools routinely
+    exceed 100 simultaneously-active selectors, whose full power set is
+    computationally impossible to enumerate; frequent-itemset mining
+    with anti-monotonic pruning stays tractable without ever capping how
+    large a qualifying combo may be).
+
+    ``windows``/``min_trades_per_window`` are always explicit (never
+    silently assumed) but default to the same two full calendar-year
+    windows and the same ``100``-per-window threshold already used
+    elsewhere in this package (``tradelab.profile_research_context.
+    PROFILE_WINDOWS``, ``tradelab.research_runner.ResearchConfig.
+    min_trades_per_window``'s own default).
     """
     if not isinstance(context, PreparedBacktestContext):
         raise ValueError(f"context must be a PreparedBacktestContext, got {context!r}")
+    if not windows:
+        raise ValueError("windows must not be empty")
+    if min_trades_per_window < 1:
+        raise ValueError(f"min_trades_per_window must be a positive integer, got {min_trades_per_window!r}")
 
     timeline = context.timeline
-    all_selectors = tuple(sorted(timeline.signals_by_selector.keys()))
-    all_selectors_set = frozenset(all_selectors)
+    bars_by_timestamp = {bar.timestamp: bar for bar in context.bars_1m}
 
-    seen_combo_keys: set[tuple[str, str, tuple[str, ...]]] = set()
-    combos: list[ObservedConfluenceCombo] = []
     fvg_bounds: dict[tuple[str, str], int] = {}
-    primary_pair_count = 0
+    primary_pairs_seen: set[tuple[str, str]] = set()
     primary_occurrence_count = 0
-    distinct_pool_count = 0
+    distinct_pools_seen: dict[tuple[str, str], set[frozenset[str]]] = {}
+    # Phase 1 output: for every (primary, direction) pair, its own real
+    # occurrences as (known_at, pool) -- pool already excludes primary
+    # itself. This is the bounded "transaction database" frequent-
+    # itemset mining (phase 2) runs against, one pair at a time.
+    occurrences_by_pair: dict[tuple[str, str], list[tuple[datetime, frozenset[str]]]] = {}
 
-    for primary in all_selectors:
+    for snapshot in iter_active_signal_snapshots(timeline):
+        signal = snapshot.signal
+        primary = signal.selector
+        direction = signal.direction
+
+        # A direction-pinned liquidity selector (selector_fixed_direction)
+        # can never really occur with a mismatched direction (tradelab.
+        # liquidity_entry always assigns direction from a fixed
+        # side/entry_mode table), but this module still never trusts that
+        # invariant blindly -- a signal here whose own direction disagrees
+        # with its own selector's fixed direction is never treated as a
+        # primary occurrence of that selector.
         fixed_direction = selector_fixed_direction(primary)
-        directions = (fixed_direction,) if fixed_direction is not None else _DIRECTIONS
-        for direction in directions:
-            occurrences = [signal for signal in timeline.signals_by_selector[primary] if signal.direction == direction]
-            if not occurrences:
-                continue
-            primary_pair_count += 1
+        if fixed_direction is not None and fixed_direction != direction:
+            continue
 
-            seen_pools: set[frozenset[str]] = set()
-            for signal in occurrences:
-                primary_occurrence_count += 1
-                query_result = query_active_signals(timeline, all_selectors_set, direction, signal.known_at)
+        active_by_selector = snapshot.active_by_selector
 
-                active_by_selector: dict[str, list] = {}
-                for active_signal in query_result.active_signals:
-                    active_by_selector.setdefault(active_signal.selector, []).append(active_signal)
+        primary_pairs_seen.add((primary, direction))
+        primary_occurrence_count += 1
 
-                # Empirical FVG-boundary-SL bound bookkeeping: every fvg-5m/15m
-                # selector actually active at this real instant -- whether it
-                # is this occurrence's own primary or a confluence -- has its
-                # own active count folded into the running max for (selector,
-                # direction). Reuses the exact same query result already
-                # computed above; no extra detector call.
-                for selector, active_list in active_by_selector.items():
-                    if selector.startswith("fvg-") and selector_timeframe(selector) in FVG_SL_TIMEFRAMES:
-                        key = (selector, direction)
-                        fvg_bounds[key] = max(fvg_bounds.get(key, 0), len(active_list))
-
-                pool = frozenset(active_by_selector.keys()) - {primary}
-                if pool in seen_pools:
+        # Empirical FVG-boundary-SL bound: the TRUE maximum count of
+        # qualifying SL boundaries detect_sl_target_candidates could ever
+        # return for (selector, direction), probed with the real entry
+        # price a backtest would actually use at every real instant where
+        # that fvg-5m/15m selector is genuinely active (as this
+        # occurrence's own primary or as a confluence). Never an
+        # approximation from merely counting active signals. Unaffected
+        # by the mining change below -- every real occurrence is still
+        # probed, not just ones that end up part of a frequent itemset.
+        entry_bar = bars_by_timestamp.get(signal.known_at)
+        if entry_bar is not None:
+            for selector, active_signals in active_by_selector.items():
+                if not (selector.startswith("fvg-") and selector_timeframe(selector) in FVG_SL_TIMEFRAMES):
                     continue
-                seen_pools.add(pool)
-                distinct_pool_count += 1
+                key = (selector, direction)
+                true_count = _true_fvg_boundary_count(
+                    direction=direction,
+                    known_at=signal.known_at,
+                    entry_price=entry_bar.open,
+                    active_signals=active_signals,
+                )
+                if true_count > fvg_bounds.get(key, 0):
+                    fvg_bounds[key] = true_count
 
-                pool_sorted = tuple(sorted(pool))
-                for size in range(0, len(pool_sorted) + 1):
-                    for confluence in combinations(pool_sorted, size):
-                        combo_key = (direction, primary, confluence)
-                        if combo_key in seen_combo_keys:
-                            continue
-                        seen_combo_keys.add(combo_key)
-                        combos.append(ObservedConfluenceCombo(direction, primary, confluence))
+        pool = frozenset(active_by_selector.keys()) - {primary}
+        distinct_pools_seen.setdefault((primary, direction), set()).add(pool)
+        occurrences_by_pair.setdefault((primary, direction), []).append((signal.known_at, pool))
+
+    # Phase 2: per (primary, direction) pair, mine every required-
+    # confluence itemset whose support meets min_trades_per_window in
+    # EVERY window -- never enumerate subsets of a pool directly.
+    combos: list[ObservedConfluenceCombo] = []
+    for (primary, direction), occurrences in occurrences_by_pair.items():
+        known_ats = [known_at for known_at, _ in occurrences]
+
+        # Safe prefilter, exactly mirroring tradelab.research_runner's own
+        # "raw signal count is an upper bound on real trade count" logic:
+        # if even the primary alone (the empty-confluence combo) never
+        # reaches min_trades_per_window raw occurrences in every window,
+        # no confluence-restricted subset of it ever could either (adding
+        # a required confluence can only ever keep or shrink the
+        # qualifying occurrence count) -- skip mining this pair entirely.
+        primary_support = _count_per_window(known_ats, windows)
+        if not all(primary_support[w.window_id] >= min_trades_per_window for w in windows):
+            continue
+
+        pools = [pool for _, pool in occurrences]
+        for itemset, support in _mine_frequent_confluence_itemsets(known_ats, pools, windows, min_trades_per_window):
+            combos.append(ObservedConfluenceCombo(direction, primary, tuple(sorted(itemset)), tuple(sorted(support.items()))))
 
     combos.sort(key=lambda combo: (combo.direction, combo.primary_entry_selector, combo.required_confluence_selectors))
+    distinct_pool_count = sum(len(pools) for pools in distinct_pools_seen.values())
     return ObservedUniverse(
         combos=tuple(combos),
         fvg_boundary_bounds=dict(fvg_bounds),
-        primary_pair_count=primary_pair_count,
+        windows=windows,
+        min_trades_per_window=min_trades_per_window,
+        primary_pair_count=len(primary_pairs_seen),
         primary_occurrence_count=primary_occurrence_count,
         distinct_pool_count=distinct_pool_count,
     )
+
+
+def _mine_frequent_confluence_itemsets(
+    occurrence_known_ats: list[datetime],
+    occurrence_pools: list[frozenset[str]],
+    windows: tuple[ResearchWindow, ...],
+    min_support_per_window: int,
+) -> list[tuple[frozenset[str], dict[str, int]]]:
+    """Deterministic frequent-itemset mining (Apriori-style: level-wise
+    candidate generation with anti-monotonic pruning) over one
+    ``(primary, direction)`` pair's own real occurrences.
+
+    Returns every itemset (subset of the selector universe observed
+    across ``occurrence_pools``) -- paired with its own per-window
+    support -- whose support (the count of occurrences, restricted to a
+    given window, whose own active pool is a *superset* of the itemset)
+    meets ``min_support_per_window`` in *every* one of ``windows``.
+    Always includes the empty itemset first (support = every occurrence
+    in each window; the caller already confirmed this passes before
+    calling, via the same safe prefilter ``tradelab.research_runner``
+    itself uses).
+
+    **Never enumerates a candidate whose own subset has already failed**
+    (the Apriori/anti-monotonicity property: adding a member to an
+    itemset can only ever keep its support the same or shrink it, since
+    "pool is a superset of S" is strictly harder to satisfy for a larger
+    S -- so if some ``(k-1)``-subset of a size-``k`` candidate already
+    fails the threshold in some window, the size-``k`` candidate cannot
+    possibly pass either, in that same window). This is what keeps
+    mining tractable even when a single occurrence's own raw active pool
+    is far too large (real MNQ data: routinely 50-140 simultaneously
+    active selectors) to enumerate every subset of directly -- real
+    per-selector support sparsity prunes the vast majority of the space
+    away before it is ever built, deterministically and without
+    approximation (no itemset that could pass the threshold is ever
+    skipped -- see this function's own completeness test).
+    """
+    assert len(occurrence_known_ats) == len(occurrence_pools)
+
+    window_indices: dict[str, set[int]] = {w.window_id: set() for w in windows}
+    for index, known_at in enumerate(occurrence_known_ats):
+        for window in windows:
+            if window.start_utc <= known_at < window.end_utc:
+                window_indices[window.window_id].add(index)
+                break
+
+    def support_by_window(tids: set[int]) -> dict[str, int]:
+        return {window.window_id: len(tids & window_indices[window.window_id]) for window in windows}
+
+    def passes(support: dict[str, int]) -> bool:
+        return all(count >= min_support_per_window for count in support.values())
+
+    all_indices = set(range(len(occurrence_pools)))
+    result: list[tuple[frozenset[str], dict[str, int]]] = [(frozenset(), support_by_window(all_indices))]
+
+    item_tids: dict[str, set[int]] = {}
+    for index, pool in enumerate(occurrence_pools):
+        for item in pool:
+            item_tids.setdefault(item, set()).add(index)
+
+    current_level: dict[frozenset[str], set[int]] = {}
+    for item in sorted(item_tids):
+        tids = item_tids[item]
+        support = support_by_window(tids)
+        if passes(support):
+            itemset = frozenset((item,))
+            current_level[itemset] = tids
+            result.append((itemset, support))
+
+    size = 2
+    while current_level:
+        ordered = sorted(current_level.keys(), key=lambda itemset: tuple(sorted(itemset)))
+        next_level: dict[frozenset[str], set[int]] = {}
+        for a_index in range(len(ordered)):
+            for b_index in range(a_index + 1, len(ordered)):
+                a, b = ordered[a_index], ordered[b_index]
+                union = a | b
+                if len(union) != size or union in next_level:
+                    continue
+                # Apriori join+prune: every (size-1)-subset of this
+                # candidate must already be a frequent itemset at the
+                # previous level, or the candidate cannot be either.
+                if not all(frozenset(union - {member}) in current_level for member in union):
+                    continue
+                tids = current_level[a] & current_level[b]
+                support = support_by_window(tids)
+                if passes(support):
+                    next_level[union] = tids
+                    result.append((union, support))
+        current_level = next_level
+        size += 1
+
+    return result
+
+
+_EMPTY_LIQUIDITY_RESULTS: dict = {}
+
+
+def _true_fvg_boundary_count(
+    *,
+    direction: str,
+    known_at: datetime,
+    entry_price: float,
+    active_signals: tuple[EntrySignal, ...],
+) -> int:
+    """The exact number of qualifying ``FVG_BOUNDARY`` SL candidates
+    ``tradelab.sl_targets.detect_sl_target_candidates`` returns for a
+    real entry at ``entry_price``/``known_at``/``direction``, linked to
+    exactly the FVG candidates genuinely active for one selector at that
+    instant -- never an approximation.
+
+    Deliberately calls ``detect_sl_target_candidates`` with **empty**
+    ``swing_equal_results``/``session_results`` rather than the context's
+    real (and, for a full real dataset, very large) liquidity detection
+    results. This is not an approximation: reading that function's own
+    body shows ``fvg_targets`` is produced exclusively by ``_fvg_sl_
+    candidates(entry, selected_fvg)``, which never looks at either
+    liquidity dict at all -- only ``liquidity_targets`` (which this
+    probe never reads) depends on them. The only place both lists ever
+    interact is a cross-list duplicate-``sl_target_id`` check, and
+    liquidity/FVG ids use disjoint prefixes (``"sl-liquidity-"`` vs.
+    ``"sl-fvg_boundary-"``) by construction, so that check can never
+    actually fire across them. Passing empty dicts therefore yields a
+    ``fvg_targets`` result byte-for-byte identical to passing the real
+    ones, while skipping a full liquidity-level scan (potentially
+    hundreds of thousands of levels for a real multi-year context) on
+    every single probe call -- this is what makes the bound computation
+    tractable at real-data scale without ever approximating the count.
+    """
+    entry = MarketEntryContext(entry_id="fvg-sl-bound-probe", direction=direction, entry_price=entry_price, entry_known_at=known_at)
+    selected_fvg = SelectedFVGConfluence(entry_id="fvg-sl-bound-probe", fvg_candidates=tuple(signal.source for signal in active_signals))
+    sl_result = detect_sl_target_candidates(entry, selected_fvg, _EMPTY_LIQUIDITY_RESULTS, _EMPTY_LIQUIDITY_RESULTS)
+    return len(sl_result.fvg_targets)
 
 
 def _sl_choices_for_combo(combo: ObservedConfluenceCombo, fvg_boundary_bounds: Mapping[tuple[str, str], int]) -> Iterator[SLChoice]:
@@ -318,6 +590,8 @@ class UniverseManifest:
     context_artifact_id: str
     selector_catalog_fingerprint: str
     generator_policy_version: str
+    min_trades_per_window: int
+    pruning_windows: tuple[dict, ...]
     primary_pair_count: int
     primary_occurrence_count: int
     combo_count: int
@@ -357,7 +631,15 @@ class StrategyUniverseGenerator:
     bounds, and the emitted ``strategy_id`` strings.
     """
 
-    def __init__(self, db_path: Path | str, *, context_artifact_id: str, context: PreparedBacktestContext) -> None:
+    def __init__(
+        self,
+        db_path: Path | str,
+        *,
+        context_artifact_id: str,
+        context: PreparedBacktestContext,
+        windows: tuple[ResearchWindow, ...] = DEFAULT_PRUNING_WINDOWS,
+        min_trades_per_window: int = DEFAULT_MIN_TRADES_PER_WINDOW,
+    ) -> None:
         if not context_artifact_id:
             raise ValueError("context_artifact_id must be non-empty")
         if not isinstance(context, PreparedBacktestContext):
@@ -365,7 +647,7 @@ class StrategyUniverseGenerator:
 
         self._db_path = Path(db_path)
         self._context_artifact_id = context_artifact_id
-        self._universe = discover_observed_universe(context)
+        self._universe = discover_observed_universe(context, windows=windows, min_trades_per_window=min_trades_per_window)
 
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._db_path))
@@ -421,11 +703,17 @@ class StrategyUniverseGenerator:
     def _open_or_verify_manifest(self) -> UniverseManifest:
         selector_fingerprint = _selector_catalog_fingerprint()
         fvg_bounds_dict = {f"{selector}|{direction}": bound for (selector, direction), bound in sorted(self._universe.fvg_boundary_bounds.items())}
+        pruning_windows = tuple(
+            {"window_id": w.window_id, "start_utc": w.start_utc.isoformat(), "end_utc": w.end_utc.isoformat()}
+            for w in sorted(self._universe.windows, key=lambda w: w.window_id)
+        )
         fields = {
             "schema_version": UNIVERSE_SCHEMA_VERSION,
             "context_artifact_id": self._context_artifact_id,
             "selector_catalog_fingerprint": selector_fingerprint,
             "generator_policy_version": GENERATOR_POLICY_VERSION,
+            "min_trades_per_window": self._universe.min_trades_per_window,
+            "pruning_windows": list(pruning_windows),
             "primary_pair_count": self._universe.primary_pair_count,
             "primary_occurrence_count": self._universe.primary_occurrence_count,
             "combo_count": len(self._universe.combos),
@@ -435,21 +723,25 @@ class StrategyUniverseGenerator:
 
         row = self._conn.execute(
             "SELECT run_id, schema_version, context_artifact_id, selector_catalog_fingerprint, generator_policy_version, "
-            "primary_pair_count, primary_occurrence_count, combo_count, fvg_boundary_bounds_json FROM universe_manifest"
+            "min_trades_per_window, pruning_windows_json, primary_pair_count, primary_occurrence_count, combo_count, "
+            "fvg_boundary_bounds_json FROM universe_manifest"
         ).fetchone()
 
         if row is None:
             with self._conn:
                 self._conn.execute(
                     "INSERT INTO universe_manifest (run_id, schema_version, context_artifact_id, selector_catalog_fingerprint, "
-                    "generator_policy_version, primary_pair_count, primary_occurrence_count, combo_count, fvg_boundary_bounds_json, "
-                    "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "generator_policy_version, min_trades_per_window, pruning_windows_json, primary_pair_count, "
+                    "primary_occurrence_count, combo_count, fvg_boundary_bounds_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         computed_run_id,
                         UNIVERSE_SCHEMA_VERSION,
                         self._context_artifact_id,
                         selector_fingerprint,
                         GENERATOR_POLICY_VERSION,
+                        fields["min_trades_per_window"],
+                        json.dumps(fields["pruning_windows"], sort_keys=True),
                         fields["primary_pair_count"],
                         fields["primary_occurrence_count"],
                         fields["combo_count"],
@@ -457,7 +749,8 @@ class StrategyUniverseGenerator:
                         datetime.now(timezone.utc).isoformat(),
                     ),
                 )
-            return UniverseManifest(run_id=computed_run_id, **fields)
+                self._write_combo_support()
+            return UniverseManifest(run_id=computed_run_id, pruning_windows=pruning_windows, **{k: v for k, v in fields.items() if k != "pruning_windows"})
 
         (
             stored_run_id,
@@ -465,16 +758,21 @@ class StrategyUniverseGenerator:
             stored_artifact,
             stored_fingerprint,
             stored_policy,
+            stored_min_trades,
+            stored_windows_json,
             stored_pp,
             stored_po,
             stored_cc,
             stored_bounds_json,
         ) = row
+        stored_pruning_windows = json.loads(stored_windows_json)
         stored_fields = {
             "schema_version": stored_schema,
             "context_artifact_id": stored_artifact,
             "selector_catalog_fingerprint": stored_fingerprint,
             "generator_policy_version": stored_policy,
+            "min_trades_per_window": stored_min_trades,
+            "pruning_windows": stored_pruning_windows,
             "primary_pair_count": stored_pp,
             "primary_occurrence_count": stored_po,
             "combo_count": stored_cc,
@@ -486,7 +784,28 @@ class StrategyUniverseGenerator:
                 f"cannot resume observed strategy universe at {self._db_path}: manifest mismatch in field(s) {mismatched} "
                 f"against the existing run (run_id={stored_run_id!r}) -- refusing to resume with a different context/universe"
             )
-        return UniverseManifest(run_id=stored_run_id, **stored_fields)
+        return UniverseManifest(
+            run_id=stored_run_id,
+            pruning_windows=tuple(stored_pruning_windows),
+            **{k: v for k, v in stored_fields.items() if k != "pruning_windows"},
+        )
+
+    def _write_combo_support(self) -> None:
+        """Persists every observed combo's per-window support -- the
+        deterministic frequent-itemset mining audit trail requirement --
+        as one row per (combo, window). Only ever called once, from
+        inside the same transaction that inserts the fresh manifest row
+        (never on resume, where the existing rows are already correct
+        for the already-verified-matching universe)."""
+        for combo in self._universe.combos:
+            confluence_json = json.dumps(list(combo.required_confluence_selectors), sort_keys=True)
+            for window_id, support in sorted(combo.support_by_window):
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO combo_support "
+                    "(direction, primary_entry_selector, required_confluence_selectors_json, window_id, support) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (combo.direction, combo.primary_entry_selector, confluence_json, window_id, support),
+                )
 
 
 def _selector_catalog_fingerprint() -> str:

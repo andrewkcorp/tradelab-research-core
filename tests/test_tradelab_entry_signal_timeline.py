@@ -7,6 +7,7 @@ direction invalidation, same-direction refresh (no duplication), and
 deterministic selector keys with full audit."""
 from __future__ import annotations
 
+import random
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -16,6 +17,7 @@ from tradelab.entry_signal_timeline import (
     SHORT,
     SourceKind,
     build_entry_signal_timeline,
+    iter_active_signal_snapshots,
     query_active_signals,
 )
 from tradelab.fvg_entry import FVGEntryCandidate, FVGEntryCandidateResult, SourceType
@@ -412,6 +414,87 @@ class SelectorKeyAndAuditTests(unittest.TestCase):
         timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
         result = query_active_signals(timeline, {"fvg-15m-ifvg"}, LONG, ny_dt(2026, 1, 5, 12, 0))
         self.assertEqual(result.active_signals, [])
+
+
+FVG_SELECTOR_POOL = ("fvg-1m-fvg_touch", "fvg-1m-ifvg", "fvg-5m-fvg_touch", "fvg-15m-ifvg")
+
+
+def _random_fvg_signals(rng: random.Random, count: int, base_dt: datetime, id_prefix: str) -> list[FVGEntryCandidate]:
+    out = []
+    for i in range(count):
+        selector = rng.choice(FVG_SELECTOR_POOL)
+        _, timeframe, source_type_str = selector.split("-")
+        source_type = SourceType.FVG_TOUCH if source_type_str == "fvg_touch" else SourceType.IFVG
+        known_at = base_dt + timedelta(minutes=rng.randint(0, 460))
+        direction = rng.choice([LONG, SHORT])
+        out.append(
+            fvg_candidate(zone_id=f"{id_prefix}-{i}", timeframe=timeframe, source_type=source_type, direction=direction, known_at=known_at)
+        )
+    return out
+
+
+class BulkSnapshotEquivalenceTests(unittest.TestCase):
+    """``iter_active_signal_snapshots`` must agree with ``query_active_
+    signals`` at every real signal's own instant -- verified by brute-
+    force comparison (never by inspecting the sweep's internals) on a
+    small, deliberately overlapping/invalidating fixture and on large
+    randomized fixtures spanning a trading-day boundary."""
+
+    def _assert_snapshots_match_query(self, timeline) -> None:
+        all_selectors = set(timeline.signals_by_selector.keys())
+        checked = 0
+        for snapshot in iter_active_signal_snapshots(timeline):
+            expected = query_active_signals(timeline, all_selectors, snapshot.signal.direction, snapshot.signal.known_at)
+            expected_by_selector: dict[str, set[str]] = {}
+            for signal in expected.active_signals:
+                expected_by_selector.setdefault(signal.selector, set()).add(signal.candidate_id)
+
+            actual_by_selector = {selector: {s.candidate_id for s in signals} for selector, signals in snapshot.active_by_selector.items()}
+            self.assertEqual(
+                actual_by_selector,
+                expected_by_selector,
+                f"mismatch at signal {snapshot.signal.candidate_id!r} known_at={snapshot.signal.known_at!r}",
+            )
+            checked += 1
+        self.assertGreater(checked, 0)
+
+    def test_matches_query_active_signals_on_a_small_overlapping_fixture(self):
+        same_instant_a = fvg_candidate(zone_id="A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        same_instant_b = fvg_candidate(zone_id="B", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        invalidator = fvg_candidate(zone_id="C", direction=SHORT, known_at=ny_dt(2026, 1, 5, 10, 30))
+        other_timeframe = fvg_candidate(zone_id="D", timeframe="5m", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 15))
+        tie_with_invalidator = fvg_candidate(zone_id="E", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 30))
+        timeline = build_entry_signal_timeline(
+            fvg_result(same_instant_a, same_instant_b, invalidator, other_timeframe, tie_with_invalidator), EMPTY_LIQUIDITY
+        )
+        self._assert_snapshots_match_query(timeline)
+
+    def test_matches_query_active_signals_on_randomized_fixtures_across_a_trading_day_boundary(self):
+        rng = random.Random(12345)
+        signals = _random_fvg_signals(rng, 150, ny_dt(2026, 1, 5, 9, 0), "d1") + _random_fvg_signals(rng, 150, ny_dt(2026, 1, 6, 9, 0), "d2")
+        timeline = build_entry_signal_timeline(fvg_result(*signals), EMPTY_LIQUIDITY)
+        self._assert_snapshots_match_query(timeline)
+
+    def test_matches_query_active_signals_on_a_second_random_seed(self):
+        rng = random.Random(987654321)
+        signals = _random_fvg_signals(rng, 200, ny_dt(2026, 6, 1, 9, 0), "s2")
+        timeline = build_entry_signal_timeline(fvg_result(*signals), EMPTY_LIQUIDITY)
+        self._assert_snapshots_match_query(timeline)
+
+    def test_snapshot_includes_the_signal_itself_under_its_own_selector(self):
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 10, 0))
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        snapshots = list(iter_active_signal_snapshots(timeline))
+        self.assertEqual(len(snapshots), 1)
+        self.assertIn(c.candidate_id, {s.candidate_id for s in snapshots[0].active_by_selector["fvg-1m-fvg_touch"]})
+
+    def test_never_calls_query_active_signals_style_full_scan_and_yields_one_snapshot_per_signal(self):
+        rng = random.Random(42)
+        signals = _random_fvg_signals(rng, 50, ny_dt(2026, 1, 5, 9, 0), "count")
+        timeline = build_entry_signal_timeline(fvg_result(*signals), EMPTY_LIQUIDITY)
+        snapshots = list(iter_active_signal_snapshots(timeline))
+        self.assertEqual(len(snapshots), 50)
+        self.assertEqual([s.signal.candidate_id for s in snapshots], [s.candidate_id for s in timeline.signals])
 
 
 if __name__ == "__main__":

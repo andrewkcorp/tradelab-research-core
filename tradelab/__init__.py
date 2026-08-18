@@ -100,6 +100,8 @@ from tradelab.news_loaders import read_news_events_csv, read_news_events_parquet
 from tradelab.observed_strategy_universe import (
     ALL_BIAS_POLICIES,
     ALL_TP_CHOICES,
+    DEFAULT_MIN_TRADES_PER_WINDOW,
+    DEFAULT_PRUNING_WINDOWS,
     GENERATOR_POLICY_VERSION,
     UNIVERSE_SCHEMA_VERSION,
     ObservedConfluenceCombo,
@@ -337,4 +339,6 @@ __all__ = [
     "ALL_TP_CHOICES",
     "GENERATOR_POLICY_VERSION",
     "UNIVERSE_SCHEMA_VERSION",
+    "DEFAULT_MIN_TRADES_PER_WINDOW",
+    "DEFAULT_PRUNING_WINDOWS",
 ]
