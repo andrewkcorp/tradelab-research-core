@@ -190,7 +190,6 @@ def make_signal(selector: str, direction: str, known_at: datetime, timeframe: st
         timestamp=known_at,
         known_at=known_at,
         trading_day_id="2024-01-01",
-        valid_until=known_at + timedelta(days=1),
         source=None,
     )
 

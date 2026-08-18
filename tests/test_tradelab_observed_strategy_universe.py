@@ -80,7 +80,6 @@ def sig(
     direction: str,
     known_at: datetime,
     *,
-    valid_until: datetime | None = None,
     candidate_suffix: str = "",
 ) -> EntrySignal:
     timeframe = selector.split("-")[1]
@@ -93,9 +92,19 @@ def sig(
         timestamp=known_at,
         known_at=known_at,
         trading_day_id="2024-06-01",
-        valid_until=valid_until if valid_until is not None else known_at + timedelta(hours=1),
         source=None,
     )
+
+
+def invalidator(selector: str, opposite_of: str, known_at: datetime) -> EntrySignal:
+    """A signal built purely to invalidate an earlier ``opposite_of``-
+    direction signal on ``selector``'s timeframe (persist-until-
+    invalidated model: there is no more time-based expiry, so tests that
+    need a confluence to stop being active at some later instant must
+    invalidate it explicitly with an opposite-direction, same-timeframe
+    signal instead)."""
+    other_direction = LONG if opposite_of == SHORT else SHORT
+    return sig(selector, other_direction, known_at)
 
 
 def repeated(selector: str, direction: str, base: datetime, count: int, *, spacing: timedelta = timedelta(minutes=10)) -> list[EntrySignal]:
@@ -131,7 +140,6 @@ def fvg_sig(zone_id: str, direction: str, known_at: datetime, *, timeframe: str 
         timestamp=candidate.timestamp,
         known_at=known_at,
         trading_day_id="2024-06-01",
-        valid_until=known_at + timedelta(hours=1),
         source=candidate,
     )
 
@@ -183,8 +191,8 @@ class AllActiveSubsetsGeneratedTests(unittest.TestCase):
         threshold = 3
         occurrences = repeated(P_SHORT, SHORT, T0, threshold)
         signals = list(occurrences) + [
-            sig(A_5M, SHORT, T0, valid_until=T0 + timedelta(hours=2)),
-            sig(B_15M, SHORT, T0, valid_until=T0 + timedelta(hours=2)),
+            sig(A_5M, SHORT, T0),
+            sig(B_15M, SHORT, T0),
         ]
         context = build_context(build_timeline(signals))
         universe = discover_observed_universe(context, windows=ALL_TIME_WINDOWS, min_trades_per_window=threshold)
@@ -198,7 +206,7 @@ class AllActiveSubsetsGeneratedTests(unittest.TestCase):
     def test_no_duplicate_combos_across_repeated_identical_pools(self):
         threshold = 3
         signals = list(repeated(P_SHORT, SHORT, T0, threshold, spacing=timedelta(minutes=30)))
-        signals += [sig(A_5M, SHORT, T0, valid_until=T0 + timedelta(hours=2))]
+        signals += [sig(A_5M, SHORT, T0)]
         context = build_context(build_timeline(signals))
         universe = discover_observed_universe(context, windows=ALL_TIME_WINDOWS, min_trades_per_window=threshold)
 
@@ -211,16 +219,21 @@ class NeverOccurringComboNotGeneratedTests(unittest.TestCase):
     def test_selectors_that_never_co_occur_frequently_are_never_combined(self):
         # {A, B} both reach the threshold together at 3 occurrences; C
         # separately reaches the threshold at 3 different occurrences
-        # where A/B are not active. A+C, B+C, A+B+C never co-occur even
-        # once and must never appear, regardless of each item's own
-        # individual frequency.
+        # where A/B are not active (invalidated by an opposite-direction,
+        # same-timeframe signal shortly after group1 -- there is no more
+        # time-based expiry, so "no longer active" must come from an
+        # explicit invalidating event instead). A+C, B+C, A+B+C never
+        # co-occur even once and must never appear, regardless of each
+        # item's own individual frequency.
         threshold = 3
         group1 = repeated(P_SHORT, SHORT, T0, threshold, spacing=timedelta(minutes=10))
         group2 = repeated(P_SHORT, SHORT, T0 + timedelta(hours=5), threshold, spacing=timedelta(minutes=10))
         signals = list(group1) + list(group2)
-        signals += [sig(A_5M, SHORT, T0, valid_until=T0 + timedelta(minutes=25))]
-        signals += [sig(B_15M, SHORT, T0, valid_until=T0 + timedelta(minutes=25))]
-        signals += [sig(C_SHORT, SHORT, T0 + timedelta(hours=5), valid_until=T0 + timedelta(hours=5, minutes=25))]
+        signals += [sig(A_5M, SHORT, T0)]
+        signals += [sig(B_15M, SHORT, T0)]
+        signals += [invalidator(A_5M, opposite_of=SHORT, known_at=T0 + timedelta(minutes=25))]
+        signals += [invalidator(B_15M, opposite_of=SHORT, known_at=T0 + timedelta(minutes=25))]
+        signals += [sig(C_SHORT, SHORT, T0 + timedelta(hours=5))]
         context = build_context(build_timeline(signals))
         universe = discover_observed_universe(context, windows=ALL_TIME_WINDOWS, min_trades_per_window=threshold)
 
@@ -234,14 +247,19 @@ class NeverOccurringComboNotGeneratedTests(unittest.TestCase):
         self.assertEqual(observed_subsets & never_seen, set())
 
     def test_a_subset_below_threshold_is_not_generated_even_though_the_primary_alone_is(self):
-        # P alone reaches the threshold (5 occurrences); A is only active
-        # alongside 2 of them -- below the threshold of 3 -- so {A} must
-        # not be generated even though the empty combo is.
+        # P alone reaches the threshold (5 occurrences); A is (re-)signaled
+        # right at occurrences 0 and 1 and each instance is invalidated
+        # (opposite-direction, same-timeframe) shortly after, before the
+        # next occurrence's query -- so A is active alongside only 2 of
+        # them, below the threshold of 3 -- so {A} must not be generated
+        # even though the empty combo is.
         threshold = 3
         occurrences = repeated(P_SHORT, SHORT, T0, 5, spacing=timedelta(minutes=30))
         signals = list(occurrences)
-        signals += [sig(A_5M, SHORT, occurrences[0].known_at, valid_until=occurrences[0].known_at + timedelta(minutes=1))]
-        signals += [sig(A_5M, SHORT, occurrences[1].known_at, valid_until=occurrences[1].known_at + timedelta(minutes=1), candidate_suffix="-b")]
+        signals += [sig(A_5M, SHORT, occurrences[0].known_at)]
+        signals += [invalidator(A_5M, opposite_of=SHORT, known_at=occurrences[0].known_at + timedelta(minutes=1))]
+        signals += [sig(A_5M, SHORT, occurrences[1].known_at, candidate_suffix="-b")]
+        signals += [invalidator(A_5M, opposite_of=SHORT, known_at=occurrences[1].known_at + timedelta(minutes=1))]
         context = build_context(build_timeline(signals))
         universe = discover_observed_universe(context, windows=ALL_TIME_WINDOWS, min_trades_per_window=threshold)
 
@@ -255,8 +273,8 @@ class CooperationAcrossTimeframesTests(unittest.TestCase):
         threshold = 3
         occurrences = repeated(P_SHORT, SHORT, T0, threshold)
         signals = list(occurrences) + [
-            sig(A_5M, SHORT, T0, valid_until=T0 + timedelta(hours=2)),
-            sig(B_15M, SHORT, T0, valid_until=T0 + timedelta(hours=2)),
+            sig(A_5M, SHORT, T0),
+            sig(B_15M, SHORT, T0),
         ]
         context = build_context(build_timeline(signals))
         universe = discover_observed_universe(context, windows=ALL_TIME_WINDOWS, min_trades_per_window=threshold)
@@ -534,11 +552,21 @@ class ScalabilityTests(unittest.TestCase):
         self.assertTrue(hasattr(module, "iter_active_signal_snapshots"))
 
     def _build_moderate_timeline_context(self, count: int) -> PreparedBacktestContext:
-        # Alternates between two liquidity selectors so pools stay small
-        # and bounded -- isolates the O(N log N) sweep itself, not the
+        # Alternates between two liquidity selectors on the same 1m
+        # timeframe, and periodically flips the direction label -- an
+        # invalidating event under the persist-until-invalidated model
+        # that wipes the whole growing same-timeframe pool, exactly as a
+        # real market's own direction reversals naturally bound the
+        # active pool despite unbounded validity. Without any such flip
+        # the pool would grow to size N (nothing ever invalidates a
+        # same-direction-forever timeline), which is a real property of
+        # that degenerate dataset, not a complexity regression in the
+        # sweep itself -- isolates the O(N log N) sweep, not the
         # (inherently different-complexity) FVG-SL bound probe, which is
         # never triggered here (no fvg-5m/15m selectors, no bars_1m).
-        signals = [sig(P_SHORT if i % 2 == 0 else C_SHORT, SHORT, T0 + timedelta(minutes=i)) for i in range(count)]
+        signals = [
+            sig(P_SHORT if i % 2 == 0 else C_SHORT, SHORT if (i // 20) % 2 == 0 else LONG, T0 + timedelta(minutes=i)) for i in range(count)
+        ]
         return build_context(build_timeline(signals))
 
     def test_discovery_time_does_not_grow_quadratically_with_signal_count(self):
@@ -565,8 +593,8 @@ class ExactOnceDedupAndResumeTests(unittest.TestCase):
         threshold = 3
         occurrences = repeated(P_SHORT, SHORT, T0, threshold)
         signals = list(occurrences) + [
-            sig(A_5M, SHORT, T0, valid_until=T0 + timedelta(hours=2)),
-            sig(B_15M, SHORT, T0, valid_until=T0 + timedelta(hours=2)),
+            sig(A_5M, SHORT, T0),
+            sig(B_15M, SHORT, T0),
         ]
         return build_context(build_timeline(signals))
 
@@ -665,8 +693,8 @@ class DeterministicManifestTests(unittest.TestCase):
     def _context(self):
         threshold = 2
         signals = list(repeated(P_SHORT, SHORT, T0, threshold)) + [
-            sig(A_5M, SHORT, T0, valid_until=T0 + timedelta(hours=2)),
-            sig(B_15M, SHORT, T0, valid_until=T0 + timedelta(hours=2)),
+            sig(A_5M, SHORT, T0),
+            sig(B_15M, SHORT, T0),
         ]
         return build_context(build_timeline(signals))
 

@@ -57,7 +57,6 @@ def make_signal(selector: str, direction: str, known_at: datetime, timeframe: st
         timestamp=known_at,
         known_at=known_at,
         trading_day_id="2024-03-04",
-        valid_until=known_at + timedelta(hours=8),
         source=None,
     )
 

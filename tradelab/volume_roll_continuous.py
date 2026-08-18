@@ -465,7 +465,7 @@ def _filter_outright(records: list[DatabentoParentRecord]) -> tuple[list[Databen
 def _group_by_session(records: list[DatabentoParentRecord]) -> dict[str, list[DatabentoParentRecord]]:
     sessions: dict[str, list[DatabentoParentRecord]] = {}
     for record in records:
-        session_id, _ = _trading_day_for(record.ts_event)
+        session_id = _trading_day_for(record.ts_event)
         sessions.setdefault(session_id, []).append(record)
     return sessions
 
