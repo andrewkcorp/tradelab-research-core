@@ -29,11 +29,28 @@ any kind)**:
 5. **No look-ahead**: a session's own selection depends only on the
    immediately preceding session's already-complete volume totals,
    never on anything in the current or a later session.
-6. The very first session observed in the data has no preceding
-   session at all in the file -- there is nothing non-heuristic to
-   compare against, so it is always warm-up and never enters the
-   research series, regardless of whether the export happened to start
-   exactly at that session's own open.
+6. A session enters the research series only if it is itself **fully
+   covered** by the file's own observed data range, and the
+   immediately preceding session (whose volume it would use) is
+   fully covered too. The file's coverage range is ``[earliest raw
+   ts_event, latest raw ts_event + 1 minute)``. A session's true total
+   volume is only known once the whole session has actually been
+   observed -- an export that starts or ends mid-session must never
+   let that partial volume drive (or be used to drive) a selection.
+   In practice this can only ever affect the very first and/or very
+   last session present in the file (any session strictly in between
+   always has its own nominal bounds fully inside the file's overall
+   data range, so it is always fully covered) -- but it is checked
+   explicitly, never assumed. The very first session in the file is
+   additionally always excluded regardless of its own coverage, since
+   there is no preceding session in the file at all to compare it
+   against. Every excluded session is recorded in the audit with one
+   of three explicit reasons (``SessionSelection.exclusion_reason``):
+   ``no_previous_session`` (the first session in the file), ``session_
+   not_fully_covered`` (its own nominal span isn't fully inside the
+   file's data range), or ``previous_session_not_fully_covered`` (the
+   session itself is fine, but the previous session it would need to
+   compare against is not).
 7. When the selected contract changes between two consecutive
    sessions, a ``RollAdjustment`` is derived -- never guessed -- from
    the single latest minute, strictly before the rollover, at which
@@ -78,6 +95,11 @@ UTC = timezone.utc
 SESSION_START_HOUR = 18
 SESSION_END_HOUR = 17
 
+# SessionSelection.exclusion_reason values -- see module docstring, policy point 6.
+EXCLUSION_NO_PREVIOUS_SESSION = "no_previous_session"
+EXCLUSION_SESSION_NOT_FULLY_COVERED = "session_not_fully_covered"
+EXCLUSION_PREVIOUS_SESSION_NOT_FULLY_COVERED = "previous_session_not_fully_covered"
+
 # Quarterly outright MNQ only: root + one quarterly month code + one year
 # digit (e.g. MNQZ3). Calendar spreads (e.g. "MNQZ3-MNQH4") and any other
 # root never match this -- requirement 1 of the roll policy.
@@ -94,15 +116,20 @@ class SymbolVolume:
 class SessionSelection:
     """One session's own contract-selection audit record. ``candidate_
     volumes``/``selected_symbol``/``tied_symbols``/``rejected_symbols``
-    are all empty/``None`` for the warm-up session, which never
-    receives a selection at all (see the module docstring, policy
+    are all empty/``None`` when ``is_included`` is ``False`` -- this
+    session never receives a selection at all and none of its bars
+    enter ``raw_bars``. ``exclusion_reason`` is one of
+    ``EXCLUSION_NO_PREVIOUS_SESSION``/``EXCLUSION_SESSION_NOT_FULLY_
+    COVERED``/``EXCLUSION_PREVIOUS_SESSION_NOT_FULLY_COVERED`` when
+    excluded, ``None`` when included (see module docstring, policy
     point 6)."""
 
     session_id: str
     session_start_utc: datetime
     session_end_utc: datetime
     previous_session_id: str | None
-    is_warmup: bool
+    is_included: bool
+    exclusion_reason: str | None
     candidate_volumes: tuple[SymbolVolume, ...]
     selected_symbol: str | None
     tied_symbols: tuple[str, ...]
@@ -133,14 +160,21 @@ class VolumeRollContinuousResult:
     continuous_futures.build_back_adjusted_continuous_series`` was
     called with); ``continuous_series_result`` is that call's own,
     unmodified result. ``session_selections`` covers every session
-    including the warm-up one; ``transitions`` covers only the
-    sessions where the selected contract actually changed."""
+    observed in the data, including every excluded one (see its own
+    ``is_included``/``exclusion_reason``); ``transitions`` covers only
+    the sessions where the selected contract actually changed.
+    ``coverage_start``/``coverage_end_exclusive`` are the file's own
+    observed data range (``[earliest raw ts_event, latest raw ts_event
+    + 1 minute)``), used to decide which leading/trailing sessions are
+    excluded as partially covered."""
 
     canonical_contract: str
     raw_bars: tuple[Bar1m, ...]
     session_selections: tuple[SessionSelection, ...]
     transitions: tuple[RollTransition, ...]
     excluded_non_outright_symbols: tuple[str, ...]
+    coverage_start: datetime
+    coverage_end_exclusive: datetime
     continuous_series_result: ContinuousSeriesResult
 
 
@@ -159,6 +193,13 @@ def build_volume_front_month_continuous_series(
         raise ValueError("records must not be empty")
     _require_non_decreasing(records)
 
+    # The file's own observed data range -- computed from every raw record,
+    # before outright filtering, since it describes what the export itself
+    # actually covers. records is already validated non-decreasing, so the
+    # first/last entries are exactly the earliest/latest ts_event.
+    coverage_start = records[0].ts_event
+    coverage_end_exclusive = records[-1].ts_event + timedelta(minutes=1)
+
     outright_records, excluded_symbols = _filter_outright(records)
     if not outright_records:
         raise ValueError(
@@ -176,33 +217,44 @@ def build_volume_front_month_continuous_series(
 
     close_by_symbol_ts, timestamps_by_symbol = _build_price_lookup(outright_records)
 
+    session_bounds = {session_id: _session_bounds(session_id) for session_id in session_ids}
+    fully_covered = {
+        session_id: (bounds[0] >= coverage_start and bounds[1] <= coverage_end_exclusive)
+        for session_id, bounds in session_bounds.items()
+    }
+
     session_selections: list[SessionSelection] = []
     transitions: list[RollTransition] = []
     roll_adjustments: list[RollAdjustment] = []
     raw_bars: list[Bar1m] = []
-
-    warmup_id = session_ids[0]
-    warmup_start, warmup_end = _session_bounds(warmup_id)
-    session_selections.append(
-        SessionSelection(
-            session_id=warmup_id,
-            session_start_utc=warmup_start,
-            session_end_utc=warmup_end,
-            previous_session_id=None,
-            is_warmup=True,
-            candidate_volumes=(),
-            selected_symbol=None,
-            tied_symbols=(),
-            rejected_symbols=(),
-            is_transition=False,
-        )
-    )
-
     previous_selected: str | None = None
-    for index in range(1, len(session_ids)):
-        session_id = session_ids[index]
+
+    for index, session_id in enumerate(session_ids):
+        session_start, session_end = session_bounds[session_id]
+
+        if index == 0:
+            # No preceding session exists in the file at all -- nothing
+            # non-heuristic to compare against, regardless of this
+            # session's own coverage.
+            session_selections.append(
+                _excluded_selection(session_id, session_start, session_end, None, EXCLUSION_NO_PREVIOUS_SESSION)
+            )
+            continue
+
         previous_session_id = session_ids[index - 1]
-        session_start, session_end = _session_bounds(session_id)
+
+        if not fully_covered[session_id]:
+            session_selections.append(
+                _excluded_selection(session_id, session_start, session_end, previous_session_id, EXCLUSION_SESSION_NOT_FULLY_COVERED)
+            )
+            continue
+        if not fully_covered[previous_session_id]:
+            session_selections.append(
+                _excluded_selection(
+                    session_id, session_start, session_end, previous_session_id, EXCLUSION_PREVIOUS_SESSION_NOT_FULLY_COVERED
+                )
+            )
+            continue
 
         volume_totals: dict[str, float] = {}
         for record in sessions[previous_session_id]:
@@ -224,7 +276,8 @@ def build_volume_front_month_continuous_series(
                 session_start_utc=session_start,
                 session_end_utc=session_end,
                 previous_session_id=previous_session_id,
-                is_warmup=False,
+                is_included=True,
+                exclusion_reason=None,
                 candidate_volumes=candidate_volumes,
                 selected_symbol=selected,
                 tied_symbols=tied,
@@ -287,6 +340,13 @@ def build_volume_front_month_continuous_series(
 
         previous_selected = selected
 
+    # An empty raw_bars here means every session was legitimately excluded
+    # (see session_selections for exactly why, per session) -- never raised
+    # as an error in its own right: tradelab.continuous_futures.build_back_
+    # adjusted_continuous_series already treats an empty bars/rolls pair as
+    # a first-class, valid (if uninteresting) case, and discarding the full
+    # per-session audit trail behind an opaque exception here would destroy
+    # exactly the information a caller needs to diagnose a fragmented file.
     continuous_result = build_back_adjusted_continuous_series(raw_bars, roll_adjustments, canonical_contract)
 
     return VolumeRollContinuousResult(
@@ -295,7 +355,27 @@ def build_volume_front_month_continuous_series(
         session_selections=tuple(session_selections),
         transitions=tuple(transitions),
         excluded_non_outright_symbols=tuple(sorted(excluded_symbols)),
+        coverage_start=coverage_start,
+        coverage_end_exclusive=coverage_end_exclusive,
         continuous_series_result=continuous_result,
+    )
+
+
+def _excluded_selection(
+    session_id: str, session_start: datetime, session_end: datetime, previous_session_id: str | None, reason: str
+) -> SessionSelection:
+    return SessionSelection(
+        session_id=session_id,
+        session_start_utc=session_start,
+        session_end_utc=session_end,
+        previous_session_id=previous_session_id,
+        is_included=False,
+        exclusion_reason=reason,
+        candidate_volumes=(),
+        selected_symbol=None,
+        tied_symbols=(),
+        rejected_symbols=(),
+        is_transition=False,
     )
 
 

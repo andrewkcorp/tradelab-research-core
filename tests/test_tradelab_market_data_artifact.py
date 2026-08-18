@@ -60,9 +60,13 @@ ROLL_MANIFEST = [
 
 DATABENTO_HEADER = "ts_event,rtype,publisher_id,instrument_id,open,high,low,close,volume,symbol\n"
 # Session boundaries (EST, UTC-5): 2024-01-15 -> [2024-01-15T23:00Z, ...),
-# 2024-01-16 -> [2024-01-16T23:00Z, ...), 2024-01-17 -> [2024-01-17T23:00Z, ...).
+# 2024-01-16 -> [2024-01-16T23:00Z, ...), 2024-01-17 -> [2024-01-17T23:00Z, 2024-01-18T22:00Z).
 # S0 (warm-up): MNQZ3 wins volume (30 vs 3) -> S1 selects MNQZ3.
 # S1: MNQU3 wins volume (80 vs 20) -> S2 selects MNQU3 (transition, adjustment = 106.5-101.5 = 5.0).
+# The trailing ESZ3 row (a non-outright symbol, never a selection candidate)
+# is dated well past S2's own nominal end so S2 itself counts as fully
+# covered by the file's own data range and isn't excluded as a trailing
+# partial session -- see tradelab.volume_roll_continuous's coverage policy.
 DATABENTO_PARENT_CSV = (
     DATABENTO_HEADER
     + "2024-01-15T23:00:00.000000000Z,33,1,1,100,100,100,100.0,20,MNQZ3\n"
@@ -74,6 +78,7 @@ DATABENTO_PARENT_CSV = (
     + "2024-01-16T23:01:00.000000000Z,33,1,1,101.5,101.5,101.5,101.5,10,MNQZ3\n"
     + "2024-01-16T23:01:00.000000000Z,33,1,2,106.5,106.5,106.5,106.5,40,MNQU3\n"
     + "2024-01-17T23:00:00.000000000Z,33,1,2,107,107,107,107.0,50,MNQU3\n"
+    + "2024-01-19T23:00:00.000000000Z,33,1,3,1,1,1,1.0,1,ESZ3\n"
 )
 
 

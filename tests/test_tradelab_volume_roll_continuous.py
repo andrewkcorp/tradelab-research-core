@@ -2,22 +2,31 @@
 """Volume-front-month roll policy tests: parallel-contract sessions
 select the single highest-previous-session-volume symbol, strictly
 never looking at the current or a later session; ties are broken
-deterministically by ascending symbol and recorded; the very first
-session in the data is always warm-up and never enters the series;
-spreads/wrong-root symbols are filtered out before anything else;
-a contract transition derives its RollAdjustment from the last common
-minute (both contracts trading) strictly before the rollover; the
-final result is exactly what calling tradelab.continuous_futures.
+deterministically by ascending symbol and recorded; a session only
+enters the research series when it is itself fully covered by the
+file's own observed data range AND its immediately preceding session
+is too -- a session whose data starts or ends mid-session (leading or
+trailing partial coverage) is excluded, with an explicit, deterministic
+reason recorded in the audit, never silently treated as ordinary
+warm-up; spreads/wrong-root symbols are filtered out before anything
+else; a contract transition derives its RollAdjustment from the last
+common minute (both contracts trading) strictly before the rollover;
+the final result is exactly what calling tradelab.continuous_futures.
 build_back_adjusted_continuous_series directly on the same raw_bars/
 rolls would produce; and input records are never mutated."""
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from tradelab.continuous_futures import build_back_adjusted_continuous_series
 from tradelab.databento_parent_csv import DatabentoParentRecord
-from tradelab.volume_roll_continuous import build_volume_front_month_continuous_series
+from tradelab.volume_roll_continuous import (
+    EXCLUSION_NO_PREVIOUS_SESSION,
+    EXCLUSION_PREVIOUS_SESSION_NOT_FULLY_COVERED,
+    EXCLUSION_SESSION_NOT_FULLY_COVERED,
+    build_volume_front_month_continuous_series,
+)
 
 UTC = timezone.utc
 
@@ -32,6 +41,10 @@ S2 = datetime(2024, 1, 17, 23, 0, tzinfo=UTC)
 S3 = datetime(2024, 1, 18, 23, 0, tzinfo=UTC)
 
 
+def _min(n: int) -> timedelta:
+    return timedelta(minutes=n)
+
+
 def rec(ts: datetime, symbol: str, close: float, volume: float, *, o: float | None = None, h: float | None = None, l: float | None = None) -> DatabentoParentRecord:
     o = close if o is None else o
     h = close if h is None else h
@@ -41,10 +54,20 @@ def rec(ts: datetime, symbol: str, close: float, volume: float, *, o: float | No
     )
 
 
+def trailing_coverage_filler(after_ts: datetime) -> DatabentoParentRecord:
+    """A throwaway, non-outright record dated well past any session
+    containing ``after_ts``, so that session is never mistaken for a
+    trailing partial session (see PartialSessionCoverageTests). Always
+    excluded from selection itself (wrong root) -- it only ever extends
+    the file's own raw coverage range forward."""
+    return rec(after_ts + timedelta(days=2), "ESZ3", 1.0, 1)
+
+
 def three_session_transition_fixture() -> list[DatabentoParentRecord]:
     """S0 warm-up: MNQZ3 wins volume (150 vs 15) -> S1 selects MNQZ3.
     S1: MNQU3 wins volume (160 vs 40) -> S2 selects MNQU3 (transition).
-    S2/S3: MNQU3 continues."""
+    S2/S3: MNQU3 continues. A trailing filler keeps S3 itself fully
+    covered so it also receives a real selection."""
     return [
         rec(S0, "MNQZ3", 100.0, 100), rec(S0, "MNQU3", 105.0, 10),
         rec(S0 + _min(1), "MNQZ3", 100.5, 50), rec(S0 + _min(1), "MNQU3", 105.5, 5),
@@ -53,13 +76,8 @@ def three_session_transition_fixture() -> list[DatabentoParentRecord]:
         rec(S2, "MNQU3", 107.0, 90),
         rec(S2 + _min(1), "MNQU3", 107.5, 90),
         rec(S3, "MNQU3", 108.0, 50),
+        trailing_coverage_filler(S3),
     ]
-
-
-def _min(n: int):
-    from datetime import timedelta
-
-    return timedelta(minutes=n)
 
 
 class ParallelContractsSameTimestampTests(unittest.TestCase):
@@ -77,7 +95,8 @@ class SessionSelectionFromPreviousVolumeOnlyTests(unittest.TestCase):
         result = build_volume_front_month_continuous_series(records, "MNQ_CONTINUOUS")
         by_session = {s.session_id: s for s in result.session_selections}
 
-        self.assertTrue(by_session["2024-01-15"].is_warmup)
+        self.assertFalse(by_session["2024-01-15"].is_included)
+        self.assertEqual(by_session["2024-01-15"].exclusion_reason, EXCLUSION_NO_PREVIOUS_SESSION)
         self.assertEqual(by_session["2024-01-16"].selected_symbol, "MNQZ3")  # S0: MNQZ3=150 > MNQU3=15
         self.assertEqual(by_session["2024-01-17"].selected_symbol, "MNQU3")  # S1: MNQU3=160 > MNQZ3=40
         self.assertEqual(by_session["2024-01-18"].selected_symbol, "MNQU3")  # S2: MNQU3=180 only candidate
@@ -92,6 +111,7 @@ class NoLookAheadTests(unittest.TestCase):
             rec(S0, "MNQZ3", 100.0, 100), rec(S0, "MNQU3", 105.0, 10),
             rec(S1, "MNQZ3", 101.0, 10), rec(S1, "MNQU3", 106.0, 5),
             rec(S2, "MNQZ3", 102.0, 10), rec(S2, "MNQU3", 107.0, 5),
+            trailing_coverage_filler(S2),
         ]
         with_future_spike = base + [rec(S1 + _min(1), "MNQU3", 999.0, 100_000)]
         with_future_spike.sort(key=lambda r: r.ts_event)
@@ -115,6 +135,7 @@ class DeterministicTieBreakTests(unittest.TestCase):
         records = [
             rec(S0, "MNQZ3", 100.0, 50), rec(S0, "MNQU3", 105.0, 50),  # exact tie
             rec(S1, "MNQZ3", 101.0, 10), rec(S1, "MNQU3", 106.0, 10),
+            trailing_coverage_filler(S1),
         ]
         result = build_volume_front_month_continuous_series(records, "X")
         s1 = result.session_selections[1]
@@ -128,20 +149,103 @@ class DeterministicTieBreakTests(unittest.TestCase):
         self.assertEqual(s1.tied_symbols, ("MNQZ3",))
 
 
-class WarmupExcludedTests(unittest.TestCase):
+class FirstSessionExcludedTests(unittest.TestCase):
     def test_first_session_never_enters_raw_bars(self):
         records = three_session_transition_fixture()
         result = build_volume_front_month_continuous_series(records, "X")
         self.assertTrue(all(b.timestamp >= S1 for b in result.raw_bars))
-        warmup_selection = result.session_selections[0]
-        self.assertTrue(warmup_selection.is_warmup)
-        self.assertIsNone(warmup_selection.selected_symbol)
-        self.assertEqual(warmup_selection.candidate_volumes, ())
+        first_selection = result.session_selections[0]
+        self.assertFalse(first_selection.is_included)
+        self.assertEqual(first_selection.exclusion_reason, EXCLUSION_NO_PREVIOUS_SESSION)
+        self.assertIsNone(first_selection.selected_symbol)
+        self.assertEqual(first_selection.candidate_volumes, ())
 
     def test_only_warmup_session_present_is_rejected(self):
         records = [rec(S0, "MNQZ3", 100.0, 10)]
         with self.assertRaises(ValueError):
             build_volume_front_month_continuous_series(records, "X")
+
+
+class PartialSessionCoverageTests(unittest.TestCase):
+    """The bug this fix addresses: an export starting or ending
+    mid-session must never let that partial session's volume drive (or
+    be used to drive) a contract selection."""
+
+    def test_file_starting_mid_session_excludes_that_session_and_the_next(self):
+        # File starts 2 hours into S0's own session -- mirrors the real
+        # bug report example (an export beginning mid-session).
+        partial_start = S0 + timedelta(hours=2)
+        records = [
+            rec(partial_start, "MNQZ3", 100.0, 100),
+            rec(partial_start + _min(1), "MNQU3", 105.0, 10),
+            rec(S1, "MNQZ3", 101.0, 200), rec(S1, "MNQU3", 106.0, 20),  # S1: fully covered, MNQZ3 wins decisively
+            rec(S2, "MNQZ3", 102.0, 10),
+            trailing_coverage_filler(S2),
+        ]
+        result = build_volume_front_month_continuous_series(records, "X")
+        by_session = {s.session_id: s for s in result.session_selections}
+
+        s0 = by_session["2024-01-15"]
+        self.assertFalse(s0.is_included)
+        self.assertEqual(s0.exclusion_reason, EXCLUSION_NO_PREVIOUS_SESSION)
+
+        # S1 is itself fully covered (real, complete data), but its own
+        # previous session (S0) is only partially covered by the file --
+        # S1 is therefore excluded too, never selected on partial S0 volume.
+        s1 = by_session["2024-01-16"]
+        self.assertFalse(s1.is_included)
+        self.assertEqual(s1.exclusion_reason, EXCLUSION_PREVIOUS_SESSION_NOT_FULLY_COVERED)
+        self.assertIsNone(s1.selected_symbol)
+
+        # S2's own previous session (S1) IS fully covered, so S2 is selected
+        # purely from S1's own complete volume -- exactly as the policy requires.
+        s2 = by_session["2024-01-17"]
+        self.assertTrue(s2.is_included)
+        self.assertIsNone(s2.exclusion_reason)
+        self.assertEqual(s2.selected_symbol, "MNQZ3")
+        self.assertEqual({c.symbol: c.total_volume for c in s2.candidate_volumes}, {"MNQZ3": 200.0, "MNQU3": 20.0})
+
+        # Neither S0's nor S1's bars ever enter the research series.
+        self.assertTrue(all(b.timestamp >= S2 for b in result.raw_bars))
+
+    def test_file_ending_mid_session_excludes_that_session(self):
+        records = [
+            rec(S0, "MNQZ3", 100.0, 100), rec(S0, "MNQU3", 105.0, 10),
+            rec(S1, "MNQZ3", 101.0, 10),
+            # S1 = last session in the file, only one bar right at its own
+            # start -- nowhere near its own nominal end -> trailing partial.
+        ]
+        result = build_volume_front_month_continuous_series(records, "X")
+        by_session = {s.session_id: s for s in result.session_selections}
+
+        s1 = by_session["2024-01-16"]
+        self.assertFalse(s1.is_included)
+        self.assertEqual(s1.exclusion_reason, EXCLUSION_SESSION_NOT_FULLY_COVERED)
+        self.assertIsNone(s1.selected_symbol)
+        # S1 never enters the resulting series -- and since it was the only
+        # non-warm-up session in this file, nothing does.
+        self.assertEqual(result.raw_bars, ())
+        self.assertEqual(result.continuous_series_result.normalized_bars, ())
+
+    def test_exclusion_reasons_are_deterministic(self):
+        partial_start = S0 + timedelta(hours=2)
+        records = [
+            rec(partial_start, "MNQZ3", 100.0, 100),
+            rec(S1, "MNQZ3", 101.0, 200), rec(S1, "MNQU3", 106.0, 20),
+            rec(S2, "MNQZ3", 102.0, 10),
+            trailing_coverage_filler(S2),
+        ]
+        result_a = build_volume_front_month_continuous_series(list(records), "X")
+        result_b = build_volume_front_month_continuous_series(list(records), "X")
+        self.assertEqual(result_a.session_selections, result_b.session_selections)
+        self.assertEqual(result_a.coverage_start, result_b.coverage_start)
+        self.assertEqual(result_a.coverage_end_exclusive, result_b.coverage_end_exclusive)
+
+    def test_coverage_fields_reflect_the_raw_file_range(self):
+        records = three_session_transition_fixture()
+        result = build_volume_front_month_continuous_series(records, "X")
+        self.assertEqual(result.coverage_start, S0)
+        self.assertEqual(result.coverage_end_exclusive, S3 + timedelta(days=2) + _min(1))
 
 
 class SymbolFilterExcludesSpreadsAndWrongRootTests(unittest.TestCase):
@@ -191,6 +295,7 @@ class TransitionAdjustmentFromLastCommonMinuteTests(unittest.TestCase):
             rec(S1, "MNQZ3", 101.0, 1),
             rec(S1 + _min(5), "MNQU3", 106.0, 100),
             rec(S2, "MNQU3", 107.0, 200),
+            trailing_coverage_filler(S2),
         ]
         with self.assertRaises(ValueError):
             build_volume_front_month_continuous_series(records, "X")
@@ -199,6 +304,7 @@ class TransitionAdjustmentFromLastCommonMinuteTests(unittest.TestCase):
         records = [
             rec(S0, "MNQZ3", 100.0, 1), rec(S0, "MNQU3", 105.0, 100),  # MNQU3 wins S0
             rec(S1, "MNQZ3", 101.0, 10),  # but only MNQZ3 actually trades in S1 -- MNQU3 has no bar here
+            trailing_coverage_filler(S1),
         ]
         with self.assertRaises(ValueError):
             build_volume_front_month_continuous_series(records, "X")
