@@ -17,6 +17,13 @@ continuous_artifact_manifest.json
 volume_roll_audit.json
 materialization_summary.json
 
+# Local research context profile (tradelab.profile_research_context) --
+# a small diagnostic JSON derived from real market/news data, never
+# committed. --output-json is always caller-supplied at runtime; this
+# pattern only guards against it being pointed inside the repo by
+# accident (e.g. for local testing).
+context_profile.json
+
 # Local research journal databases (tradelab.research_journal) -- SQLite
 # checkpoint/resume state and any exported qualifying-strategy results,
 # never committed. db_path/export path are always caller-supplied at

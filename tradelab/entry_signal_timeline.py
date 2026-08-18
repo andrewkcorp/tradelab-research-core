@@ -20,10 +20,20 @@ level source only).
 - An NY trading day runs ``[18:00 NY, 17:00 NY next day)`` -- the same
   23-hour shape as ``tradelab.session_calendar``'s regular session, and
   identified by ``trading_day_id``, the ISO date of the day it *started*
-  on (18:00). A signal whose own ``known_at`` falls inside the daily
-  17:00-18:00 maintenance break belongs to no trading day at all and is
-  rejected outright (``ValueError``) -- real candles never close inside
-  that break, so this can only happen from malformed input.
+  on (18:00). A signal whose own ``known_at`` falls strictly *between*
+  17:00 and 18:00 NY (open interval: excludes both boundaries) belongs
+  to no trading day at all and is rejected outright (``ValueError``) --
+  real candles never close in there, so this can only happen from
+  malformed input. ``known_at`` exactly *at* 17:00 NY is different: it is
+  the regular session's own close, and therefore the ``known_at`` of
+  every trading day's genuinely last 1-minute candle (``timestamp``
+  16:59, ``known_at`` 17:00) -- a completely ordinary, expected instant
+  for real data, never malformed, so it belongs to the trading day that
+  is *ending* at that instant rather than being rejected. Its own
+  ``valid_until`` for that day is that same 17:00 NY instant, so
+  ``[known_at, valid_until)`` is empty -- correct, not a bug: a signal
+  known simultaneously with its own trading day's end has no remaining
+  time left in that day to ever be found active.
 - All boundary math uses ``zoneinfo.ZoneInfo("America/New_York")``, never
   a fixed UTC offset, so DST transitions are handled correctly for free.
 
@@ -86,9 +96,16 @@ LONG = "long"
 SHORT = "short"
 _DIRECTIONS = frozenset({LONG, SHORT})
 
-# The daily NY maintenance break: a signal known_at falling in here belongs
-# to no trading day. Half-open, matching every other window in this
-# package: [17:00, 18:00).
+# The daily NY maintenance break: a signal known_at falling strictly
+# inside here belongs to no trading day. Open on *both* ends -- unlike
+# every other window in this package, which is half-open -- because
+# known_at == 17:00 NY exactly is not itself part of the break: it is
+# the regular session's own close, i.e. the known_at of every trading
+# day's genuinely last 1-minute candle, and is handled separately below
+# (attributed to the ending day, not rejected). known_at == 18:00 NY can
+# never actually occur (every Candle.known_at is strictly after its own
+# timestamp, and the earliest possible session-open timestamp is itself
+# 18:00 NY), so only the true open interval is ever reachable there.
 _BREAK_START = time(17, 0)
 _BREAK_END = time(18, 0)
 
@@ -145,14 +162,17 @@ class EntrySignalQueryResult:
 
 def _trading_day_for(known_at: datetime) -> tuple[str, datetime]:
     """The ``(trading_day_id, valid_until_utc)`` pair for a signal known
-    at ``known_at``. Raises if ``known_at`` falls inside the daily
-    17:00-18:00 NY maintenance break, which no trading day owns."""
+    at ``known_at``. Raises if ``known_at`` falls strictly between 17:00
+    and 18:00 NY, which no trading day owns. ``known_at`` exactly at
+    17:00 NY -- the regular session's own close -- is not rejected: it
+    is attributed to the trading day that is ending at that instant (see
+    module docstring)."""
     local = known_at.astimezone(NY)
     t = local.time()
-    if _BREAK_START <= t < _BREAK_END:
+    if _BREAK_START < t < _BREAK_END:
         raise ValueError(
             f"known_at {known_at!r} (NY local {local!r}) falls inside the daily NY maintenance break "
-            "[17:00, 18:00) -- no trading day owns this instant, so it can never be a valid entry signal"
+            "(17:00, 18:00) -- no trading day owns this instant, so it can never be a valid entry signal"
         )
     start_date = local.date() if t >= _BREAK_END else local.date() - timedelta(days=1)
     end_date = start_date + timedelta(days=1)

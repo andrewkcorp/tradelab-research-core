@@ -212,10 +212,25 @@ class NewTradingDayTests(unittest.TestCase):
         timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
         self.assertEqual(timeline.signals[0].trading_day_id, "2026-01-05")
 
-    def test_signal_known_exactly_at_1700_is_rejected(self):
+    def test_signal_known_exactly_at_1700_belongs_to_the_ending_trading_day(self):
+        # 17:00 NY is the regular session's own close -- the known_at of
+        # every trading day's genuinely last 1-minute candle -- so it is
+        # never malformed and is attributed to the day that is ending,
+        # not rejected (unlike the open interval strictly between 17:00
+        # and 18:00, which no trading day owns).
         c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 17, 0))
-        with self.assertRaises(ValueError):
-            build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        self.assertEqual(timeline.signals[0].trading_day_id, "2026-01-04")
+        self.assertEqual(timeline.signals[0].valid_until, ny_dt(2026, 1, 5, 17, 0))
+
+    def test_signal_known_exactly_at_1700_has_zero_width_validity(self):
+        # known_at == valid_until for this signal: it becomes known at the
+        # exact instant its own trading day ends, so [known_at, valid_until)
+        # is empty -- it can never be found active, by construction, not by bug.
+        c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 17, 0))
+        timeline = build_entry_signal_timeline(fvg_result(c), EMPTY_LIQUIDITY)
+        result = query_active_signals(timeline, {"fvg-1m-fvg_touch"}, LONG, ny_dt(2026, 1, 5, 17, 0))
+        self.assertEqual(result.active_signals, [])
 
     def test_signal_known_inside_the_break_is_rejected(self):
         c = fvg_candidate(known_at=ny_dt(2026, 1, 5, 17, 30))
