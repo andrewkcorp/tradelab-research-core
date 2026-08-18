@@ -3,3 +3,16 @@ __pycache__/
 .env
 .env.*
 backtest_results.json
+
+# Local MNQ research artifacts (tradelab.materialize_research_artifact) --
+# generated data + audit JSON, never real market data checked into git.
+# Matches the exact filenames the CLI writes, wherever they land, plus the
+# conventional local output directory name so an --output-dir pointed
+# inside the repo (e.g. for local testing) can never be committed by accident.
+tradelab_mnq_research_artifact/
+**/tradelab_mnq_research_artifact/
+mnq_continuous_1m.csv
+source_artifact_manifest.json
+continuous_artifact_manifest.json
+volume_roll_audit.json
+materialization_summary.json

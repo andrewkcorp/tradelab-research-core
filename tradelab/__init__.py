@@ -95,6 +95,7 @@ from tradelab.market_data_artifact import (
     load_market_data_series,
     read_roll_manifest,
 )
+from tradelab.materialize_research_artifact import MaterializationResult, materialize_mnq_research_artifact
 from tradelab.news import NewsEvent, is_entry_blocked, validate_news_events
 from tradelab.news_loaders import read_news_events_csv, read_news_events_parquet
 from tradelab.research_runner import (
@@ -299,4 +300,6 @@ __all__ = [
     "RollTransition",
     "VolumeRollContinuousResult",
     "build_volume_front_month_continuous_series",
+    "MaterializationResult",
+    "materialize_mnq_research_artifact",
 ]

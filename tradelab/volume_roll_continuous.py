@@ -92,6 +92,13 @@ from tradelab.entry_signal_timeline import _trading_day_for
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
 
+# The single, versioned roll policy this module implements (see module
+# docstring) -- the value recorded as MarketDataArtifact.normalization_
+# method by callers (e.g. tradelab.materialize_research_artifact) so a
+# resulting continuous/databento_parent_csv artifact's manifest always
+# names exactly which policy version produced it.
+POLICY_VERSION = "volume_front_month_v1"
+
 SESSION_START_HOUR = 18
 SESSION_END_HOUR = 17
 
@@ -110,6 +117,9 @@ _OUTRIGHT_SYMBOL_PATTERN = re.compile(r"^MNQ[HMUZ]\d$")
 class SymbolVolume:
     symbol: str
     total_volume: float
+
+    def to_dict(self) -> dict:
+        return {"symbol": self.symbol, "total_volume": self.total_volume}
 
 
 @dataclass(frozen=True)
@@ -136,6 +146,21 @@ class SessionSelection:
     rejected_symbols: tuple[str, ...]
     is_transition: bool
 
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "session_start_utc": self.session_start_utc.isoformat(),
+            "session_end_utc": self.session_end_utc.isoformat(),
+            "previous_session_id": self.previous_session_id,
+            "is_included": self.is_included,
+            "exclusion_reason": self.exclusion_reason,
+            "candidate_volumes": [v.to_dict() for v in self.candidate_volumes],
+            "selected_symbol": self.selected_symbol,
+            "tied_symbols": list(self.tied_symbols),
+            "rejected_symbols": list(self.rejected_symbols),
+            "is_transition": self.is_transition,
+        }
+
 
 @dataclass(frozen=True)
 class RollTransition:
@@ -151,6 +176,18 @@ class RollTransition:
     outgoing_close_at_common_minute: float
     incoming_close_at_common_minute: float
     adjustment_points: float
+
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "outgoing_contract": self.outgoing_contract,
+            "incoming_contract": self.incoming_contract,
+            "effective_at": self.effective_at.isoformat(),
+            "common_minute": self.common_minute.isoformat(),
+            "outgoing_close_at_common_minute": self.outgoing_close_at_common_minute,
+            "incoming_close_at_common_minute": self.incoming_close_at_common_minute,
+            "adjustment_points": self.adjustment_points,
+        }
 
 
 @dataclass(frozen=True)
@@ -176,6 +213,23 @@ class VolumeRollContinuousResult:
     coverage_start: datetime
     coverage_end_exclusive: datetime
     continuous_series_result: ContinuousSeriesResult
+
+    def to_dict(self) -> dict:
+        """A plain, JSON-compatible audit dict. Deliberately excludes
+        ``raw_bars``/``continuous_series_result`` -- the bars themselves
+        already live in whatever file a caller writes them to (e.g. a
+        continuous CSV), and duplicating a potentially multi-year bar
+        series into a second, redundant JSON file here would be wasteful;
+        this covers only the audit trail (selections, transitions,
+        exclusions, coverage)."""
+        return {
+            "canonical_contract": self.canonical_contract,
+            "coverage_start": self.coverage_start.isoformat(),
+            "coverage_end_exclusive": self.coverage_end_exclusive.isoformat(),
+            "session_selections": [s.to_dict() for s in self.session_selections],
+            "transitions": [t.to_dict() for t in self.transitions],
+            "excluded_non_outright_symbols": list(self.excluded_non_outright_symbols),
+        }
 
 
 def build_volume_front_month_continuous_series(
