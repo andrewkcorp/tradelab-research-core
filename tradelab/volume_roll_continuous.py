@@ -221,8 +221,15 @@ class VolumeRollContinuousResult:
         continuous CSV), and duplicating a potentially multi-year bar
         series into a second, redundant JSON file here would be wasteful;
         this covers only the audit trail (selections, transitions,
-        exclusions, coverage)."""
+        exclusions, coverage). ``policy_version`` is always ``POLICY_
+        VERSION`` -- this dict is only ever produced by this module's own
+        ``build_volume_front_month_continuous_series``, so it can never
+        actually vary, but it is included explicitly (not left implicit)
+        so this file alone is self-contained: a reader never has to
+        already know which module produced it to know which policy
+        version did."""
         return {
+            "policy_version": POLICY_VERSION,
             "canonical_contract": self.canonical_contract,
             "coverage_start": self.coverage_start.isoformat(),
             "coverage_end_exclusive": self.coverage_end_exclusive.isoformat(),

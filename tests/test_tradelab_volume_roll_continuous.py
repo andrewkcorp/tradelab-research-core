@@ -25,6 +25,7 @@ from tradelab.volume_roll_continuous import (
     EXCLUSION_NO_PREVIOUS_SESSION,
     EXCLUSION_PREVIOUS_SESSION_NOT_FULLY_COVERED,
     EXCLUSION_SESSION_NOT_FULLY_COVERED,
+    POLICY_VERSION,
     build_volume_front_month_continuous_series,
 )
 
@@ -308,6 +309,22 @@ class TransitionAdjustmentFromLastCommonMinuteTests(unittest.TestCase):
         ]
         with self.assertRaises(ValueError):
             build_volume_front_month_continuous_series(records, "X")
+
+
+class ToDictAuditSerializationTests(unittest.TestCase):
+    def test_to_dict_includes_policy_version(self):
+        records = three_session_transition_fixture()
+        result = build_volume_front_month_continuous_series(records, "MNQ_CONTINUOUS")
+        payload = result.to_dict()
+        self.assertEqual(payload["policy_version"], POLICY_VERSION)
+        self.assertEqual(payload["policy_version"], "volume_front_month_v1")
+
+    def test_to_dict_omits_raw_bars_and_continuous_series_result(self):
+        records = three_session_transition_fixture()
+        result = build_volume_front_month_continuous_series(records, "MNQ_CONTINUOUS")
+        payload = result.to_dict()
+        self.assertNotIn("raw_bars", payload)
+        self.assertNotIn("continuous_series_result", payload)
 
 
 class MatchesDirectContinuousFuturesCallTests(unittest.TestCase):
