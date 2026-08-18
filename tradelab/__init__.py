@@ -82,6 +82,18 @@ from tradelab.liquidity_entry import (
     detect_liquidity_entry_candidates,
 )
 from tradelab.loaders import read_csv_bars, read_parquet_bars
+from tradelab.market_data_artifact import (
+    AuditFinding,
+    AuditSeverity,
+    MarketDataArtifact,
+    MarketDataArtifactAuditReport,
+    MarketDataSeriesResult,
+    SeriesKind,
+    audit_market_data_artifact,
+    load_market_data_artifact,
+    load_market_data_series,
+    read_roll_manifest,
+)
 from tradelab.news import NewsEvent, is_entry_blocked, validate_news_events
 from tradelab.news_loaders import read_news_events_csv, read_news_events_parquet
 from tradelab.research_runner import (
@@ -262,4 +274,14 @@ __all__ = [
     "ContractOffset",
     "ContinuousSeriesResult",
     "build_back_adjusted_continuous_series",
+    "SeriesKind",
+    "MarketDataArtifact",
+    "load_market_data_artifact",
+    "read_roll_manifest",
+    "AuditSeverity",
+    "AuditFinding",
+    "MarketDataArtifactAuditReport",
+    "audit_market_data_artifact",
+    "MarketDataSeriesResult",
+    "load_market_data_series",
 ]
