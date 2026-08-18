@@ -16,3 +16,15 @@ source_artifact_manifest.json
 continuous_artifact_manifest.json
 volume_roll_audit.json
 materialization_summary.json
+
+# Local research journal databases (tradelab.research_journal) -- SQLite
+# checkpoint/resume state and any exported qualifying-strategy results,
+# never committed. db_path/export path are always caller-supplied at
+# runtime; these patterns only guard against one being pointed inside
+# the repo by accident (e.g. for local testing).
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+research_journal.sqlite3

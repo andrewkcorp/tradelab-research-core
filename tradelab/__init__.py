@@ -97,6 +97,14 @@ from tradelab.market_data_artifact import (
 )
 from tradelab.news import NewsEvent, is_entry_blocked, validate_news_events
 from tradelab.news_loaders import read_news_events_csv, read_news_events_parquet
+from tradelab.research_journal import (
+    EvaluationStatus,
+    JournalEntry,
+    LastCheckpoint,
+    ResearchJournal,
+    RunManifest,
+    RunStatus,
+)
 from tradelab.research_runner import (
     RejectionReason,
     ResearchConfig,
@@ -299,4 +307,10 @@ __all__ = [
     "RollTransition",
     "VolumeRollContinuousResult",
     "build_volume_front_month_continuous_series",
+    "ResearchJournal",
+    "RunManifest",
+    "RunStatus",
+    "LastCheckpoint",
+    "JournalEntry",
+    "EvaluationStatus",
 ]
