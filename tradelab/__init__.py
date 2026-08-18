@@ -97,6 +97,19 @@ from tradelab.market_data_artifact import (
 )
 from tradelab.news import NewsEvent, is_entry_blocked, validate_news_events
 from tradelab.news_loaders import read_news_events_csv, read_news_events_parquet
+from tradelab.observed_strategy_universe import (
+    ALL_BIAS_POLICIES,
+    ALL_TP_CHOICES,
+    GENERATOR_POLICY_VERSION,
+    UNIVERSE_SCHEMA_VERSION,
+    ObservedConfluenceCombo,
+    ObservedUniverse,
+    StrategyUniverseGenerator,
+    UniverseManifest,
+    UniverseProgress,
+    discover_observed_universe,
+    iter_observed_strategy_specs,
+)
 from tradelab.research_journal import (
     EvaluationStatus,
     JournalEntry,
@@ -313,4 +326,15 @@ __all__ = [
     "LastCheckpoint",
     "JournalEntry",
     "EvaluationStatus",
+    "ObservedConfluenceCombo",
+    "ObservedUniverse",
+    "StrategyUniverseGenerator",
+    "UniverseManifest",
+    "UniverseProgress",
+    "discover_observed_universe",
+    "iter_observed_strategy_specs",
+    "ALL_BIAS_POLICIES",
+    "ALL_TP_CHOICES",
+    "GENERATOR_POLICY_VERSION",
+    "UNIVERSE_SCHEMA_VERSION",
 ]
