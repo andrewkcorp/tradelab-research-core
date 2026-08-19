@@ -25,6 +25,7 @@ from tradelab.entry_signal_timeline import (
     SignalSuspension,
     SourceKind,
     build_entry_signal_timeline,
+    iter_active_pool_scalar_snapshots,
     iter_active_signal_snapshots,
     iter_fvg_lifecycle_transitions,
     query_active_signals,
@@ -1100,6 +1101,249 @@ class BulkSnapshotEquivalenceTests(unittest.TestCase):
         snapshots = list(iter_active_signal_snapshots(timeline))
         self.assertEqual(len(snapshots), 50)
         self.assertEqual([s.signal.candidate_id for s in snapshots], [s.candidate_id for s in timeline.signals])
+
+
+class ActivePoolScalarSnapshotEquivalenceTests(unittest.TestCase):
+    """``iter_active_pool_scalar_snapshots`` must agree exactly with
+    ``iter_active_signal_snapshots`` (unique active-selector count
+    including/excluding the primary's own selector, and raw active
+    instance count) at every real signal's own instant -- it reuses the
+    exact same ``_apply_liquidity_batch``/``_apply_fvg_batch``/
+    ``_resolve_zone`` calls via ``_RefCountingDict``, never
+    reimplementing the suspend/restore/invalidate/retire rules, so any
+    disagreement here would indicate the ref-counting wrapper itself is
+    broken, not a semantic divergence."""
+
+    def _assert_scalar_matches_full(self, timeline) -> None:
+        full = list(iter_active_signal_snapshots(timeline))
+        scalar = list(iter_active_pool_scalar_snapshots(timeline))
+        self.assertEqual(len(full), len(scalar))
+        checked = 0
+        for f, s in zip(full, scalar):
+            self.assertEqual(f.signal.candidate_id, s.signal.candidate_id)
+            unique_selectors = len(f.active_by_selector)
+            instance_count = sum(len(sigs) for sigs in f.active_by_selector.values())
+            self.assertEqual(
+                unique_selectors, s.active_selector_count_including_primary,
+                f"unique-selector-count mismatch at {f.signal.candidate_id!r} known_at={f.signal.known_at!r}",
+            )
+            self.assertEqual(
+                unique_selectors - 1, s.required_confluence_selector_count_excluding_primary,
+                f"confluence-count mismatch at {f.signal.candidate_id!r} known_at={f.signal.known_at!r}",
+            )
+            self.assertEqual(
+                instance_count, s.active_signal_instance_count,
+                f"instance-count mismatch at {f.signal.candidate_id!r} known_at={f.signal.known_at!r}",
+            )
+            checked += 1
+        self.assertGreater(checked, 0)
+
+    def test_matches_on_a_small_overlapping_fixture(self):
+        same_instant_a = fvg_candidate(zone_id="A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        same_instant_b = fvg_candidate(zone_id="B", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        challenger = fvg_candidate(zone_id="C", direction=SHORT, known_at=ny_dt(2026, 1, 5, 10, 30))
+        other_timeframe = fvg_candidate(zone_id="D", timeframe="5m", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 15))
+        tie_with_challenger = fvg_candidate(zone_id="E", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 30))
+        timeline = build_entry_signal_timeline(
+            fvg_result(same_instant_a, same_instant_b, challenger, other_timeframe, tie_with_challenger), EMPTY_LIQUIDITY
+        )
+        self._assert_scalar_matches_full(timeline)
+
+    def test_matches_on_randomized_fvg_signals(self):
+        rng = random.Random(555111)
+        signals = _random_fvg_signals(rng, 200, ny_dt(2026, 1, 5, 9, 0), "scalar-fvg")
+        timeline = build_entry_signal_timeline(fvg_result(*signals), EMPTY_LIQUIDITY)
+        self._assert_scalar_matches_full(timeline)
+
+    def test_matches_on_randomized_fvg_signals_second_seed(self):
+        rng = random.Random(222999)
+        signals = _random_fvg_signals(rng, 250, ny_dt(2026, 6, 1, 9, 0), "scalar-fvg2")
+        timeline = build_entry_signal_timeline(fvg_result(*signals), EMPTY_LIQUIDITY)
+        self._assert_scalar_matches_full(timeline)
+
+    def test_matches_on_randomized_mixed_fvg_and_liquidity_fixtures(self):
+        rng = random.Random(13579)
+        fvg_signals = _random_fvg_signals(rng, 150, ny_dt(2026, 1, 5, 9, 0), "scalar-mix-fvg")
+        liquidity_signals = _random_liquidity_signals(rng, 150, ny_dt(2026, 1, 5, 9, 0), "scalar-mix-liq")
+        timeline = build_entry_signal_timeline(fvg_result(*fvg_signals), liquidity_result(*liquidity_signals))
+        self._assert_scalar_matches_full(timeline)
+
+    def test_matches_on_randomized_realistic_fvg_zone_lifecycles(self):
+        # exercises suspend/restore/nesting/mitigation-driven-restoration
+        # directly, same as BulkSnapshotEquivalenceTests's own coverage.
+        rng = random.Random(864213)
+        candidates, mitigations = _random_fvg_zone_stories(rng, 200, ny_dt(2026, 1, 5, 9, 0), "scalar-story")
+        timeline = build_entry_signal_timeline(fvg_result(*candidates, mitigations=mitigations), EMPTY_LIQUIDITY)
+        self._assert_scalar_matches_full(timeline)
+
+    def test_matches_on_randomized_realistic_fvg_zone_lifecycles_second_seed(self):
+        rng = random.Random(741852)
+        candidates, mitigations = _random_fvg_zone_stories(rng, 200, ny_dt(2026, 3, 1, 9, 0), "scalar-story2")
+        timeline = build_entry_signal_timeline(fvg_result(*candidates, mitigations=mitigations), EMPTY_LIQUIDITY)
+        self._assert_scalar_matches_full(timeline)
+
+
+class ActivePoolScalarSnapshotFocusedTests(unittest.TestCase):
+    """Direct, hand-built scenarios for each lifecycle mechanic the
+    scalar stream must track correctly: overlapping same-selector
+    instances (dedup to one unique selector, never two), FVG
+    suspension, restoration via inversion, restoration via a later
+    non-inverting mitigation, liquidity same-selector invalidation, and
+    strict direction separation."""
+
+    def test_overlapping_same_selector_instances_dedupe_to_one_unique_selector(self):
+        first = fvg_candidate(zone_id="A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        second = fvg_candidate(zone_id="B", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 1))
+        timeline = build_entry_signal_timeline(fvg_result(first, second), EMPTY_LIQUIDITY)
+
+        snapshots = list(iter_active_pool_scalar_snapshots(timeline))
+        self.assertEqual(snapshots[0].active_selector_count_including_primary, 1)
+        self.assertEqual(snapshots[0].active_signal_instance_count, 1)
+        # second's own snapshot: both first and second active, same selector -- still 1 unique selector, 2 instances.
+        self.assertEqual(snapshots[1].active_selector_count_including_primary, 1)
+        self.assertEqual(snapshots[1].active_signal_instance_count, 2)
+        self.assertEqual(snapshots[1].required_confluence_selector_count_excluding_primary, 0)
+
+    def test_suspension_reduces_selector_and_instance_counts(self):
+        bullish = fvg_candidate(zone_id="A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        bearish_touch = fvg_candidate(zone_id="B", direction=SHORT, known_at=ny_dt(2026, 1, 5, 11, 0))
+        # A second, later long signal after the suspension makes the suspension's effect on the
+        # long-direction pool directly observable (bearish_touch's own snapshot is scoped to the
+        # SHORT direction, so it alone couldn't show whether bullish was actually removed).
+        later_long = fvg_candidate(zone_id="C", direction=LONG, known_at=ny_dt(2026, 1, 5, 12, 0))
+        timeline = build_entry_signal_timeline(fvg_result(bullish, bearish_touch, later_long), EMPTY_LIQUIDITY)
+
+        snapshots = list(iter_active_pool_scalar_snapshots(timeline))
+        later_long_snapshot = next(s for s in snapshots if s.signal.candidate_id == later_long.candidate_id)
+        # bullish is suspended by bearish_touch (same timeframe, opposite direction) -- only
+        # later_long itself should be active in the long pool at this point.
+        self.assertEqual(later_long_snapshot.active_selector_count_including_primary, 1)
+        self.assertEqual(later_long_snapshot.active_signal_instance_count, 1)
+
+    def test_restoration_via_inversion_restores_counts(self):
+        bullish = fvg_candidate(zone_id="A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        bearish_touch, bearish_ifvg = fvg_touch_then_inversion("B", "1m", SHORT, ny_dt(2026, 1, 5, 11, 0), ny_dt(2026, 1, 5, 13, 0))
+        later_long = fvg_candidate(zone_id="C", direction=LONG, known_at=ny_dt(2026, 1, 5, 14, 0))
+        timeline = build_entry_signal_timeline(fvg_result(bullish, bearish_touch, bearish_ifvg, later_long), EMPTY_LIQUIDITY)
+
+        snapshots = list(iter_active_pool_scalar_snapshots(timeline))
+        later_long_snapshot = next(s for s in snapshots if s.signal.candidate_id == later_long.candidate_id)
+        # bullish was restored by bearish_ifvg, and bearish_ifvg is itself a new LONG confluence
+        # of its own (selector "fvg-1m-ifvg") -- so by later_long's own known_at, the long pool
+        # holds two unique selectors ("fvg-1m-fvg_touch": bullish + later_long, "fvg-1m-ifvg":
+        # bearish_ifvg), three instances total, and one confluence selector besides later_long's own.
+        self.assertEqual(later_long_snapshot.active_selector_count_including_primary, 2)
+        self.assertEqual(later_long_snapshot.active_signal_instance_count, 3)
+        self.assertEqual(later_long_snapshot.required_confluence_selector_count_excluding_primary, 1)
+
+    def test_restoration_via_mitigation_restores_counts(self):
+        bullish = fvg_candidate(zone_id="A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        bearish_touch, bearish_mitigation = fvg_touch_then_mitigation("B", "1m", SHORT, ny_dt(2026, 1, 5, 11, 0), ny_dt(2026, 1, 5, 13, 0))
+        later_long = fvg_candidate(zone_id="C", direction=LONG, known_at=ny_dt(2026, 1, 5, 14, 0))
+        timeline = build_entry_signal_timeline(fvg_result(bullish, bearish_touch, later_long, mitigations=(bearish_mitigation,)), EMPTY_LIQUIDITY)
+
+        snapshots = list(iter_active_pool_scalar_snapshots(timeline))
+        later_long_snapshot = next(s for s in snapshots if s.signal.candidate_id == later_long.candidate_id)
+        # bullish was restored by the mitigation event (never a signal of its own) --
+        # both bullish and later_long are active in the long pool by later_long's own known_at.
+        self.assertEqual(later_long_snapshot.active_selector_count_including_primary, 1)
+        self.assertEqual(later_long_snapshot.active_signal_instance_count, 2)
+
+    def test_liquidity_invalidation_reduces_instance_count(self):
+        # `_liquidity_selector` is built from (timeframe, source_family, liquidity_type,
+        # trigger_phase, entry_mode) -- NOT `side` -- while direction is derived from
+        # (side, entry_mode). Flipping only `side` (keeping every selector-affecting field
+        # fixed) therefore gives two candidates with the SAME selector but OPPOSITE direction.
+        first = liquidity_candidate(level_id="L1", known_at=ny_dt(2026, 1, 5, 10, 0))  # side=HIGH, REVERSAL -> short
+        opposite = liquidity_candidate(level_id="L2", side=LOW, known_at=ny_dt(2026, 1, 5, 10, 1))  # side=LOW, REVERSAL -> long
+        later_same_selector = liquidity_candidate(level_id="L3", known_at=ny_dt(2026, 1, 5, 10, 2))  # short again
+        timeline = build_entry_signal_timeline(EMPTY_FVG, liquidity_result(first, opposite, later_same_selector))
+
+        snapshots = list(iter_active_pool_scalar_snapshots(timeline))
+        later_snapshot = next(s for s in snapshots if s.signal.candidate_id == later_same_selector.candidate_id)
+        # `first` (short) was invalidated by `opposite` (long, same selector) before
+        # `later_same_selector` (also short) arrives -- only later_same_selector itself
+        # should be active in the short-direction pool.
+        self.assertEqual(later_snapshot.active_selector_count_including_primary, 1)
+        self.assertEqual(later_snapshot.active_signal_instance_count, 1)
+
+    def test_directions_are_never_mixed(self):
+        long_a = fvg_candidate(zone_id="A", timeframe="1m", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        long_b = fvg_candidate(zone_id="B", timeframe="5m", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 1))
+        short_c = fvg_candidate(zone_id="C", timeframe="15m", direction=SHORT, known_at=ny_dt(2026, 1, 5, 10, 2))
+        timeline = build_entry_signal_timeline(fvg_result(long_a, long_b, short_c), EMPTY_LIQUIDITY)
+
+        snapshots = list(iter_active_pool_scalar_snapshots(timeline))
+        short_snapshot = next(s for s in snapshots if s.signal.candidate_id == short_c.candidate_id)
+        # short_c's own snapshot must never see the two long-direction selectors active before it.
+        self.assertEqual(short_snapshot.active_selector_count_including_primary, 1)
+        self.assertEqual(short_snapshot.active_signal_instance_count, 1)
+        self.assertEqual(short_snapshot.required_confluence_selector_count_excluding_primary, 0)
+
+    def test_empty_timeline_yields_nothing(self):
+        timeline = build_entry_signal_timeline(EMPTY_FVG, EMPTY_LIQUIDITY)
+        self.assertEqual(list(iter_active_pool_scalar_snapshots(timeline)), [])
+
+
+class ActivePoolScalarSnapshotPerformanceTests(unittest.TestCase):
+    """Demonstrates ``iter_active_pool_scalar_snapshots`` never
+    materializes a per-snapshot active list/dict of ``EntrySignal``
+    instances: (1) structurally, every scalar field on
+    ``ActivePoolScalarSnapshot`` is a plain ``int``, never a
+    ``list``/``dict``; (2) behaviorally, on a timeline whose active
+    pool grows large and stays large (many concurrently-active,
+    never-suspended signals across many selectors, mirroring the real-
+    MNQ persist-until-invalidated shape that made ``iter_active_signal_
+    snapshots``-based profiling the actual bottleneck), the scalar
+    stream is dramatically faster than rebuilding a full
+    ``active_by_selector`` snapshot at every signal -- with a generous
+    margin so this stays robust to normal machine-load variance."""
+
+    def test_scalar_fields_are_plain_integers_never_lists_or_dicts(self):
+        signal = fvg_candidate(zone_id="A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        timeline = build_entry_signal_timeline(fvg_result(signal), EMPTY_LIQUIDITY)
+        snapshot = next(iter(iter_active_pool_scalar_snapshots(timeline)))
+        self.assertIsInstance(snapshot.active_selector_count_including_primary, int)
+        self.assertIsInstance(snapshot.required_confluence_selector_count_excluding_primary, int)
+        self.assertIsInstance(snapshot.active_signal_instance_count, int)
+
+    def test_scalar_stream_is_substantially_faster_on_a_large_persistent_active_pool(self):
+        import time as _time
+
+        rng = random.Random(9988)
+        base_dt = ny_dt(2026, 1, 5, 9, 0)
+        # 300 distinct never-suspended, never-invalidated selectors, each
+        # contributing one signal every few minutes across a wide window --
+        # the active pool only ever grows, exactly the shape that made
+        # iter_active_signal_snapshots-based profiling O(N x pool size).
+        candidates = []
+        for i in range(300):
+            zone_id = f"perf-{i}"
+            timeframe = rng.choice(FVG_TIMEFRAME_POOL)
+            direction = LONG
+            for occurrence in range(4):
+                known_at = _avoid_maintenance_break(base_dt + timedelta(minutes=i + occurrence * 350))
+                candidates.append(
+                    fvg_candidate(
+                        zone_id=f"{zone_id}-{occurrence}", timeframe=timeframe, direction=direction, known_at=known_at
+                    )
+                )
+        timeline = build_entry_signal_timeline(fvg_result(*candidates), EMPTY_LIQUIDITY)
+
+        start = _time.perf_counter()
+        list(iter_active_pool_scalar_snapshots(timeline))
+        scalar_duration = _time.perf_counter() - start
+
+        start = _time.perf_counter()
+        list(iter_active_signal_snapshots(timeline))
+        full_duration = _time.perf_counter() - start
+
+        self.assertLess(
+            scalar_duration,
+            full_duration * 0.5,
+            f"scalar stream ({scalar_duration:.4f}s) should be substantially faster than the full "
+            f"snapshot stream ({full_duration:.4f}s) on a large, persistently-growing active pool",
+        )
 
 
 if __name__ == "__main__":

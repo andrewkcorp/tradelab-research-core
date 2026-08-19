@@ -785,3 +785,178 @@ def iter_fvg_lifecycle_transitions(timeline: EntrySignalTimeline) -> Iterator[Si
         )
         yield from batch_suspensions
         yield from batch_restorations
+
+
+class _ActivePoolRefCounter:
+    """Per-direction selector ref-counts and total instance counts for
+    the currently-active pool -- the only state ``iter_active_pool_
+    scalar_snapshots`` needs. Never stores an ``EntrySignal`` itself,
+    only integers, so memory stays ``O(number of currently active
+    unique selectors)`` rather than growing with the number of
+    snapshots taken."""
+
+    __slots__ = ("_selector_counts", "_instance_counts")
+
+    def __init__(self) -> None:
+        self._selector_counts: dict[str, dict[str, int]] = {}
+        self._instance_counts: dict[str, int] = {}
+
+    def increment(self, direction: str, selector: str) -> None:
+        sel_map = self._selector_counts.setdefault(direction, {})
+        sel_map[selector] = sel_map.get(selector, 0) + 1
+        self._instance_counts[direction] = self._instance_counts.get(direction, 0) + 1
+
+    def decrement(self, direction: str, selector: str) -> None:
+        sel_map = self._selector_counts[direction]
+        remaining = sel_map[selector] - 1
+        if remaining <= 0:
+            del sel_map[selector]
+        else:
+            sel_map[selector] = remaining
+        self._instance_counts[direction] -= 1
+
+    def unique_selector_count(self, direction: str) -> int:
+        return len(self._selector_counts.get(direction, {}))
+
+    def instance_count(self, direction: str) -> int:
+        return self._instance_counts.get(direction, 0)
+
+
+class _RefCountingDict(dict):
+    """A drop-in replacement for the plain ``{}`` used at every level of
+    ``liquidity_active``/``fvg_active`` in ``_apply_liquidity_batch``/
+    ``_apply_fvg_batch``/``_resolve_zone`` -- **reuses those functions
+    completely unmodified**, so the active/suspended/restored/retired
+    transition semantics can never drift from theirs (no rule is
+    reimplemented here). It only adds a side effect on the dict
+    mutation protocol those functions already use throughout
+    (``__setitem__``, ``__delitem__``, ``pop``, ``setdefault``):
+    whenever a *leaf* value (an ``EntrySignal``, never another dict) is
+    inserted or removed, the shared ``_ActivePoolRefCounter`` is
+    incremented/decremented for that signal's own ``(direction,
+    selector)`` -- an O(1) update per transition, never a full rescan
+    of the active pool. ``setdefault(key, {})`` (used throughout those
+    functions purely to create an intermediate nesting level on first
+    use, e.g. ``active.setdefault(timeframe, {})``) transparently
+    substitutes another ``_RefCountingDict`` sharing the same counter
+    for the literal ``{}``, so nesting stays uniform to any depth
+    (liquidity is 2 levels deep, FVG is 3) without either caller
+    needing to know about this class at all."""
+
+    __slots__ = ("_counter",)
+
+    def __init__(self, counter: "_ActivePoolRefCounter") -> None:
+        super().__init__()
+        self._counter = counter
+
+    def setdefault(self, key, default):
+        if key in self:
+            return self[key]
+        if isinstance(default, dict):
+            default = _RefCountingDict(self._counter)
+        dict.__setitem__(self, key, default)
+        return default
+
+    def __setitem__(self, key, value) -> None:
+        is_new = key not in self
+        dict.__setitem__(self, key, value)
+        if is_new and not isinstance(value, dict):
+            self._counter.increment(value.direction, value.selector)
+
+    def __delitem__(self, key) -> None:
+        value = self[key]
+        dict.__delitem__(self, key)
+        if not isinstance(value, dict):
+            self._counter.decrement(value.direction, value.selector)
+
+    def pop(self, key, *default):
+        if key not in self:
+            if default:
+                return default[0]
+            raise KeyError(key)
+        value = self[key]
+        dict.__delitem__(self, key)
+        if not isinstance(value, dict):
+            self._counter.decrement(value.direction, value.selector)
+        return value
+
+
+@dataclass(frozen=True)
+class ActivePoolScalarSnapshot:
+    """One real ``EntrySignal``'s own ``known_at`` instant, paired with
+    **only** the O(1) scalar active-pool-size counts in that signal's
+    own direction -- never a materialized list or dict of active
+    ``EntrySignal`` instances (see ``SignalSnapshot``/``iter_active_
+    signal_snapshots`` for that). Built for ``tradelab.profile_research_
+    context``'s ``active_pool_stats``: a real-MNQ run of that section
+    via ``iter_active_signal_snapshots`` (rebuilding a full ``active_by_
+    selector`` dict at every one of ~1.2M real signals) was the actual
+    bottleneck -- >2GB RAM, over an hour. This carries only integers.
+
+    ``active_selector_count_including_primary`` and ``active_signal_
+    instance_count`` are both counted only over ``direction``'s own
+    active pool, exactly like ``SignalSnapshot.active_by_selector``
+    already restricts itself to. ``required_confluence_selector_count_
+    excluding_primary`` is ``active_selector_count_including_primary``
+    minus the primary signal's own selector -- guaranteed present (see
+    ``iter_active_pool_scalar_snapshots``), so always exactly one less.
+    """
+
+    signal: EntrySignal
+    active_selector_count_including_primary: int
+    required_confluence_selector_count_excluding_primary: int
+    active_signal_instance_count: int
+
+
+def iter_active_pool_scalar_snapshots(timeline: EntrySignalTimeline) -> Iterator[ActivePoolScalarSnapshot]:
+    """Yield one ``ActivePoolScalarSnapshot`` per real signal in
+    ``timeline.signals``, in the timeline's own chronological order --
+    the exact same transition sweep ``iter_active_signal_snapshots``
+    already performs (same ``_merge_known_at_groups`` batching, the
+    exact same, unmodified ``_apply_liquidity_batch``/``_apply_fvg_
+    batch`` calls -- lifecycle semantics are reused, never reimplemented
+    or approximated), except ``liquidity_active``/``fvg_active`` are
+    ``_RefCountingDict`` instances instead of plain ``dict``s, so no
+    per-snapshot ``active_by_selector`` is ever built: every snapshot's
+    counts are read back from the shared ``_ActivePoolRefCounter`` in
+    O(1). Time stays ``O(N log N)`` total (identical to ``iter_active_
+    signal_snapshots``); memory stays ``O(number of currently active
+    unique selectors/signals)``, never ``O(number of snapshots x active
+    pool size)``.
+
+    Proven exactly equivalent to ``iter_active_signal_snapshots`` (same
+    per-signal ``direction``-scoped active-selector/instance counts) on
+    randomized fixtures exercising liquidity invalidation, FVG
+    suspension/restoration/mitigation-resolution, and nested FVG
+    conflicts together -- see ``tests/test_tradelab_entry_signal_
+    timeline.py``'s ``ActivePoolScalarSnapshotEquivalenceTests``. Never
+    changes ``iter_active_signal_snapshots`` itself, which remains the
+    audit/debug API for inspecting the actual active ``EntrySignal``
+    instances at any given real signal's own instant.
+    """
+    counter = _ActivePoolRefCounter()
+    liquidity_active: dict[str, dict[str, EntrySignal]] = _RefCountingDict(counter)
+    fvg_active: dict[str, dict[str, dict[str, EntrySignal]]] = _RefCountingDict(counter)
+    fvg_suspended: dict[str, EntrySignal] = {}
+    fvg_suspended_by: dict[str, SignalSuspension] = {}
+    fvg_pending_resolution: dict[str, list[str]] = {}
+    fvg_touch_by_zone: dict[str, tuple[str, str]] = {}
+
+    for real_signal_batch, mitigation_batch in _merge_known_at_groups(timeline.signals, timeline.zone_mitigations):
+        liquidity_batch = [s for s in real_signal_batch if s.source_kind == SourceKind.LIQUIDITY]
+        fvg_batch = [s for s in real_signal_batch if s.source_kind == SourceKind.FVG]
+
+        if liquidity_batch:
+            _apply_liquidity_batch(liquidity_batch, liquidity_active)
+        if fvg_batch or mitigation_batch:
+            _apply_fvg_batch(fvg_batch, mitigation_batch, fvg_active, fvg_suspended, fvg_suspended_by, fvg_pending_resolution, fvg_touch_by_zone)
+
+        for signal in real_signal_batch:
+            active_selector_count = counter.unique_selector_count(signal.direction)
+            instance_count = counter.instance_count(signal.direction)
+            yield ActivePoolScalarSnapshot(
+                signal=signal,
+                active_selector_count_including_primary=active_selector_count,
+                required_confluence_selector_count_excluding_primary=active_selector_count - 1,
+                active_signal_instance_count=instance_count,
+            )

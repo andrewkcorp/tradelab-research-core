@@ -101,10 +101,11 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 from tradelab.aggregate import aggregate_bars
 from tradelab.backtest import PreparedBacktestContext, prepare_backtest_context
@@ -114,7 +115,7 @@ from tradelab.entry_signal_timeline import (
     EntrySignal,
     EntrySignalTimeline,
     SignalSuspension,
-    iter_active_signal_snapshots,
+    iter_active_pool_scalar_snapshots,
     iter_fvg_lifecycle_transitions,
 )
 from tradelab.fvg import BEARISH, BULLISH, FVGDetectionResult, FVGMitigationEvent
@@ -199,6 +200,7 @@ def profile_research_context(
     *,
     previous_profile_json_path: Path | str | None = None,
     command: str | None = None,
+    phase_callback: Callable[[str, float], None] | None = None,
 ) -> ContextProfileResult:
     """Load and audit ``market_artifact_path``, load and validate
     ``news_csv_path``, call ``prepare_backtest_context`` with this
@@ -219,12 +221,31 @@ def profile_research_context(
     function directly (e.g. from a test, or another script) never
     silently records that *caller's own* argv as if it were this
     profile's invocation.
+
+    ``phase_callback``, if given, is called with ``(phase_name,
+    duration_seconds)`` as each of the five phases below completes --
+    ``"preparation"``, ``"lifecycle_profiling"``, ``"pool_statistics"``,
+    ``"serialization"``, ``"total"`` (in that order). Purely a side-
+    effecting hook for CLI progress visibility on a long real run
+    (``main()`` uses it to print); it never affects the return value or
+    ``output_json_path``'s own content -- wall-clock durations are
+    exactly the kind of non-deterministic value that must never enter
+    the deterministic profile JSON (see the module's own byte-identical-
+    across-runs guarantee), so they are reported only through this
+    callback, never written anywhere.
     """
     market_artifact_path = Path(market_artifact_path)
     news_csv_path = Path(news_csv_path)
     output_json_path = Path(output_json_path)
     previous_profile_json_path = Path(previous_profile_json_path) if previous_profile_json_path is not None else None
 
+    def _report(phase: str, phase_start: float) -> None:
+        if phase_callback is not None:
+            phase_callback(phase, time.perf_counter() - phase_start)
+
+    total_start = time.perf_counter()
+
+    preparation_start = time.perf_counter()
     artifact = load_market_data_artifact(market_artifact_path)
     series_result = load_market_data_series(artifact, base_dir=market_artifact_path.parent)
     bars = list(series_result.bars)
@@ -235,9 +256,17 @@ def profile_research_context(
     context = prepare_backtest_context(
         bars, news_events, tick_size=TICK_SIZE_MNQ, pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS
     )
+    _report("preparation", preparation_start)
 
+    lifecycle_start = time.perf_counter()
     timeline_stats = _entry_signal_timeline_stats(context.timeline)
+    _report("lifecycle_profiling", lifecycle_start)
+
+    pool_stats_start = time.perf_counter()
     active_pool_stats = _active_pool_stats(context.timeline)
+    _report("pool_statistics", pool_stats_start)
+
+    serialization_start = time.perf_counter()
     entry_signals_by_selector_direction = _selector_direction_counts(context.timeline)
 
     previous_profile = None
@@ -260,6 +289,8 @@ def profile_research_context(
         command=command,
     )
     _write_atomic_json(output_json_path, profile)
+    _report("serialization", serialization_start)
+    _report("total", total_start)
 
     return ContextProfileResult(
         output_json=output_json_path,
@@ -687,20 +718,21 @@ def _entry_signal_timeline_stats(timeline: EntrySignalTimeline) -> dict:
 
 _ACTIVE_POOL_STATS_NOTE = (
     "Current-model-only (persist-until-invalidated), derived solely from "
-    "tradelab.entry_signal_timeline.iter_active_signal_snapshots -- never "
-    "the obsolete end-of-NY-day model, and never compared against it (see "
-    "comparison.active_pool_comparison_possible, always false). One row "
-    "per real primary EntrySignal's own snapshot; three metrics per row: "
-    "active_selector_count_including_primary (every unique selector "
-    "active in that signal's own direction at that instant, including "
-    "the primary's own selector), required_confluence_selector_count_"
-    "excluding_primary (the same set with the primary's own selector "
-    "removed -- exactly frozenset(active_by_selector.keys()) - {primary}, "
-    "the identical selector-level interpretation tradelab.observed_"
-    "strategy_universe.discover_observed_universe already consumes for "
-    "its own confluence pool), and active_signal_instance_count (the raw "
-    "count of individual EntrySignal instances active, summed across "
-    "every selector -- NOT deduplicated by selector). "
+    "tradelab.entry_signal_timeline.iter_active_pool_scalar_snapshots -- "
+    "never the obsolete end-of-NY-day model, and never compared against "
+    "it (see comparison.active_pool_comparison_possible, always false). "
+    "One row per real primary EntrySignal's own snapshot; three metrics "
+    "per row: active_selector_count_including_primary (every unique "
+    "selector active in that signal's own direction at that instant, "
+    "including the primary's own selector), required_confluence_"
+    "selector_count_excluding_primary (the same set with the primary's "
+    "own selector removed -- exactly active_selector_count_including_"
+    "primary minus one, the identical selector-level interpretation "
+    "tradelab.observed_strategy_universe.discover_observed_universe "
+    "already consumes for its own confluence pool: frozenset(active_by_"
+    "selector.keys()) - {primary}), and active_signal_instance_count "
+    "(the raw count of individual EntrySignal instances active, summed "
+    "across every selector -- NOT deduplicated by selector). "
     "active_signal_instance_count can meaningfully exceed the selector "
     "counts (a selector can have more than one concurrently active "
     "variant/timeframe instance); it is reported purely as a separate "
@@ -713,7 +745,13 @@ _ACTIVE_POOL_STATS_NOTE = (
     "is infeasible at real-MNQ pool sizes and why frequent-itemset "
     "mining is used instead). This section never enumerates subsets and "
     "never runs mining or a backtest -- it only summarizes the sizes of "
-    "the real active pools the current model actually produced."
+    "the real active pools the current model actually produced. Computed "
+    "via an incremental, ref-counted scalar stream (never a per-snapshot "
+    "materialized active-signal list) so memory stays O(number of "
+    "currently active unique selectors/signals), not O(number of "
+    "snapshots x active pool size) -- see iter_active_pool_scalar_"
+    "snapshots's own docstring for why that distinction matters at real-"
+    "MNQ scale (~1.2M snapshots)."
 )
 
 
@@ -721,23 +759,26 @@ def _active_pool_stats(timeline: EntrySignalTimeline) -> dict:
     """Deterministic active-confluence-pool size statistics at every
     real primary ``EntrySignal``'s own ``known_at`` -- global, by
     direction, and by (primary selector, direction). One linear forward
-    sweep over ``iter_active_signal_snapshots`` (``O(N log N)``, never
-    re-implements suspend/restore/invalidate). See
-    ``_ACTIVE_POOL_STATS_NOTE`` for exactly what each metric measures
-    and why selector count, not signal-instance count, is what matters
-    for confluence-combination tractability."""
+    sweep over ``iter_active_pool_scalar_snapshots`` (``O(N log N)``,
+    never re-implements suspend/restore/invalidate -- that incremental
+    stream itself reuses ``_apply_liquidity_batch``/``_apply_fvg_batch``
+    unmodified via a ref-counting dict wrapper, so this function never
+    touches an ``EntrySignal`` list, only the three integer counts each
+    snapshot already carries). See ``_ACTIVE_POOL_STATS_NOTE`` for
+    exactly what each metric measures and why selector count, not
+    signal-instance count, is what matters for confluence-combination
+    tractability."""
     global_active: list[int] = []
     global_confluence: list[int] = []
     global_instances: list[int] = []
     by_direction: dict[str, tuple[list[int], list[int], list[int]]] = {}
     by_selector_direction: dict[tuple[str, str], tuple[list[int], list[int], list[int]]] = {}
 
-    for snapshot in iter_active_signal_snapshots(timeline):
+    for snapshot in iter_active_pool_scalar_snapshots(timeline):
         signal = snapshot.signal
-        active_by_selector = snapshot.active_by_selector
-        active_selector_count = len(active_by_selector)
-        required_confluence_count = len(frozenset(active_by_selector.keys()) - {signal.selector})
-        instance_count = sum(len(signals) for signals in active_by_selector.values())
+        active_selector_count = snapshot.active_selector_count_including_primary
+        required_confluence_count = snapshot.required_confluence_selector_count_excluding_primary
+        instance_count = snapshot.active_signal_instance_count
 
         global_active.append(active_selector_count)
         global_confluence.append(required_confluence_count)
@@ -938,6 +979,10 @@ def _reconstruct_command(args: argparse.Namespace) -> str:
     return " ".join(parts)
 
 
+def _print_phase_timing(phase: str, duration_seconds: float) -> None:
+    print(f"  phase {phase:<20} {duration_seconds:10.2f}s")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     command = _reconstruct_command(args)
@@ -948,6 +993,7 @@ def main(argv: list[str] | None = None) -> int:
             args.output_json,
             previous_profile_json_path=args.previous_profile_json,
             command=command,
+            phase_callback=_print_phase_timing,
         )
     except (ValueError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)

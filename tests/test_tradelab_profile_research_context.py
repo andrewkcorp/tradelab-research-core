@@ -1022,6 +1022,84 @@ class ProfileSchemaVersionAndProvenanceEndToEndTests(unittest.TestCase):
             self.assertEqual(output_a.read_bytes(), output_b.read_bytes())
 
 
+class PhaseCallbackTests(unittest.TestCase):
+    """``phase_callback`` exposes per-phase wall-clock timing for CLI
+    progress visibility on a long real run -- purely a side-effecting
+    hook. Must never appear in, or affect, the deterministic JSON
+    output, and must never be required (omitting it changes nothing)."""
+
+    def test_callback_receives_all_five_expected_phases_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            manifest_path, news_path = write_valid_fixture(tmp)
+            output_json = tmp / "context_profile.json"
+
+            observed_phases: list[str] = []
+            profile_research_context(manifest_path, news_path, output_json, phase_callback=lambda phase, duration: observed_phases.append(phase))
+
+            self.assertEqual(observed_phases, ["preparation", "lifecycle_profiling", "pool_statistics", "serialization", "total"])
+
+    def test_callback_receives_non_negative_float_durations(self):
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            manifest_path, news_path = write_valid_fixture(tmp)
+            output_json = tmp / "context_profile.json"
+
+            observed_durations: dict[str, float] = {}
+            profile_research_context(
+                manifest_path, news_path, output_json, phase_callback=lambda phase, duration: observed_durations.__setitem__(phase, duration)
+            )
+
+            for phase, duration in observed_durations.items():
+                self.assertIsInstance(duration, float, f"{phase} duration should be a float")
+                self.assertGreaterEqual(duration, 0.0, f"{phase} duration should never be negative")
+            # total must be at least as large as the sum of the four named sub-phases.
+            sub_phase_total = sum(d for p, d in observed_durations.items() if p != "total")
+            self.assertGreaterEqual(observed_durations["total"], sub_phase_total)
+
+    def test_omitting_the_callback_changes_nothing_about_the_written_profile(self):
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            manifest_path, news_path = write_valid_fixture(tmp)
+            output_with_callback = tmp / "with_callback.json"
+            output_without_callback = tmp / "without_callback.json"
+
+            profile_research_context(manifest_path, news_path, output_with_callback, command="fixed", phase_callback=lambda phase, duration: None)
+            profile_research_context(manifest_path, news_path, output_without_callback, command="fixed")
+
+            self.assertEqual(output_with_callback.read_bytes(), output_without_callback.read_bytes())
+
+    def test_no_phase_timing_key_ever_appears_in_the_written_json(self):
+        def _collect_keys(value) -> set:
+            keys: set = set()
+            if isinstance(value, dict):
+                for key, sub_value in value.items():
+                    keys.add(key)
+                    keys |= _collect_keys(sub_value)
+            elif isinstance(value, list):
+                for item in value:
+                    keys |= _collect_keys(item)
+            return keys
+
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            manifest_path, news_path = write_valid_fixture(tmp)
+            output_json = tmp / "context_profile.json"
+
+            profile_research_context(manifest_path, news_path, output_json, phase_callback=lambda phase, duration: None)
+            profile = json.loads(output_json.read_text(encoding="utf-8"))
+            all_keys = _collect_keys(profile)
+
+            # Exact key names, never substring-matched, and excluding phase names that
+            # collide with real, legitimate, unrelated existing keys ("total" is
+            # tradelab.data_wicks's own upper/lower/total breakdown; "preparation" is a
+            # substring of "context_preparation_params") -- those are covered instead by
+            # DeterminismTests/test_two_runs_with_same_command_and_no_previous_profile_stay_
+            # byte_identical, which would fail the instant any wall-clock duration leaked in.
+            for phase_key in ("lifecycle_profiling", "pool_statistics", "serialization", "phase_timings", "phase_timings_seconds"):
+                self.assertNotIn(phase_key, all_keys)
+
+
 class NoRealDataInRepoTests(unittest.TestCase):
     def test_gitignore_covers_generated_profile_and_market_artifact_files(self):
         gitignore = Path(__file__).resolve().parent.parent / ".gitignore"
