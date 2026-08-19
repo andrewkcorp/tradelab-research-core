@@ -994,8 +994,8 @@ class ProfileSchemaVersionAndProvenanceEndToEndTests(unittest.TestCase):
             self.assertIn("active_persistent_context_at_candidate_timestamps", profile["entry_event_model"])
             self.assertIn("no_accumulation_evidence", profile["entry_event_model"])
             self.assertIn("entry_event_count_equals_candidate_snapshot_count", profile["entry_event_model"]["no_accumulation_evidence"])
-            self.assertLessEqual(profile["entry_event_model"]["no_accumulation_evidence"]["max_active_fvg_selectors_observed"], 12)
-            self.assertEqual(profile["entry_event_model"]["no_accumulation_evidence"]["max_possible_fvg_selectors_by_catalog"], 12)
+            self.assertLessEqual(profile["entry_event_model"]["no_accumulation_evidence"]["max_active_fvg_selectors_observed"], 6)
+            self.assertEqual(profile["entry_event_model"]["no_accumulation_evidence"]["max_possible_fvg_selectors_by_catalog"], 6)
             self.assertEqual(profile["provenance"]["command"], "python3 -m tradelab.profile_research_context --test")
             self.assertEqual(profile["provenance"]["market_artifact_sha256"], profile["market_artifact"]["sha256"])
             self.assertEqual(profile["provenance"]["news_csv_sha256"], profile["news"]["sha256"])
@@ -1219,8 +1219,8 @@ class EntryEventModelSectionTests(unittest.TestCase):
         section = _entry_event_model_section({}, fvg_entry_result, liquidity_entry_result, htf_bias_result)
 
         self.assertTrue(section["no_accumulation_evidence"]["entry_event_count_equals_candidate_snapshot_count"])
-        self.assertLessEqual(section["no_accumulation_evidence"]["max_active_fvg_selectors_observed"], 12)
-        self.assertEqual(section["no_accumulation_evidence"]["max_possible_fvg_selectors_by_catalog"], 12)
+        self.assertLessEqual(section["no_accumulation_evidence"]["max_active_fvg_selectors_observed"], 6)
+        self.assertEqual(section["no_accumulation_evidence"]["max_possible_fvg_selectors_by_catalog"], 6)
 
     def test_empty_inputs_report_all_zero_and_still_hold_the_evidence(self):
         fvg_entry_result = FVGEntryCandidateResult(candidates=[])

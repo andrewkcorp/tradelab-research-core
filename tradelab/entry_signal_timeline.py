@@ -1029,6 +1029,22 @@ def iter_active_pool_scalar_snapshots(timeline: EntrySignalTimeline) -> Iterator
 # by this: they are still built only from actual touch/iFVG/liquidity
 # candidates (``build_entry_events``, unchanged) -- formation is never an
 # ``EntryEvent``, only ever a persistent-state fact.
+#
+# **A confirmed iFVG is an atomic EntryEvent, never persistent state.** An
+# earlier version of ``_apply_fvg_zone_batch`` retired an original zone on
+# its own inversion (correct) but then re-inserted that same zone_id into
+# ``zone_active`` under an ``ifvg`` selector, in the inverted direction --
+# making the iFVG itself an indefinitely persistent confluence fact, the
+# exact bug class this whole section exists to eliminate. Fixed: an iFVG is
+# retired exactly like a plain, non-inverting mitigation (the original
+# zone's presence is removed, whatever it had itself suspended is
+# restored) and **nothing takes its place** -- ``EntryEventKind.IFVG``
+# still fires as one atomic ``EntryEvent`` at its own ``known_at``,
+# entirely independent of ``zone_active``. Persistent FVG state
+# (``MarketStateSnapshot.active_fvg_selectors_by_direction``) therefore
+# represents **only structurally active original FVG zones** -- bounded by
+# 6 timeframes x 1 (original-FVG-only) = 6 possible selector strings per
+# direction, not 12.
 # ---------------------------------------------------------------------------
 
 
@@ -1081,22 +1097,28 @@ class MarketStateSnapshot:
     approximation -- see ``docs/market-state-vs-entry-events-v1.md``):
 
     - ``active_fvg_selectors_by_direction``: for each direction, the
-      set of FVG-family selectors (``"fvg-{timeframe}-{fvg_touch|
-      ifvg}"``) with at least one zone that is currently structurally
-      ACTIVE -- not currently suspended by a same-timeframe opposite-
-      direction challenger, and not permanently retired by its own
-      resolution. A zone contributes to its timeframe's ``fvg_touch``
-      selector from its own ``formed_at`` onward -- **whether or not it
-      has ever actually been touched** -- and switches to that
-      timeframe's ``ifvg`` selector only once it has itself inverted;
+      set of **original-FVG** selectors (``"fvg-{timeframe}-fvg_touch"``
+      -- never an ``ifvg`` string, see below) with at least one zone
+      that is currently structurally ACTIVE in its own original
+      direction -- not currently suspended by a same-timeframe
+      opposite-direction challenger, and not permanently retired by its
+      own resolution (inversion or mitigation). A zone contributes to
+      its timeframe's ``fvg_touch`` selector from its own ``formed_at``
+      onward -- **whether or not it has ever actually been touched**;
       the same suspend/restore/retire/mitigation-resolution rules
       ``_apply_fvg_batch`` implements for the older, signal-keyed model
       apply here too, just tracked by zone_id instead of candidate_id
       (see ``_apply_fvg_zone_batch``) so an untouched, unresolved zone
-      is never invisible. At most 6 timeframes x 2 source types = 12
-      possible strings per direction, system-wide, ever -- bounded by
-      the FVG-family selector catalog itself, never by how much history
-      has accumulated.
+      is never invisible. **A confirmed iFVG is never represented
+      here** -- when a zone inverts, it is retired from this set
+      (exactly like a plain, non-inverting mitigation) and nothing
+      takes its place; the inversion itself is reported solely as a
+      one-shot ``EntryEvent`` (``EntryEventKind.IFVG``), never as
+      persistent state (see that type's own docstring). At most 6
+      timeframes x 1 (original-FVG-only) = 6 possible strings per
+      direction, system-wide, ever -- bounded by the FVG-family
+      selector catalog itself, never by how much history has
+      accumulated.
     - ``bias``: the HTF bias snapshot (``tradelab.bias.BiasSnapshot``,
       identical to what ``tradelab.bias.bias_at`` would return at this
       same instant -- proven equivalent by randomized test, computed
@@ -1273,6 +1295,28 @@ def _apply_fvg_zone_batch(
     cross-checks against ``_apply_fvg_batch`` on every zone that *does*
     get touched, proving no semantic drift.
 
+    **A confirmed iFVG is never (re-)inserted into ``zone_active``.**
+    ``FVGEvent``/``EntryEventKind.IFVG`` is a one-shot, atomic
+    ``EntryEvent`` (see this module's own top-of-section docstring) --
+    never a persistent zone state. When an original zone's own iFVG
+    arrives (step 1 below): (1) that zone's own, original-direction
+    presence is permanently retired -- exactly like a plain,
+    non-inverting mitigation, via the same ``_resolve`` call; (2)
+    whatever that zone had itself suspended (as a challenger) is
+    restored, per the existing suspend/restore rules, completely
+    unaffected by this change; (3) ``build_entry_events``/``iter_
+    candidate_entry_snapshots`` still emit exactly one atomic ``IFVG``
+    ``EntryEvent`` for it, at its own ``known_at`` -- entirely
+    independent of ``zone_active``, since ``EntryEvent`` construction
+    never reads persistent state at all; (4) nothing is inserted back
+    into ``zone_active`` in the zone's new, inverted direction --
+    unlike an earlier version of this function, which incorrectly
+    treated the iFVG as a *second*, indefinitely persistent confluence
+    fact in its own right. Persistent FVG state therefore represents
+    **only structurally active original FVG zones** -- an iFVG belongs
+    solely to ``EntryEventKind.IFVG``, never to ``MarketStateSnapshot.
+    active_fvg_selectors_by_direction``.
+
     ``zone_entries`` always holds a zone's current representation
     (timeframe/direction/selector) for every zone currently tracked,
     whether it lives in ``zone_active`` or ``zone_suspended`` --
@@ -1312,13 +1356,19 @@ def _apply_fvg_zone_batch(
                 ] = restored_entry
 
     # 1. Resolve zones whose own confirmed iFVG or mitigation is in this
-    #    batch -- permanently retires that zone's ORIGINAL-direction (or
-    #    already-inverted) presence and restores whatever it had itself
-    #    suspended. A zone's own FULL_MITIGATION_NO_INVERSION touch
-    #    always has a matching FVGMitigationEvent at this exact known_at
-    #    (tradelab.fvg._apply_lifecycle emits one unconditionally on
-    #    every non-inverting resolution, first contact or not), so it is
-    #    already retired here -- no separate handling needed below.
+    #    batch -- permanently retires that zone's (always original-
+    #    direction, since a zone only ever lives in zone_active under
+    #    its original direction -- see step 3's own comment) presence,
+    #    and restores whatever it had itself suspended. A confirmed
+    #    iFVG is resolved via this exact same call and nothing else --
+    #    it never gets inserted anywhere afterward (see this function's
+    #    own docstring: an iFVG is a one-shot EntryEvent, never a new
+    #    persistent state fact). A zone's own FULL_MITIGATION_NO_
+    #    INVERSION touch always has a matching FVGMitigationEvent at
+    #    this exact known_at (tradelab.fvg._apply_lifecycle emits one
+    #    unconditionally on every non-inverting resolution, first
+    #    contact or not), so it is already retired here too -- no
+    #    separate handling needed below.
     for signal in touch_batch:
         candidate: FVGEntryCandidate = signal.source
         if candidate.source_type != FVGSourceType.IFVG:
@@ -1361,9 +1411,13 @@ def _apply_fvg_zone_batch(
         zone_suspended_by[target_zone_id] = challenger_zone_id
         pending_resolution.setdefault(challenger_zone_id, []).append(target_zone_id)
 
-    # 3. New zone formations enter the pool, in their own direction, as
-    #    fvg_touch-kind -- structurally active from this instant on,
-    #    whether or not anything ever touches them.
+    # 3. New zone formations enter the pool, in their own (original)
+    #    direction, as fvg_touch-kind -- structurally active from this
+    #    instant on, whether or not anything ever touches them. This is
+    #    the *only* way anything ever enters zone_active: a confirmed
+    #    iFVG is deliberately never (re-)inserted here (see this
+    #    function's own docstring) -- it is retired in step 1 above,
+    #    exactly like a plain mitigation, and nothing takes its place.
     for zone in formation_batch:
         direction = _FVG_ZONE_DIRECTION[zone.direction]
         entry = _ZoneStateEntry(
@@ -1372,19 +1426,6 @@ def _apply_fvg_zone_batch(
         )
         zone_entries[zone.zone_id] = entry
         zone_active.setdefault(zone.timeframe, {}).setdefault(direction, {})[zone.zone_id] = entry
-
-    # 4. A confirmed iFVG in this batch is itself a new active
-    #    confluence, in the inverted direction, as ifvg-kind.
-    for signal in touch_batch:
-        candidate = signal.source
-        if candidate.source_type != FVGSourceType.IFVG:
-            continue
-        entry = _ZoneStateEntry(
-            zone_id=candidate.zone_id, timeframe=candidate.timeframe, direction=signal.direction,
-            selector=_fvg_zone_selector(candidate.timeframe, FVGSourceType.IFVG.value),
-        )
-        zone_entries[candidate.zone_id] = entry
-        zone_active.setdefault(candidate.timeframe, {}).setdefault(signal.direction, {})[candidate.zone_id] = entry
 
 
 def iter_candidate_entry_snapshots(

@@ -1620,9 +1620,11 @@ class MarketStateVsEntryEventRegressionTests(unittest.TestCase):
         later_state = snapshots[later_long.candidate_id].market_state
         # bullish was suspended by bearish_touch, then restored when bearish_touch's own
         # zone inverted (a partially-touched opposing FVG never permanently cancels the
-        # prior FVG) -- both the restored touch and the new iFVG are active by now.
+        # prior FVG) -- the restored original zone is active again by now. The iFVG
+        # itself is never persistent state (only a one-shot EntryEvent) -- retired
+        # exactly like a plain mitigation, with nothing taking its place.
         self.assertIn("fvg-1m-fvg_touch", later_state.active_fvg_selectors_by_direction[LONG])
-        self.assertIn("fvg-1m-ifvg", later_state.active_fvg_selectors_by_direction[LONG])
+        self.assertNotIn("fvg-1m-ifvg", later_state.active_fvg_selectors_by_direction[LONG])
 
     def test_liquidity_sweep_is_a_one_shot_event(self):
         sweep = liquidity_candidate(known_at=ny_dt(2026, 1, 5, 10, 0))
@@ -1827,7 +1829,9 @@ class UntouchedZoneVisibilityRegressionTests(unittest.TestCase):
         after_state = snapshots[probe_after.candidate_id].market_state
         self.assertNotIn("fvg-1m-fvg_touch", mid_state.active_fvg_selectors_by_direction[LONG])
         self.assertIn("fvg-1m-fvg_touch", after_state.active_fvg_selectors_by_direction[LONG])
-        self.assertIn("fvg-1m-ifvg", after_state.active_fvg_selectors_by_direction[LONG])
+        # the challenger's own iFVG is never persistent state -- it is retired
+        # exactly like a plain mitigation, with nothing taking its place.
+        self.assertNotIn("fvg-1m-ifvg", after_state.active_fvg_selectors_by_direction[LONG])
 
     def test_c_a_later_events_snapshot_never_re_offers_an_earlier_touch_as_its_own_event(self):
         t0 = ny_dt(2026, 1, 5, 10, 0)
@@ -1881,9 +1885,22 @@ class FVGZoneStateEquivalenceTests(unittest.TestCase):
     ``"full_mitigation"`` story kind -- the old model has its own
     independent, pre-existing bug for that exact contact_type (see the
     generator's own docstring) that this amendment correctly does not
-    reproduce, so equality there is neither expected nor desired."""
+    reproduce, so equality there is neither expected nor desired.
+
+    Both selector sets are also filtered to drop any ``-ifvg``-suffixed
+    selector before comparing: the old, signal-keyed model still (by
+    design, unchanged) treats a confirmed iFVG as persistent state,
+    while the new, zone-keyed model deliberately never does (a
+    confirmed iFVG is a one-shot ``EntryEvent``, never persistent
+    state -- see ``_apply_fvg_zone_batch``'s own docstring). That is a
+    legitimate, permanent divergence between the two models, not a bug
+    this equivalence check should be catching."""
 
     _EQUIVALENCE_KINDS = ("partial_only", "partial_then_inverted", "partial_then_mitigated", "immediate_inversion")
+
+    @staticmethod
+    def _without_ifvg_selectors(selectors):
+        return {selector for selector in selectors if not selector.endswith("-ifvg")}
 
     def test_matches_the_older_signal_keyed_active_pool_for_touched_zones(self):
         rng = random.Random(864213)
@@ -1901,8 +1918,8 @@ class FVGZoneStateEquivalenceTests(unittest.TestCase):
         for candidate_id, old_snapshot in old_by_id.items():
             new_snapshot = new_by_id[candidate_id]
             direction = old_snapshot.signal.direction
-            old_selectors = set(old_snapshot.active_by_selector.keys())
-            new_selectors = set(new_snapshot.market_state.active_fvg_selectors_by_direction[direction])
+            old_selectors = self._without_ifvg_selectors(old_snapshot.active_by_selector.keys())
+            new_selectors = self._without_ifvg_selectors(new_snapshot.market_state.active_fvg_selectors_by_direction[direction])
             self.assertEqual(old_selectors, new_selectors, f"mismatch at {candidate_id!r}")
             checked += 1
         self.assertGreater(checked, 0)
@@ -1924,8 +1941,8 @@ class FVGZoneStateEquivalenceTests(unittest.TestCase):
             new_snapshot = new_by_id[candidate_id]
             direction = old_snapshot.signal.direction
             self.assertEqual(
-                set(old_snapshot.active_by_selector.keys()),
-                set(new_snapshot.market_state.active_fvg_selectors_by_direction[direction]),
+                self._without_ifvg_selectors(old_snapshot.active_by_selector.keys()),
+                self._without_ifvg_selectors(new_snapshot.market_state.active_fvg_selectors_by_direction[direction]),
                 f"mismatch at {candidate_id!r}",
             )
             checked += 1

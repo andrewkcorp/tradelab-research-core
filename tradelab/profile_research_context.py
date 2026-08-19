@@ -939,20 +939,24 @@ def _entry_event_model_section(
         "no_accumulation_evidence": {
             "entry_event_count_equals_candidate_snapshot_count": event_count_total == snapshot_count,
             "max_active_fvg_selectors_observed": max_active_fvg_selectors_observed,
-            "max_possible_fvg_selectors_by_catalog": 12,
+            "max_possible_fvg_selectors_by_catalog": 6,
             "note": (
                 "entry_event_count_equals_candidate_snapshot_count "
                 "being true proves every EntryEvent is joined with "
                 "market state exactly once -- never duplicated, never "
                 "re-offered at a later instant, so an event can never "
                 "silently accumulate as if it were a persistent fact. "
-                "max_active_fvg_selectors_observed <= 12 (6 timeframes "
-                "x 2 source types: fvg_touch, ifvg) proves the "
-                "persistent-state pool itself stays bounded by the "
-                "fixed FVG-family selector catalog, never by how much "
-                "history has accumulated -- contrast with the older "
-                "active_pool_stats section's median of 219 selectors "
-                "and up to hundreds of thousands of instances."
+                "max_active_fvg_selectors_observed <= 6 (6 timeframes "
+                "x 1 source type: original-FVG-zone selectors only -- a "
+                "confirmed iFVG is a one-shot EntryEvent, never re-"
+                "inserted into persistent state, see EntryEventKind.IFVG "
+                "and MarketStateSnapshot.active_fvg_selectors_by_direction's "
+                "own docstrings) proves the persistent-state pool itself "
+                "stays bounded by the fixed FVG-family selector catalog, "
+                "never by how much history has accumulated -- contrast "
+                "with the older active_pool_stats section's median of "
+                "219 selectors and up to hundreds of thousands of "
+                "instances."
             ),
         },
     }
