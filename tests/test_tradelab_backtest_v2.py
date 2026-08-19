@@ -56,7 +56,7 @@ from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, SourceType
 from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityLevel, LiquidityStatus, LiquidityType
 from tradelab.market_data_artifact import MarketDataArtifact, SeriesKind
 from tradelab.news import NewsEvent
-from tradelab.research_run import RunReporter, create_run, read_leaderboard, read_live_status, read_progress_events, read_run_manifest
+from tradelab.research_run import ProgressThrottle, RunReporter, create_run, read_leaderboard, read_live_status, read_progress_events, read_run_manifest
 from tradelab.sweep_fvg_setup import SweepFVGSetupEvent
 
 UTC = timezone.utc
@@ -1254,6 +1254,186 @@ class PreflightTests(unittest.TestCase):
 
             # still never wrote a journal or completed the universe.
             self.assertFalse((reporter.run_dir / "backtest_v2_journal.sqlite3").exists())
+
+
+class BarProgressCallbackTests(unittest.TestCase):
+    """task 044: on_bar_progress is purely observational -- it reports
+    monotonically non-decreasing (bars_scanned, bars_total) pairs as the
+    simulation loop advances, and never changes trades, skipped entries,
+    P&L, or any other field of the returned StrategyVariantResult."""
+
+    def _one_real_variant(self):
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=1
+        )
+        self.assertGreater(universe.equivalence_class_count, 0)
+        return context, universe.equivalence_classes[0], ALL_EXIT_VARIANTS[0], DEFAULT_INSTRUMENTS[0]
+
+    def test_callback_reports_monotonically_non_decreasing_progress(self):
+        context, equivalence_class, variant, instrument = self._one_real_variant()
+        calls = []
+        run_strategy_variant_backtest(
+            equivalence_class, variant, instrument, context, on_bar_progress=lambda scanned, total: calls.append((scanned, total))
+        )
+        self.assertGreater(len(calls), 0)
+        self.assertTrue(all(total == len(context.bars_1m) for _scanned, total in calls))
+        scanned_values = [scanned for scanned, _total in calls]
+        self.assertEqual(scanned_values, sorted(scanned_values))
+        self.assertTrue(all(0 < s <= len(context.bars_1m) for s in scanned_values))
+
+    def test_callback_never_changes_the_simulated_result(self):
+        context, equivalence_class, variant, instrument = self._one_real_variant()
+        without_callback = run_strategy_variant_backtest(equivalence_class, variant, instrument, context)
+        calls = []
+        with_callback = run_strategy_variant_backtest(
+            equivalence_class, variant, instrument, context, on_bar_progress=lambda s, t: calls.append((s, t))
+        )
+        self.assertGreater(len(calls), 0)  # confirms the callback path was genuinely exercised
+        self.assertEqual(without_callback.trades, with_callback.trades)
+        self.assertEqual(without_callback.trade_count, with_callback.trade_count)
+        self.assertEqual(without_callback.net_pnl_usd, with_callback.net_pnl_usd)
+        self.assertEqual(without_callback.max_drawdown_usd, with_callback.max_drawdown_usd)
+        self.assertEqual(without_callback.skipped_entries_by_reason, with_callback.skipped_entries_by_reason)
+        self.assertEqual(without_callback.strategy_variant_id, with_callback.strategy_variant_id)
+
+    def test_a_throttled_callback_never_receives_a_call_per_bar(self):
+        # A ProgressThrottle wrapping a spy, exactly as production wires
+        # it -- proves the actual wrapped callback fires far less often
+        # than the number of bars scanned, even though maybe() itself is
+        # invoked once per bar internally.
+        context, equivalence_class, variant, instrument = self._one_real_variant()
+        fired = []
+        throttle = ProgressThrottle(lambda s, t: fired.append((s, t)), check_every=50)
+        run_strategy_variant_backtest(equivalence_class, variant, instrument, context, on_bar_progress=throttle.maybe)
+        self.assertGreaterEqual(len(fired), 1)
+        self.assertLess(len(fired), len(context.bars_1m))
+
+
+class ExpandAndSimulateHeartbeatTests(unittest.TestCase):
+    """task 044: _expand_and_simulate reports a live heartbeat (current
+    strategy_variant_id, 1-based position among total_variant_runs) for
+    every variant -- proven here to advance in order and to never change
+    the completed count or final leaderboard versus an unobserved run."""
+
+    def _universe_and_context(self):
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=1
+        )
+        self.assertGreater(universe.equivalence_class_count, 0)
+        return context, universe
+
+    def _run(self, tmp, run_id, universe, context, *, spy=None):
+        reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={}, run_id=run_id, is_demo=True)
+        journal = _open_journal(
+            reporter, market_artifact_path=None, news_csv_path=None, parameters={}, risk_config=DEFAULT_RISK_CONFIG,
+            equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS, instruments=DEFAULT_INSTRUMENTS,
+        )
+        if spy is not None:
+            with patch.object(RunReporter, "heartbeat", spy):
+                completed, final_leaderboard = _expand_and_simulate(
+                    reporter, journal, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, context, risk_config=DEFAULT_RISK_CONFIG,
+                    equity_config=DEFAULT_EQUITY_CONFIG, top_n_leaderboard=3, checkpoint_every=1000,
+                )
+        else:
+            completed, final_leaderboard = _expand_and_simulate(
+                reporter, journal, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, context, risk_config=DEFAULT_RISK_CONFIG,
+                equity_config=DEFAULT_EQUITY_CONFIG, top_n_leaderboard=3, checkpoint_every=1000,
+            )
+        journal.close()
+        return completed, final_leaderboard
+
+    def test_heartbeat_advances_across_variants_without_changing_the_outcome(self):
+        context, universe = self._universe_and_context()
+        total_expected = universe.equivalence_class_count * len(ALL_EXIT_VARIANTS) * len(DEFAULT_INSTRUMENTS)
+
+        calls = []
+        orig = RunReporter.heartbeat
+
+        def spy(self, **kwargs):
+            calls.append(dict(kwargs))
+            return orig(self, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            completed_observed, leaderboard_observed = self._run(tmp, "observed", universe, context, spy=spy)
+            completed_baseline, leaderboard_baseline = self._run(tmp, "baseline", universe, context)
+
+        self.assertEqual(completed_observed, total_expected)
+        sim_calls = [c for c in calls if c.get("operation") == "simulating_backtests"]
+        self.assertGreater(len(sim_calls), 0)
+        self.assertTrue(all(c.get("variant_id") for c in sim_calls))
+        unit_indices = [c["unit_index"] for c in sim_calls]
+        self.assertEqual(unit_indices, sorted(unit_indices))  # 1-based position never goes backwards
+        self.assertEqual(unit_indices[0], 1)
+
+        # zero semantic change: an unobserved run reaches exactly the
+        # same completed count and the exact same final leaderboard.
+        self.assertEqual(completed_observed, completed_baseline)
+        self.assertEqual([e.to_dict() for e in leaderboard_observed], [e.to_dict() for e in leaderboard_baseline])
+
+
+class PreflightThroughputSampleProgressTests(unittest.TestCase):
+    """task 044: --throughput-sample-size N must visibly advance 0/N ->
+    1/N -> ... -> N/N (never jump straight from 0 to N at the very end),
+    with intra-sample bar progress too -- proven deterministically via a
+    forced (never-throttled) heartbeat per completed sample, since the
+    sample size is always a small, caller-chosen, explicitly bounded
+    budget (never the full universe)."""
+
+    def test_sample_progress_advances_one_at_a_time_with_forced_flushes(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
+            runs_dir = tmp / "runs"
+
+            calls = []
+            orig = RunReporter.heartbeat
+
+            def spy(self, **kwargs):
+                calls.append(dict(kwargs))
+                return orig(self, **kwargs)
+
+            with patch.object(RunReporter, "heartbeat", spy):
+                reporter = run_preflight_v2(
+                    market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                    pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                    throughput_sample_size=5, command="test",
+                )
+
+            preflight = read_preflight(reporter.run_dir)
+            self.assertEqual(preflight["throughput_estimate"]["sample_size_measured"], 5)
+
+            sample_calls = [c for c in calls if c.get("operation") == "sampling_throughput"]
+            self.assertGreater(len(sample_calls), 0)
+
+            # the forced, per-sample-completion calls (bars_scanned ==
+            # bars_total) are the ones that must show unit_index advancing
+            # 1, 2, 3, 4, 5 in order -- unconditionally, never throttled.
+            forced_completions = [c["unit_index"] for c in sample_calls if c.get("bars_scanned") == c.get("bars_total") and c.get("force")]
+            self.assertEqual(forced_completions, [1, 2, 3, 4, 5])
+
+            # every sample carried a real strategy_variant_id and the
+            # correct, fixed unit_total throughout.
+            self.assertTrue(all(c.get("variant_id") for c in sample_calls))
+            self.assertTrue(all(c.get("unit_total") == 5 for c in sample_calls))
+
+    def test_throughput_sample_reporter_none_path_is_unaffected(self):
+        # reporter=None (no telemetry wired) must still work identically
+        # -- _measure_sample_throughput is called this way nowhere in
+        # production, but the parameter is optional and must degrade
+        # cleanly, never crash, when omitted.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
+            runs_dir = tmp / "runs"
+            reporter = run_preflight_v2(
+                market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                throughput_sample_size=3, command="test",
+            )
+            preflight = read_preflight(reporter.run_dir)
+            self.assertEqual(preflight["throughput_estimate"]["sample_size_measured"], 3)
 
 
 if __name__ == "__main__":

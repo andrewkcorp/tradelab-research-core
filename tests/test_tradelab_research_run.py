@@ -12,11 +12,15 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tradelab.research_run import (
     RUN_ARTIFACT_SCHEMA_VERSION,
+    ActiveWork,
     CheckpointRecord,
     LeaderboardEntry,
+    LiveStatus,
+    ProgressThrottle,
     RunManifest,
     RunPhase,
     atomic_write_json,
@@ -337,6 +341,198 @@ class ListRunIdsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "not-a-run").mkdir()
             self.assertEqual(list_run_ids(tmp), [])
+
+
+class ProgressThrottleTests(unittest.TestCase):
+    """task 044: ProgressThrottle.maybe -- fires immediately on the very
+    first call, throttles to at most once per min_interval_seconds
+    thereafter (monotonic-clock based), and evaluates the clock itself
+    only once every check_every calls -- never on every single call, so
+    it is safe to call from inside a tight per-bar loop."""
+
+    def test_first_call_always_fires(self):
+        calls = []
+        throttle = ProgressThrottle(lambda *a: calls.append(a), check_every=1000)
+        self.assertTrue(throttle.maybe(1, 2))
+        self.assertEqual(calls, [(1, 2)])
+
+    def test_none_callback_never_fires(self):
+        throttle = ProgressThrottle(None)
+        self.assertFalse(throttle.maybe(1))
+        self.assertFalse(throttle.force(1))
+
+    def test_throttles_within_min_interval_then_fires_after(self):
+        with patch("tradelab.research_run.time.monotonic", side_effect=[100.0, 100.5, 101.5]):
+            calls = []
+            throttle = ProgressThrottle(lambda v: calls.append(v), min_interval_seconds=1.0, check_every=1)
+            self.assertTrue(throttle.maybe("a"))  # t=100.0 -- first call, always fires
+            self.assertFalse(throttle.maybe("b"))  # t=100.5 -- only 0.5s since last fire, throttled
+            self.assertTrue(throttle.maybe("c"))  # t=101.5 -- 1.5s since last fire, fires
+            self.assertEqual(calls, ["a", "c"])
+
+    def test_check_every_stride_avoids_a_clock_check_on_every_call(self):
+        with patch("tradelab.research_run.time.monotonic", return_value=100.0) as mock_monotonic:
+            throttle = ProgressThrottle(lambda *a: None, min_interval_seconds=1.0, check_every=1000)
+            for i in range(2500):
+                throttle.maybe(i)
+            # ~2500/1000 checks, never anywhere near 2500 -- the stride is
+            # doing real work, not just a no-op wrapper around the clock.
+            self.assertLessEqual(mock_monotonic.call_count, 5)
+
+    def test_force_bypasses_both_stride_and_interval(self):
+        calls = []
+        throttle = ProgressThrottle(lambda v: calls.append(v), min_interval_seconds=1000.0, check_every=1000000)
+        self.assertTrue(throttle.maybe("a"))
+        self.assertFalse(throttle.maybe("b"))  # would be throttled for a very long time
+        self.assertTrue(throttle.force("c"))
+        self.assertEqual(calls, ["a", "c"])
+
+    def test_rejects_invalid_construction(self):
+        with self.assertRaises(ValueError):
+            ProgressThrottle(None, check_every=0)
+        with self.assertRaises(ValueError):
+            ProgressThrottle(None, min_interval_seconds=-1)
+
+
+class HeartbeatTests(unittest.TestCase):
+    """task 044: RunReporter.heartbeat -- throttled to at most once per
+    second, never appends a progress_events.jsonl entry (so a long-running
+    loop calling it far more often never grows the durable event log
+    without bound), populates ActiveWork in live_status.json, and is
+    cleared by the next phase_started()."""
+
+    def test_throttled_to_at_most_once_per_second(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=10)
+            with patch("tradelab.research_run.time.monotonic", side_effect=[100.0, 100.5, 101.5]):
+                self.assertTrue(reporter.heartbeat(operation="sim", unit_index=1, unit_total=10))
+                self.assertFalse(reporter.heartbeat(operation="sim", unit_index=2, unit_total=10))
+                self.assertTrue(reporter.heartbeat(operation="sim", unit_index=3, unit_total=10))
+            status = read_live_status(reporter.run_dir)
+            # the throttled-away call (unit_index=2) never landed -- the
+            # last flush reflects the most recent call that actually fired.
+            self.assertEqual(status.active_work["unit_index"], 3)
+
+    def test_force_bypasses_the_throttle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=10)
+            self.assertTrue(reporter.heartbeat(operation="sim", unit_index=1, unit_total=10))
+            self.assertTrue(reporter.heartbeat(operation="sim", unit_index=2, unit_total=10, force=True))
+            status = read_live_status(reporter.run_dir)
+            self.assertEqual(status.active_work["unit_index"], 2)
+
+    def test_never_appends_a_progress_event_even_across_a_long_simulated_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=1_000_000)
+            events_before = read_progress_events(reporter.run_dir)
+
+            # A long simulated loop: 10,000 heartbeats, clock advancing
+            # 0.01s per call (~100s of simulated wall time) -- proves both
+            # "status updates during a long simulated loop" (throughput
+            # samples below) and "no unbounded progress-event growth" at
+            # once, deterministically (no real sleeping).
+            clock = [100.0]
+
+            def fake_monotonic():
+                clock[0] += 0.01
+                return clock[0]
+
+            flushed_count = 0
+            with patch("tradelab.research_run.time.monotonic", side_effect=fake_monotonic):
+                for i in range(10_000):
+                    if reporter.heartbeat(operation="scanning_bars", unit_index=1, unit_total=1, bars_scanned=i, bars_total=10_000):
+                        flushed_count += 1
+
+            events_after = read_progress_events(reporter.run_dir)
+            self.assertEqual(events_after, events_before)  # not one single new durable event
+
+            # ~100s of simulated time at a 1s throttle -> roughly 100
+            # actual flushes -- nowhere close to the 10,000 calls made.
+            self.assertGreater(flushed_count, 50)
+            self.assertLess(flushed_count, 150)
+
+            # the final flushed state is genuinely visible -- proves this
+            # was a real, working status update stream, not a no-op.
+            status = read_live_status(reporter.run_dir)
+            self.assertIsNotNone(status.active_work)
+            self.assertEqual(status.active_work["operation"], "scanning_bars")
+
+    def test_active_work_fields_round_trip_through_live_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=200)
+            reporter.heartbeat(
+                operation="simulating_backtests", variant_id="CLASS_A::variant_x::MNQ", unit_index=42, unit_total=200,
+                bars_scanned=734211, bars_total=1057182,
+            )
+            status = read_live_status(reporter.run_dir)
+            self.assertEqual(status.active_work, {
+                "operation": "simulating_backtests", "variant_id": "CLASS_A::variant_x::MNQ", "unit_index": 42,
+                "unit_total": 200, "bars_scanned": 734211, "bars_total": 1057182,
+                "updated_at": status.active_work["updated_at"],
+            })
+
+    def test_phase_started_clears_stale_active_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=10)
+            reporter.heartbeat(operation="sim", unit_index=1, unit_total=10)
+            self.assertIsNotNone(read_live_status(reporter.run_dir).active_work)
+            reporter.phase_started(RunPhase.RANKING_RESULTS, items_total=1)
+            self.assertIsNone(read_live_status(reporter.run_dir).active_work)
+
+    def test_empty_operation_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=10)
+            with self.assertRaises(ValueError):
+                reporter.heartbeat(operation="")
+
+
+class LiveStatusBackwardCompatibilityTests(unittest.TestCase):
+    """task 044: active_work must be a purely additive field -- an older
+    run's live_status.json, written before this field existed at all,
+    must still parse cleanly (active_work defaults to None), and the
+    dashboard-facing to_dict()/from_dict() round trip must be lossless
+    for both old (missing-key) and new (present) payloads."""
+
+    def test_from_dict_without_active_work_key_defaults_to_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.PREPARING_DATA, items_total=1)
+            reporter.progress(items_completed=1)
+            with open(reporter.run_dir / "live_status.json", encoding="utf-8") as f:
+                raw = json.load(f)
+            self.assertIn("active_work", raw)  # this module's own writer always includes it
+            del raw["active_work"]  # simulate a genuinely pre-task-044 run folder
+            status = LiveStatus.from_dict(raw)
+            self.assertIsNone(status.active_work)
+
+    def test_to_dict_always_includes_active_work_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.PREPARING_DATA, items_total=1)
+            status = read_live_status(reporter.run_dir)
+            self.assertIn("active_work", status.to_dict())
+            self.assertIsNone(status.to_dict()["active_work"])
+
+    def test_active_work_dataclass_round_trips(self):
+        work = ActiveWork(
+            operation="simulating_backtests", variant_id="v1", unit_index=3, unit_total=10, bars_scanned=500, bars_total=1000,
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+        self.assertEqual(ActiveWork.from_dict(work.to_dict()), work)
+
+    def test_active_work_rejects_empty_operation(self):
+        with self.assertRaises(ValueError):
+            ActiveWork(operation="", variant_id=None, unit_index=None, unit_total=None, bars_scanned=None, bars_total=None, updated_at="2026-01-01T00:00:00+00:00")
+
+    def test_active_work_rejects_negative_counters(self):
+        with self.assertRaises(ValueError):
+            ActiveWork(operation="x", variant_id=None, unit_index=-1, unit_total=None, bars_scanned=None, bars_total=None, updated_at="2026-01-01T00:00:00+00:00")
 
 
 if __name__ == "__main__":

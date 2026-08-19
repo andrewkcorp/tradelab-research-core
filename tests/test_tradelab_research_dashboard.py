@@ -181,5 +181,49 @@ class ArtifactParsingTests(_ServerTestCase):
         self.assertIsInstance(data["events"], list)  # create_run() itself never appends an event, only phase_started()/progress()/etc. do
 
 
+class LiveActivityBackwardCompatibilityTests(_ServerTestCase):
+    """task 044: the /status endpoint must serve active_work correctly
+    for a new-schema run, and must not error on an older run folder's
+    live_status.json that never had the field at all -- the server-side
+    read path (tradelab.research_run.read_live_status) must upgrade it
+    to active_work: null transparently."""
+
+    def test_status_endpoint_reflects_a_live_heartbeat(self):
+        reporter = create_run(runs_dir=self.runs_dir, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="run-i")
+        reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=200)
+        reporter.heartbeat(
+            operation="simulating_backtests", variant_id="CLASS_A::v1::MNQ", unit_index=42, unit_total=200,
+            bars_scanned=734211, bars_total=1057182,
+        )
+        status, body = self._get("/api/runs/run-i/status")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["active_work"]["operation"], "simulating_backtests")
+        self.assertEqual(data["active_work"]["variant_id"], "CLASS_A::v1::MNQ")
+        self.assertEqual(data["active_work"]["unit_index"], 42)
+        self.assertEqual(data["active_work"]["bars_scanned"], 734211)
+
+    def test_status_endpoint_serves_an_old_schema_run_folder_without_error(self):
+        import os
+
+        reporter = create_run(runs_dir=self.runs_dir, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="run-old")
+        reporter.phase_started(RunPhase.PREPARING_DATA, items_total=1)
+        reporter.progress(items_completed=1)
+
+        # simulate a genuinely pre-task-044 run folder: rewrite live_status.json without the active_work key at all.
+        status_path = os.path.join(self.runs_dir, "run-old", "live_status.json")
+        with open(status_path, encoding="utf-8") as f:
+            raw = json.load(f)
+        del raw["active_work"]
+        with open(status_path, "w", encoding="utf-8") as f:
+            json.dump(raw, f)
+
+        status, body = self._get("/api/runs/run-old/status")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertIsNone(data["active_work"])
+        self.assertEqual(data["phase"], "preparing_data")  # every other field is still served correctly
+
+
 if __name__ == "__main__":
     unittest.main()

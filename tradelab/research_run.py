@@ -75,12 +75,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 RUN_ARTIFACT_SCHEMA_VERSION = "1.0"
 _UTC = timezone.utc
 _MIN_ETA_SAMPLES = 3
 _MAX_PROGRESS_SAMPLES = 50  # bounded ring buffer -- never grows with run length
+_HEARTBEAT_MIN_INTERVAL_SECONDS = 1.0  # task 044: at most one live-status write per second from heartbeat()
 
 
 class RunPhase(str, Enum):
@@ -149,6 +150,59 @@ def _sample_resource_usage() -> tuple[int | None, float | None]:
         return None, None
 
 
+class ProgressThrottle:
+    """Wraps a callback so it fires at most once per ``min_interval_
+    seconds`` (a monotonic-clock check), *and* so that clock check itself
+    is only evaluated once every ``check_every`` calls to :meth:`maybe` --
+    never on every single call. This is what makes it safe to call
+    ``maybe(...)`` from inside a tight, per-bar simulation loop that may
+    run millions of times: the overwhelming majority of calls do nothing
+    more than increment one integer counter and compare it, never touch
+    the clock or invoke the wrapped callback at all (task 044 spec: "the
+    callback must be throttled by monotonic time to no more than once
+    per second; never once per bar").
+
+    The very first call always fires immediately (regardless of
+    ``check_every``), so a live dashboard sees an instant first update
+    rather than waiting for the first stride to complete. ``force()``
+    bypasses both the stride and the time check entirely -- useful for a
+    caller that wants to guarantee one final, definite update (e.g. "this
+    bounded unit of work just finished") without waiting on the throttle.
+    """
+
+    def __init__(self, callback: Callable[..., None] | None, *, min_interval_seconds: float = _HEARTBEAT_MIN_INTERVAL_SECONDS, check_every: int = 2000) -> None:
+        _require(check_every >= 1, "ProgressThrottle(check_every=...) must be >= 1")
+        _require(min_interval_seconds >= 0, "ProgressThrottle(min_interval_seconds=...) must be >= 0")
+        self._callback = callback
+        self._min_interval = min_interval_seconds
+        self._check_every = check_every
+        self._calls_since_check = 0
+        self._last_fired_monotonic: float | None = None
+
+    def maybe(self, *args: Any, **kwargs: Any) -> bool:
+        if self._callback is None:
+            return False
+        first_call = self._last_fired_monotonic is None
+        self._calls_since_check += 1
+        if not first_call and self._calls_since_check < self._check_every:
+            return False
+        self._calls_since_check = 0
+        now = time.monotonic()
+        if not first_call and (now - self._last_fired_monotonic) < self._min_interval:
+            return False
+        self._last_fired_monotonic = now
+        self._callback(*args, **kwargs)
+        return True
+
+    def force(self, *args: Any, **kwargs: Any) -> bool:
+        if self._callback is None:
+            return False
+        self._last_fired_monotonic = time.monotonic()
+        self._calls_since_check = 0
+        self._callback(*args, **kwargs)
+        return True
+
+
 def atomic_write_json(path: Path | str, payload: Mapping[str, Any]) -> None:
     """Write ``payload`` to ``path`` atomically: temp file in the same
     directory, ``fsync``'d, then ``os.replace`` -- see module docstring.
@@ -212,6 +266,57 @@ class ResourceUsage:
     @staticmethod
     def from_dict(d: Mapping[str, Any]) -> "ResourceUsage":
         return ResourceUsage(rss_bytes=d.get("rss_bytes"), cpu_seconds=d.get("cpu_seconds"))
+
+
+@dataclass(frozen=True)
+class ActiveWork:
+    """A live, best-effort heartbeat snapshot of *what a runner is doing
+    right now*, inside a single phase, between the coarser ``progress()``
+    milestones -- task 044. Written by :meth:`RunReporter.heartbeat`,
+    throttled to at most once per second (see ``_HEARTBEAT_MIN_INTERVAL_
+    SECONDS``) and never durably logged as its own event (see that
+    method's own docstring for why): this is pure, ephemeral, in-flight
+    status, not a milestone worth a permanent record.
+
+    ``unit_index``/``unit_total`` are deliberately generic -- the same
+    two fields serve both "current sample number of N" (preflight
+    throughput sampling) and "current strategy-variant number of N"
+    (production simulation); ``operation`` names which one a given
+    snapshot means. ``bars_scanned``/``bars_total`` are populated only
+    while genuinely inside a single variant's own bar-by-bar simulation
+    loop -- ``None`` otherwise."""
+
+    operation: str
+    variant_id: str | None
+    unit_index: int | None
+    unit_total: int | None
+    bars_scanned: int | None
+    bars_total: int | None
+    updated_at: str
+
+    def __post_init__(self) -> None:
+        _require(bool(self.operation), "ActiveWork.operation must be non-empty")
+        for name, value in (
+            ("unit_index", self.unit_index), ("unit_total", self.unit_total),
+            ("bars_scanned", self.bars_scanned), ("bars_total", self.bars_total),
+        ):
+            if value is not None:
+                _require(value >= 0, f"ActiveWork.{name} must be >= 0")
+
+    def to_dict(self) -> dict:
+        return {
+            "operation": self.operation, "variant_id": self.variant_id, "unit_index": self.unit_index,
+            "unit_total": self.unit_total, "bars_scanned": self.bars_scanned, "bars_total": self.bars_total,
+            "updated_at": self.updated_at,
+        }
+
+    @staticmethod
+    def from_dict(d: Mapping[str, Any]) -> "ActiveWork":
+        return ActiveWork(
+            operation=d["operation"], variant_id=d.get("variant_id"), unit_index=d.get("unit_index"),
+            unit_total=d.get("unit_total"), bars_scanned=d.get("bars_scanned"), bars_total=d.get("bars_total"),
+            updated_at=d["updated_at"],
+        )
 
 
 @dataclass(frozen=True)
@@ -424,6 +529,7 @@ class LiveStatus:
     top_strategies: tuple[Mapping[str, Any], ...]
     warnings: tuple[str, ...]
     errors: tuple[str, ...]
+    active_work: Mapping[str, Any] | None = None  # task 044 -- see ActiveWork; None on older run folders, always backward compatible
 
     def __post_init__(self) -> None:
         RunPhase(self.phase)  # raises ValueError if not a legal phase
@@ -447,6 +553,7 @@ class LiveStatus:
             "exit_variants_generated": self.exit_variants_generated, "backtests_completed": self.backtests_completed,
             "top_strategies": [dict(s) for s in self.top_strategies],
             "warnings": list(self.warnings), "errors": list(self.errors),
+            "active_work": (dict(self.active_work) if self.active_work is not None else None),
         }
 
     @staticmethod
@@ -461,7 +568,7 @@ class LiveStatus:
             eligible_specs=d.get("eligible_specs"), unique_entry_classes=d.get("unique_entry_classes"),
             exit_variants_generated=d.get("exit_variants_generated"), backtests_completed=d.get("backtests_completed"),
             top_strategies=tuple(d.get("top_strategies", ())), warnings=tuple(d.get("warnings", ())),
-            errors=tuple(d.get("errors", ())),
+            errors=tuple(d.get("errors", ())), active_work=d.get("active_work"),  # absent on older run folders -- None, never a KeyError
         )
 
 
@@ -500,6 +607,8 @@ class RunReporter:
         self._top_strategies: tuple[Mapping[str, Any], ...] = ()
         self._warnings: list[str] = []
         self._errors: list[str] = []
+        self._active_work: ActiveWork | None = None
+        self._last_heartbeat_monotonic: float | None = None
 
     @property
     def run_dir(self) -> Path:
@@ -523,6 +632,8 @@ class RunReporter:
         self._items_total = items_total
         self._items_completed = 0 if items_total is not None else None
         self._progress_samples = []
+        self._active_work = None  # stale in-flight status from the previous phase must not linger
+        self._last_heartbeat_monotonic = None
         self._append_event("phase_started", {"items_total": items_total})
         self._flush_status()
 
@@ -576,6 +687,66 @@ class RunReporter:
         self._resource_usage = ResourceUsage(rss_bytes=rss_bytes, cpu_seconds=cpu_seconds)
         self._append_event("resource_usage", self._resource_usage.to_dict())
         self._flush_status()
+
+    def heartbeat(
+        self,
+        *,
+        operation: str,
+        variant_id: str | None = None,
+        unit_index: int | None = None,
+        unit_total: int | None = None,
+        bars_scanned: int | None = None,
+        bars_total: int | None = None,
+        force: bool = False,
+    ) -> bool:
+        """A live, in-flight status update for the dashboard -- task 044.
+
+        Unlike every other ``RunReporter`` method, this one deliberately
+        does **not** append to ``progress_events.jsonl``: it exists
+        precisely so a caller inside a long, tight loop (potentially
+        millions of iterations -- one strategy variant's own bar-by-bar
+        simulation, or the full production variant sweep) can report
+        fine-grained, second-by-second position without growing the
+        durable event log without bound. ``live_status.json`` (via
+        ``_flush_status``) is the only artifact this writes to.
+
+        **Throttled to at most once per second** (``_HEARTBEAT_MIN_
+        INTERVAL_SECONDS``, monotonic-clock based), regardless of how
+        often the caller invokes this method -- satisfies the "write an
+        updated live status at most once per second" requirement even if
+        a caller forgets to throttle its own call site (callers inside a
+        genuinely per-bar loop should still wrap their own callback in a
+        :class:`ProgressThrottle` first, purely to avoid paying the
+        function-call/monotonic-check cost of *this* method on every
+        single bar -- see that class's own docstring). Pass ``force=True``
+        to bypass the throttle for a single, guaranteed-to-land update
+        (e.g. "this bounded unit of work just finished") -- only
+        appropriate for a caller that itself controls how often it forces
+        (never once per bar).
+
+        Returns ``True`` if this call actually flushed a new status,
+        ``False`` if it was throttled away (purely informational, useful
+        for tests).
+
+        As a side effect (only when it actually flushes), this also
+        refreshes ``resource_usage`` with a fresh, un-logged CPU/RSS
+        sample -- so CPU/RAM stay visibly live during long work without
+        needing their own separate once-a-second event either.
+        """
+        _require(bool(operation), "heartbeat(operation=...) must be non-empty")
+        now = time.monotonic()
+        if not force and self._last_heartbeat_monotonic is not None and (now - self._last_heartbeat_monotonic) < _HEARTBEAT_MIN_INTERVAL_SECONDS:
+            return False
+        self._last_heartbeat_monotonic = now
+        self._active_work = ActiveWork(
+            operation=operation, variant_id=variant_id, unit_index=unit_index, unit_total=unit_total,
+            bars_scanned=bars_scanned, bars_total=bars_total, updated_at=_utc_now_iso(),
+        )
+        rss_bytes, cpu_seconds = _sample_resource_usage()
+        if rss_bytes is not None or cpu_seconds is not None:
+            self._resource_usage = ResourceUsage(rss_bytes=rss_bytes, cpu_seconds=cpu_seconds)
+        self._flush_status()
+        return True
 
     def update_leaderboard(self, entries: Sequence[LeaderboardEntry]) -> None:
         for entry in entries:
@@ -673,6 +844,7 @@ class RunReporter:
             unique_entry_classes=self._unique_entry_classes, exit_variants_generated=self._exit_variants_generated,
             backtests_completed=self._backtests_completed, top_strategies=self._top_strategies,
             warnings=tuple(self._warnings), errors=tuple(self._errors),
+            active_work=(self._active_work.to_dict() if self._active_work is not None else None),
         )
         atomic_write_json(self._run_dir / "live_status.json", status.to_dict())
 

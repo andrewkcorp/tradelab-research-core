@@ -422,6 +422,43 @@ class EquivalenceClassDedupTests(unittest.TestCase):
         self.assertEqual(directions, {LONG, SHORT})
 
 
+class OnProgressCallbackTests(unittest.TestCase):
+    """task 044: on_progress is purely observational -- it reports
+    (primaries_processed, primaries_total) once per real primary in the
+    discovery loop, in order, with no gaps or duplicates, and never
+    changes the returned EntryStrategyUniverseResult in any way."""
+
+    def test_callback_reports_every_primary_in_order_and_never_changes_the_result(self):
+        candidates_long, zones_long = repeated_touch_candidates(LONG, "1m", 2024, DEFAULT_MIN_ENTRIES_PER_YEAR, "long24")
+        candidates_long2, zones_long2 = repeated_touch_candidates(LONG, "1m", 2025, DEFAULT_MIN_ENTRIES_PER_YEAR, "long25")
+        candidates_short, zones_short = repeated_touch_candidates(SHORT, "1m", 2024, DEFAULT_MIN_ENTRIES_PER_YEAR, "short24")
+        candidates_short2, zones_short2 = repeated_touch_candidates(SHORT, "1m", 2025, DEFAULT_MIN_ENTRIES_PER_YEAR, "short25")
+
+        fvg_results = fvg_res(*zones_long, *zones_long2, *zones_short, *zones_short2)
+        fvg_entry_result = FVGEntryCandidateResult(candidates=candidates_long + candidates_long2 + candidates_short + candidates_short2)
+        liquidity_entry_result = LiquidityEntryCandidateResult(candidates=[])
+
+        without_callback = discover_entry_strategy_universe(fvg_results, fvg_entry_result, liquidity_entry_result, EMPTY_BIAS)
+
+        calls = []
+        with_callback = discover_entry_strategy_universe(
+            fvg_results, fvg_entry_result, liquidity_entry_result, EMPTY_BIAS,
+            on_progress=lambda done, total: calls.append((done, total)),
+        )
+
+        self.assertGreater(len(calls), 0)
+        totals = {total for _done, total in calls}
+        self.assertEqual(len(totals), 1)  # the total never changes mid-loop
+        total = totals.pop()
+        self.assertEqual([done for done, _total in calls], list(range(1, total + 1)))  # exactly once per primary, in order, no gaps/dupes
+
+        self.assertEqual(without_callback.equivalence_class_count, with_callback.equivalence_class_count)
+        self.assertEqual(without_callback.eligible_spec_count, with_callback.eligible_spec_count)
+        self.assertEqual(
+            [c.class_id for c in without_callback.equivalence_classes], [c.class_id for c in with_callback.equivalence_classes]
+        )
+
+
 class BruteForceReferenceComparisonTests(unittest.TestCase):
     """Independently re-derives eligible-entry sequences for a small,
     randomly generated fixture via a naive O(primaries x cells x events)

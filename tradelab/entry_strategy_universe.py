@@ -103,7 +103,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from itertools import combinations, product
-from typing import Mapping
+from typing import Callable, Mapping
 
 from tradelab.bias import BEARISH, BULLISH, HTFBiasResult, NEUTRAL
 from tradelab.bias import SUPPORTED_TIMEFRAMES as _BIAS_TIMEFRAMES
@@ -403,6 +403,7 @@ def discover_entry_strategy_universe(
     htf_bias_result: HTFBiasResult,
     *,
     min_entries_per_year: int = DEFAULT_MIN_ENTRIES_PER_YEAR,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> EntryStrategyUniverseResult:
     """Enumerate the full, fixed 1,554,432-spec syntactic universe,
     determine each spec's exact, no-look-ahead observed eligible-entry
@@ -420,6 +421,13 @@ def discover_entry_strategy_universe(
     the vast majority of the 3036-primary catalog that never fires at
     all in a given dataset costs nothing beyond the fixed arithmetic
     ``SYNTACTIC_SPEC_COUNT`` total.
+
+    ``on_progress`` (task 044), if given, is called with ``(primaries_
+    processed, primaries_total)`` once per real (already-fired) primary
+    processed in the loop below -- purely observational, never read back
+    into the returned ``EntryStrategyUniverseResult`` in any way. The
+    caller is expected to pass an already time-throttled callback (e.g.
+    ``tradelab.research_run.ProgressThrottle.maybe``).
     """
     market_state_by_event_id: dict[str, MarketStateSnapshot] = {
         snapshot.event.event_id: snapshot.market_state
@@ -465,7 +473,8 @@ def discover_entry_strategy_universe(
     classes_by_sequence_key: dict[tuple, list[EntryStrategySpec]] = {}
     observed_by_sequence_key: dict[tuple, tuple[ObservedEntry, ...]] = {}
 
-    for primary, items in items_by_primary.items():
+    total_primaries = len(items_by_primary)
+    for primary_index, (primary, items) in enumerate(items_by_primary.items(), start=1):
         cells: dict[tuple[frozenset[str], BiasRequirementSpec], list[ObservedEntry]] = {}
         for observed, s, b in items:
             for req in context_subset_lookup[s]:
@@ -483,6 +492,9 @@ def discover_entry_strategy_universe(
             sequence_key = tuple((o.entry_id, o.known_at, o.direction) for o in observed_list)
             classes_by_sequence_key.setdefault(sequence_key, []).append(spec)
             observed_by_sequence_key[sequence_key] = tuple(observed_list)
+
+        if on_progress is not None:
+            on_progress(primary_index, total_primaries)
 
     equivalence_classes: list[EntryStrategyEquivalenceClass] = []
     for sequence_key, specs in classes_by_sequence_key.items():

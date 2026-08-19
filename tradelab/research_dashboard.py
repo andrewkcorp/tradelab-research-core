@@ -262,11 +262,33 @@ DASHBOARD_HTML = r"""<!doctype html>
         <span class="stat">Items: <b id="stat-items">-</b></span>
         <span class="stat">Throughput: <b id="stat-throughput">-</b></span>
         <span class="stat">ETA: <b id="stat-eta">-</b></span>
+        <span class="stat">RAM: <b id="stat-ram">-</b></span>
+        <span class="stat">CPU: <b id="stat-cpu">-</b></span>
       </div>
       <div class="progress-row">
         <div class="progress-bar-track"><div id="progress-bar-fill" class="progress-bar-fill" style="width:0%"></div></div>
       </div>
       <div class="timeline" id="phase-timeline"></div>
+    </div>
+  </section>
+
+  <section id="section-active-work">
+    <h2>Live activity</h2>
+    <div id="active-work-empty" class="empty-state">No live activity yet.</div>
+    <div id="active-work-content" style="display:none">
+      <div class="progress-row">
+        <span class="stat">Operation: <b id="stat-operation">-</b></span>
+        <span class="stat">Strategy variant: <b id="stat-variant-id">-</b></span>
+        <span class="stat">Updated: <b id="stat-active-work-updated">-</b></span>
+      </div>
+      <div class="progress-row" id="active-work-unit-row">
+        <span class="stat" style="min-width:170px">Variant/sample: <b id="stat-unit-progress">-</b></span>
+        <div class="progress-bar-track"><div id="unit-progress-bar-fill" class="progress-bar-fill" style="width:0%"></div></div>
+      </div>
+      <div class="progress-row" id="active-work-bars-row">
+        <span class="stat" style="min-width:170px">Bars scanned: <b id="stat-bar-progress">-</b></span>
+        <div class="progress-bar-track"><div id="bar-progress-bar-fill" class="progress-bar-fill" style="width:0%"></div></div>
+      </div>
     </div>
   </section>
 
@@ -323,13 +345,15 @@ const PHASE_LABELS = {preparing_data:"Preparing data", discovering_entries:"Disc
 
 let currentRunId = null;
 let pollTimer = null;
-const POLL_MS = 2000;
+const POLL_MS = 1000; // task 044: live status can update at most once/second server-side -- poll to match
 const throughputHistory = []; // [{t, throughput}]
 
 function fmtNum(n) { if (n === null || n === undefined) return "-"; return Number(n).toLocaleString(undefined, {maximumFractionDigits: 2}); }
 function fmtSeconds(s) { if (s === null || s === undefined) return "-"; s = Math.round(s); const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60; return (h>0?h+"h ":"") + (m>0||h>0?m+"m ":"") + sec+"s"; }
 function fmtMoney(n) { if (n === null || n === undefined) return "-"; const sign = n < 0 ? "-" : ""; return sign + "$" + Math.abs(n).toLocaleString(undefined, {maximumFractionDigits: 2}); }
 function fmtPct(n) { if (n === null || n === undefined) return "-"; return (n*100).toFixed(1) + "%"; }
+function fmtBytes(n) { if (n === null || n === undefined) return "-"; const units = ["B","KB","MB","GB","TB"]; let i = 0; let v = n; while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; } return v.toFixed(v >= 10 || i === 0 ? 0 : 1) + " " + units[i]; }
+function fmtAgo(iso) { if (!iso) return "-"; const s = (Date.now() - new Date(iso).getTime()) / 1000; if (s < 0) return "just now"; if (s < 2) return "just now"; return fmtSeconds(s) + " ago"; }
 
 async function fetchJson(url) {
   const res = await fetch(url, {cache: "no-store"});
@@ -385,6 +409,47 @@ function renderCards(status) {
   document.getElementById("cards-grid").innerHTML = cards.map(([label, value]) => `
     <div class="card"><div class="label">${label}</div><div class="value">${value === null || value === undefined ? "&mdash;" : fmtNum(value)}</div></div>
   `).join("");
+}
+
+// task 044: live_status.active_work is optional -- absent entirely on
+// older run folders written before this field existed, and null on any
+// run (old or new) that isn't currently between heartbeats. Both cases
+// render the same "no live activity yet" empty state, never an error.
+function renderActiveWork(status) {
+  const empty = document.getElementById("active-work-empty");
+  const content = document.getElementById("active-work-content");
+  const work = status && status.active_work;
+  if (!work) {
+    empty.style.display = "block";
+    content.style.display = "none";
+    return;
+  }
+  empty.style.display = "none";
+  content.style.display = "block";
+
+  document.getElementById("stat-operation").textContent = work.operation || "-";
+  document.getElementById("stat-variant-id").textContent = work.variant_id || "-";
+  document.getElementById("stat-active-work-updated").textContent = fmtAgo(work.updated_at);
+
+  const unitRow = document.getElementById("active-work-unit-row");
+  if (work.unit_index === null || work.unit_index === undefined) {
+    unitRow.style.display = "none";
+  } else {
+    unitRow.style.display = "flex";
+    document.getElementById("stat-unit-progress").textContent = fmtNum(work.unit_index) + " / " + (work.unit_total === null || work.unit_total === undefined ? "?" : fmtNum(work.unit_total));
+    const unitPct = (work.unit_total && work.unit_total > 0) ? Math.min(100, (work.unit_index / work.unit_total) * 100) : 0;
+    document.getElementById("unit-progress-bar-fill").style.width = unitPct + "%";
+  }
+
+  const barsRow = document.getElementById("active-work-bars-row");
+  if (work.bars_scanned === null || work.bars_scanned === undefined) {
+    barsRow.style.display = "none";
+  } else {
+    barsRow.style.display = "flex";
+    document.getElementById("stat-bar-progress").textContent = fmtNum(work.bars_scanned) + " / " + (work.bars_total === null || work.bars_total === undefined ? "?" : fmtNum(work.bars_total));
+    const barsPct = (work.bars_total && work.bars_total > 0) ? Math.min(100, (work.bars_scanned / work.bars_total) * 100) : 0;
+    document.getElementById("bar-progress-bar-fill").style.width = barsPct + "%";
+  }
 }
 
 function renderLeaders(leaderboard) {
@@ -581,11 +646,15 @@ async function refresh() {
   document.getElementById("stat-items").textContent = (status.items_completed === null ? "-" : fmtNum(status.items_completed)) + " / " + (status.items_total === null || status.items_total === undefined ? "?" : fmtNum(status.items_total));
   document.getElementById("stat-throughput").textContent = status.throughput_per_second === null || status.throughput_per_second === undefined ? "-" : fmtNum(status.throughput_per_second) + "/s";
   document.getElementById("stat-eta").textContent = status.eta_seconds === null || status.eta_seconds === undefined ? "n/a" : fmtSeconds(status.eta_seconds);
+  const usage = status.resource_usage || {};
+  document.getElementById("stat-ram").textContent = fmtBytes(usage.rss_bytes);
+  document.getElementById("stat-cpu").textContent = usage.cpu_seconds === null || usage.cpu_seconds === undefined ? "-" : fmtSeconds(usage.cpu_seconds);
 
   const pct = (status.items_total && status.items_total > 0 && status.items_completed !== null) ? Math.min(100, (status.items_completed / status.items_total) * 100) : (status.phase === "completed" ? 100 : 0);
   document.getElementById("progress-bar-fill").style.width = pct + "%";
 
   renderTimeline(status.phase);
+  renderActiveWork(status);
   renderCards(status);
   renderLeaders(leaderboard);
   renderWarnings(status);

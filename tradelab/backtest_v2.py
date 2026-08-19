@@ -188,7 +188,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from tradelab.accounting import AccountBacktestResult, Instrument, RiskConfig, apply_accounting
 from tradelab.backtest import (
@@ -208,7 +208,7 @@ from tradelab.equity import EquityConfig, EquityResult, build_equity_curve
 from tradelab.fvg import DEFAULT_TICK_SIZE
 from tradelab.fvg_entry import FVGEntryCandidate
 from tradelab.news import is_entry_blocked
-from tradelab.research_run import LeaderboardEntry, RunPhase, RunReporter, append_jsonl, atomic_write_json, create_run, read_run_manifest
+from tradelab.research_run import LeaderboardEntry, ProgressThrottle, RunPhase, RunReporter, append_jsonl, atomic_write_json, create_run, read_run_manifest
 from tradelab.research_run import _git_provenance as _current_git_provenance
 from tradelab.research_run import _sha256_of_file as _hash_file
 from tradelab.sl_targets import FVG_SL_TIMEFRAMES, SelectedFVGConfluence, SLTargetCandidate, detect_sl_target_candidates
@@ -394,12 +394,29 @@ def simulate_market_execution(
     variant: ExitVariantSpec,
     context: PreparedBacktestContext,
     strategy_variant_id: str,
+    *,
+    on_bar_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[list[ExecutedTrade], list[SkippedEntryV2]]:
     """The core, new execution loop -- next-bar-open fill, same-1m-bar
     SL-first tie-break (reused from ``tradelab.backtest``), one
     position at a time, news-blocked at the actual fill instant. See
-    module docstring for the full rule set."""
+    module docstring for the full rule set.
+
+    ``on_bar_progress`` (task 044), if given, is called with
+    ``(bars_scanned, bars_total)`` as the bar cursor advances -- this is
+    the loop that can genuinely scan the *entire* dataset one bar at a
+    time for a single (equivalence class, exit variant, instrument)
+    combination whenever its own observed entries are sparse relative to
+    the bar count (the cursor still has to walk every bar in between to
+    check an open position for exit, or simply to advance to the next
+    entry's own fill bar). Purely observational: this callback's return
+    value is ignored and it can never influence ``trades``/``skipped``/
+    ``position`` in any way -- the caller is expected to pass an already
+    time-throttled callback (e.g. a ``tradelab.research_run.
+    ProgressThrottle.maybe``), since this loop may invoke it once per
+    bar, for millions of bars."""
     bars = context.bars_1m
+    total_bars = len(bars)
     sorted_timestamps = [b.timestamp for b in bars]  # already chronological by construction
     trades: list[ExecutedTrade] = []
     skipped: list[SkippedEntryV2] = []
@@ -424,6 +441,8 @@ def simulate_market_execution(
                     trades.append(_finalize_trade(position, exit_timestamp=bars[bar_cursor].timestamp, exit_price=exit_price, reason=reason))
                     position = None
             bar_cursor += 1
+            if on_bar_progress is not None:
+                on_bar_progress(bar_cursor, total_bars)
 
         if fill_index is None:
             skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.NO_BAR_AVAILABLE))
@@ -493,6 +512,8 @@ def simulate_market_execution(
             trades.append(_finalize_trade(position, exit_timestamp=bars[bar_cursor].timestamp, exit_price=exit_price, reason=reason))
             position = None
         bar_cursor += 1
+        if on_bar_progress is not None:
+            on_bar_progress(bar_cursor, total_bars)
 
     if position is not None:
         trades.append(_finalize_trade(position, exit_timestamp=None, exit_price=None, reason=TradeExitReason.OPEN_UNRESOLVED))
@@ -581,16 +602,21 @@ def run_strategy_variant_backtest(
     *,
     risk_config: RiskConfig = DEFAULT_RISK_CONFIG,
     equity_config: EquityConfig = DEFAULT_EQUITY_CONFIG,
+    on_bar_progress: Callable[[int, int], None] | None = None,
 ) -> StrategyVariantResult:
     """Simulate one full (equivalence class, exit variant, instrument)
     strategy backtest -- market execution (this module), then sizing/
     P&L (``tradelab.accounting.apply_accounting``, unmodified), then
     equity/drawdown (``tradelab.equity.build_equity_curve``,
-    unmodified)."""
+    unmodified).
+
+    ``on_bar_progress`` (task 044) is forwarded, unmodified, straight
+    through to ``simulate_market_execution`` -- purely observational,
+    never read back into anything this function returns."""
     direction = equivalence_class.representative_spec.primary.direction
     variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value)
 
-    trades, skipped = simulate_market_execution(equivalence_class.observed_entries, direction, variant, context, variant_id)
+    trades, skipped = simulate_market_execution(equivalence_class.observed_entries, direction, variant, context, variant_id, on_bar_progress=on_bar_progress)
 
     backtest_result = BacktestResult(
         strategy_id=variant_id, trades=trades, skipped_signals=[], trade_count=len(trades),
@@ -823,6 +849,16 @@ def _expand_and_simulate(
     would itself be a significant, unbounded-with-run-size memory
     allocation, which this loop deliberately avoids. Returns
     ``(completed_count, final_top_n_leaderboard)``.
+
+    **Live, second-by-second telemetry (task 044).** Before simulating
+    each variant, and repeatedly while ``simulate_market_execution``
+    scans through that variant's own bars, this reports a heartbeat --
+    current strategy_variant_id, its 1-based position among ``total_
+    variant_runs``, and bars-scanned/bars-total -- via ``reporter.
+    heartbeat()``, itself throttled to at most once per second and never
+    logged as its own durable event (see that method's own docstring).
+    This is purely observational: it never affects ``result``, the
+    journal, the leaderboard, or which variant is simulated next.
     """
     total_variant_runs = universe.equivalence_class_count * len(exit_variants) * len(instruments)
     reporter.phase_started(RunPhase.EXPANDING_EXIT_VARIANTS, items_total=max(total_variant_runs, 1))
@@ -846,7 +882,27 @@ def _expand_and_simulate(
                 if journal.is_completed(variant_id):
                     continue  # durably completed in a previous process -- never recomputed
 
-                result = run_strategy_variant_backtest(equivalence_class, variant, instrument, context, risk_config=risk_config, equity_config=equity_config)
+                # task 044: live, second-by-second telemetry -- purely
+                # observational (never read back into result/ranking).
+                # reporter.heartbeat() is itself throttled to at most
+                # once/second; ProgressThrottle additionally keeps the
+                # per-bar call site inside simulate_market_execution cheap
+                # for a variant that scans millions of bars.
+                current_unit_index = completed + 1
+                reporter.heartbeat(
+                    operation="simulating_backtests", variant_id=variant_id, unit_index=current_unit_index, unit_total=total_variant_runs,
+                    bars_scanned=0, bars_total=len(context.bars_1m),
+                )
+                bar_progress = ProgressThrottle(
+                    lambda scanned, total, _vid=variant_id, _idx=current_unit_index: reporter.heartbeat(
+                        operation="simulating_backtests", variant_id=_vid, unit_index=_idx, unit_total=total_variant_runs,
+                        bars_scanned=scanned, bars_total=total,
+                    )
+                )
+                result = run_strategy_variant_backtest(
+                    equivalence_class, variant, instrument, context, risk_config=risk_config, equity_config=equity_config,
+                    on_bar_progress=bar_progress.maybe,
+                )
                 row = VariantSummaryRow.from_result(result)
                 journal.commit_summary(row.to_dict())  # durable, authoritative -- BEFORE anything below reports it as done
                 append_jsonl(summary_path, row.to_dict())  # plain-text export/audit mirror only, never read back for resume
@@ -916,6 +972,34 @@ def _open_journal(
         exit_variant_ids=[v.variant_id for v in exit_variants],
         instruments=[i.value for i in instruments],
     )
+
+
+def _prepare_data_phase_callback(reporter: RunReporter) -> Callable[[str, float, int | None], None]:
+    """Adapts ``prepare_backtest_context``'s own existing, already-tested
+    per-phase diagnostic hook (task-independent -- already used by
+    ``tradelab.diagnose_context_preparation``) into a task-044 live
+    heartbeat -- reused, never reimplemented: this changes nothing about
+    what that function computes or in what order, it purely observes
+    each phase completing (``phase_callback`` itself fires once per
+    detector phase -- 1m validation, timeframe aggregation, one FVG
+    detection per timeframe, etc. -- never per-bar, so no additional
+    throttling wrapper is needed here beyond ``heartbeat()``'s own)."""
+    def _callback(phase_name: str, _duration_seconds: float, _peak_rss_bytes: int | None) -> None:
+        reporter.heartbeat(operation=f"preparing_data:{phase_name}")
+    return _callback
+
+
+def _discovery_progress_callback(reporter: RunReporter) -> Callable[[int, int], None]:
+    """A ``ProgressThrottle``-wrapped adapter from ``discover_entry_
+    strategy_universe``'s own ``on_progress(primaries_processed,
+    primaries_total)`` hook (task 044) to a live heartbeat -- throttled
+    here (rather than relying solely on ``heartbeat()``'s own throttle)
+    since a real dataset's ``items_by_primary`` can itself be a large
+    loop, and this keeps the per-primary call site cheap."""
+    throttle = ProgressThrottle(
+        lambda processed, total: reporter.heartbeat(operation="discovering_entries", unit_index=processed, unit_total=total)
+    )
+    return throttle.maybe
 
 
 def _require_clean_working_tree() -> None:
@@ -1051,7 +1135,8 @@ def run_production_backtest_v2(
         news_events = read_news_events_csv(Path(news_csv_path))
         reporter.progress(items_completed=3)
         context = prepare_backtest_context(
-            list(series_result.bars), list(news_events), tick_size=tick_size, pivot_strength=pivot_strength, reclaim_window_bars=reclaim_window_bars
+            list(series_result.bars), list(news_events), tick_size=tick_size, pivot_strength=pivot_strength, reclaim_window_bars=reclaim_window_bars,
+            phase_callback=_prepare_data_phase_callback(reporter),
         )
         reporter.progress(items_completed=4)
         reporter.record_resource_usage()
@@ -1061,7 +1146,8 @@ def run_production_backtest_v2(
 
         reporter.phase_started(RunPhase.DISCOVERING_ENTRIES, items_total=1)
         universe = discover_entry_strategy_universe(
-            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=min_entries_per_year
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=min_entries_per_year,
+            on_progress=_discovery_progress_callback(reporter),
         )
         reporter.progress(
             items_completed=1, discovered_specs=universe.syntactically_enumerated_spec_count,
@@ -1137,19 +1223,56 @@ def _iter_variant_combinations(
 def _measure_sample_throughput(
     universe: EntryStrategyUniverseResult, exit_variants: tuple[ExitVariantSpec, ...], instruments: tuple[Instrument, ...],
     context: PreparedBacktestContext, *, risk_config: RiskConfig, equity_config: EquityConfig, sample_size: int,
+    reporter: RunReporter | None = None,
 ) -> dict[str, Any]:
     """Actually simulates up to ``sample_size`` variants (a small,
     caller-chosen prefix of the real enumeration order) purely to *measure*
     (never estimate blind) real per-variant wall-clock cost and real
     per-row summary size. Never simulates the full universe -- ``sample_
-    size`` is the caller's own explicit, bounded budget."""
+    size`` is the caller's own explicit, bounded budget.
+
+    **Live telemetry (task 044).** When ``reporter`` is given, this
+    reports a heartbeat before and during each sample (current sample
+    number of ``len(combos)``, current strategy_variant_id, and bars-
+    scanned/bars-total from inside that sample's own simulation), and a
+    forced (never-throttled) heartbeat the instant each sample finishes
+    -- so, e.g., ``--throughput-sample-size 25`` visibly advances 0/25 ->
+    1/25 -> 2/25 -> ... rather than jumping straight from 0 to 25 at the
+    very end. Forcing one flush per *completed sample* (never per bar)
+    is safe precisely because ``sample_size`` is a small, caller-chosen,
+    explicitly bounded budget -- never the full, potentially millions-
+    strong variant universe (see ``_expand_and_simulate``, which
+    deliberately never forces, relying purely on the throttle, since it
+    has no such bound)."""
     combos = list(itertools.islice(_iter_variant_combinations(universe, exit_variants, instruments), sample_size))
     row_byte_sizes: list[int] = []
     start = time.perf_counter()
-    for equivalence_class, variant, instrument in combos:
-        result = run_strategy_variant_backtest(equivalence_class, variant, instrument, context, risk_config=risk_config, equity_config=equity_config)
+    for i, (equivalence_class, variant, instrument) in enumerate(combos):
+        variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value)
+        on_bar_progress = None
+        if reporter is not None:
+            reporter.heartbeat(
+                operation="sampling_throughput", variant_id=variant_id, unit_index=i + 1, unit_total=len(combos),
+                bars_scanned=0, bars_total=len(context.bars_1m),
+            )
+            bar_progress = ProgressThrottle(
+                lambda scanned, total, _vid=variant_id, _idx=i + 1: reporter.heartbeat(
+                    operation="sampling_throughput", variant_id=_vid, unit_index=_idx, unit_total=len(combos),
+                    bars_scanned=scanned, bars_total=total,
+                )
+            )
+            on_bar_progress = bar_progress.maybe
+        result = run_strategy_variant_backtest(
+            equivalence_class, variant, instrument, context, risk_config=risk_config, equity_config=equity_config,
+            on_bar_progress=on_bar_progress,
+        )
         row = VariantSummaryRow.from_result(result)
         row_byte_sizes.append(len(json.dumps(row.to_dict()).encode("utf-8")))
+        if reporter is not None:
+            reporter.heartbeat(
+                operation="sampling_throughput", variant_id=variant_id, unit_index=i + 1, unit_total=len(combos),
+                bars_scanned=len(context.bars_1m), bars_total=len(context.bars_1m), force=True,
+            )
     elapsed_seconds = time.perf_counter() - start
     variants_per_second = (len(combos) / elapsed_seconds) if elapsed_seconds > 0 else None
     return {
@@ -1246,7 +1369,8 @@ def run_preflight_v2(
         news_events = read_news_events_csv(Path(news_csv_path))
         reporter.progress(items_completed=3)
         context = prepare_backtest_context(
-            list(series_result.bars), list(news_events), tick_size=tick_size, pivot_strength=pivot_strength, reclaim_window_bars=reclaim_window_bars
+            list(series_result.bars), list(news_events), tick_size=tick_size, pivot_strength=pivot_strength, reclaim_window_bars=reclaim_window_bars,
+            phase_callback=_prepare_data_phase_callback(reporter),
         )
         reporter.progress(items_completed=4)
         reporter.record_resource_usage()
@@ -1257,7 +1381,8 @@ def run_preflight_v2(
 
         reporter.phase_started(RunPhase.DISCOVERING_ENTRIES, items_total=1)
         universe = discover_entry_strategy_universe(
-            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=min_entries_per_year
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=min_entries_per_year,
+            on_progress=_discovery_progress_callback(reporter),
         )
         reporter.progress(
             items_completed=1, discovered_specs=universe.syntactically_enumerated_spec_count,
@@ -1274,7 +1399,7 @@ def run_preflight_v2(
             reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=min(throughput_sample_size, total_variant_simulations))
             throughput_sample = _measure_sample_throughput(
                 universe, exit_variants, instruments, context, risk_config=risk_config, equity_config=equity_config,
-                sample_size=throughput_sample_size,
+                sample_size=throughput_sample_size, reporter=reporter,
             )
             reporter.progress(items_completed=throughput_sample["sample_size_measured"])
 
