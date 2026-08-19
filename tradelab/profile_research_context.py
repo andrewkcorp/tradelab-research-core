@@ -112,10 +112,13 @@ from tradelab.backtest import PreparedBacktestContext, prepare_backtest_context
 from tradelab.bar import Bar1m
 from tradelab.data_wicks import DataWickDetectionResult, DataWickDirection
 from tradelab.entry_signal_timeline import (
+    EntryEventKind,
     EntrySignal,
     EntrySignalTimeline,
     SignalSuspension,
+    build_entry_events,
     iter_active_pool_scalar_snapshots,
+    iter_candidate_entry_snapshots,
     iter_fvg_lifecycle_transitions,
 )
 from tradelab.fvg import BEARISH, BULLISH, FVGDetectionResult, FVGMitigationEvent
@@ -223,9 +226,10 @@ def profile_research_context(
     profile's invocation.
 
     ``phase_callback``, if given, is called with ``(phase_name,
-    duration_seconds)`` as each of the five phases below completes --
+    duration_seconds)`` as each of the six phases below completes --
     ``"preparation"``, ``"lifecycle_profiling"``, ``"pool_statistics"``,
-    ``"serialization"``, ``"total"`` (in that order). Purely a side-
+    ``"entry_event_model"``, ``"serialization"``, ``"total"`` (in that
+    order). Purely a side-
     effecting hook for CLI progress visibility on a long real run
     (``main()`` uses it to print); it never affects the return value or
     ``output_json_path``'s own content -- wall-clock durations are
@@ -266,6 +270,12 @@ def profile_research_context(
     active_pool_stats = _active_pool_stats(context.timeline)
     _report("pool_statistics", pool_stats_start)
 
+    entry_event_model_start = time.perf_counter()
+    entry_event_model = _entry_event_model_section(
+        context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result
+    )
+    _report("entry_event_model", entry_event_model_start)
+
     serialization_start = time.perf_counter()
     entry_signals_by_selector_direction = _selector_direction_counts(context.timeline)
 
@@ -283,6 +293,7 @@ def profile_research_context(
         context=context,
         timeline_stats=timeline_stats,
         active_pool_stats=active_pool_stats,
+        entry_event_model=entry_event_model,
         entry_signals_by_selector_direction=entry_signals_by_selector_direction,
         previous_profile_json_path=previous_profile_json_path,
         previous_profile=previous_profile,
@@ -323,6 +334,7 @@ def _build_profile(
     context: PreparedBacktestContext,
     timeline_stats: dict,
     active_pool_stats: dict,
+    entry_event_model: dict,
     entry_signals_by_selector_direction: list[dict],
     previous_profile_json_path: Path | None,
     previous_profile: dict | None,
@@ -377,6 +389,7 @@ def _build_profile(
         },
         "entry_signal_timeline": timeline_stats,
         "active_pool_stats": active_pool_stats,
+        "entry_event_model": entry_event_model,
         "provenance": _provenance_section(
             market_artifact_sha256=artifact.sha256, news_csv_sha256=news_sha256, command=command
         ),
@@ -812,6 +825,116 @@ def _active_pool_stats(timeline: EntrySignalTimeline) -> dict:
             {"selector": selector, "direction": direction, **_group_summary(*buckets)}
             for (selector, direction), buckets in sorted(by_selector_direction.items())
         ],
+    }
+
+
+_ENTRY_EVENT_MODEL_NOTE = (
+    "Persistent market STATE (FVG zone active/suspended/retired "
+    "structural status, HTF bias) is reported separately from atomic "
+    "ENTRY EVENTS (FVG touch, confirmed iFVG, liquidity sweep) -- see "
+    "docs/market-state-vs-entry-events-v1.md and tradelab.entry_signal_"
+    "timeline's own EntryEvent/MarketStateSnapshot/CandidateEntrySnapshot "
+    "docstrings for the full rationale. The older active_pool_stats "
+    "section above (tradelab.entry_signal_timeline.EntrySignal/query_"
+    "active_signals) treats every FVG-family and liquidity signal as "
+    "'active until specifically invalidated' -- correct for the FVG "
+    "zone's own structural lifecycle, but wrong when applied to the "
+    "*event* of a touch/sweep itself: a real-MNQ profile under that "
+    "model showed a median 219 simultaneously 'active' required-"
+    "confluence selectors and 255,886 'active' signal instances at real "
+    "primary signal timestamps -- old, one-off historical occurrences "
+    "that nothing later specifically invalidated, not a genuinely large "
+    "simultaneous market state. This section reports the corrected "
+    "model instead: an EntryEvent is known once, at its own known_at, "
+    "and is never re-offered as a fresh primary trigger at any later "
+    "instant; only the FVG zone's own structural state and HTF bias -- "
+    "genuinely persistent facts, not events -- are usable as context for "
+    "a later, unrelated event. This is not a cap, a time window, or an "
+    "approximation of any kind -- see no_accumulation_evidence below for "
+    "machine-checkable proof that events are not silently accumulating "
+    "as if they were persistent facts."
+)
+
+
+def _entry_event_model_section(
+    fvg_results: Mapping[str, FVGDetectionResult],
+    fvg_entry_result: FVGEntryCandidateResult,
+    liquidity_entry_result: LiquidityEntryCandidateResult,
+    htf_bias_result: HTFBiasResult,
+) -> dict:
+    """Persistent-state fact counts, atomic EntryEvent counts, candidate-
+    entry snapshot counts, and active-persistent-context statistics at
+    those candidate timestamps -- see ``_ENTRY_EVENT_MODEL_NOTE``. One
+    linear forward sweep over ``iter_candidate_entry_snapshots``
+    (``O(N log N)``, same technique as ``_active_pool_stats``): never
+    re-implements the FVG suspend/restore/retire engine or HTF bias
+    combine rule, and never materializes a per-snapshot active-signal
+    list."""
+    event_count_by_kind = {kind.value: 0 for kind in EntryEventKind}
+    for event in build_entry_events(fvg_entry_result, liquidity_entry_result):
+        event_count_by_kind[event.kind.value] += 1
+    event_count_total = sum(event_count_by_kind.values())
+
+    fvg_zone_count_total = sum(len(result.zones) for result in fvg_results.values())
+    bias_change_count_total = sum(len(changes) for changes in htf_bias_result.timeframe_changes.values())
+
+    including_primary: list[int] = []
+    excluding_primary: list[int] = []
+    snapshot_count = 0
+    max_active_fvg_selectors_observed = 0
+
+    for snapshot in iter_candidate_entry_snapshots(fvg_entry_result, liquidity_entry_result, htf_bias_result):
+        snapshot_count += 1
+        same_direction_selectors = snapshot.market_state.active_fvg_selectors_by_direction[snapshot.event.direction]
+        including = len(same_direction_selectors)
+        is_fvg_primary = snapshot.event.kind in (EntryEventKind.FVG_TOUCH, EntryEventKind.IFVG)
+        excluding = including - 1 if is_fvg_primary else including
+        including_primary.append(including)
+        excluding_primary.append(excluding)
+        max_active_fvg_selectors_observed = max(max_active_fvg_selectors_observed, including)
+
+    return {
+        "note": _ENTRY_EVENT_MODEL_NOTE,
+        "persistent_state_fact_counts": {
+            "fvg_zone_count_total": fvg_zone_count_total,
+            "htf_bias_change_count_total": bias_change_count_total,
+        },
+        "entry_event_count_by_kind": {**event_count_by_kind, "total": event_count_total},
+        "candidate_entry_snapshot_count": snapshot_count,
+        "active_persistent_context_at_candidate_timestamps": {
+            "note": (
+                "Scoped to each event's own direction -- the same set "
+                "tradelab.entry_signal_timeline.MarketStateSnapshot "
+                "reports for that direction. active_fvg_selector_count_"
+                "including_primary includes the event's own selector "
+                "when the event is itself FVG-family (touch/iFVG); "
+                "required_confluence_selector_count_excluding_primary "
+                "subtracts it in that case, and is identical to the "
+                "including-primary count for a liquidity-sweep primary "
+                "(liquidity is never itself in this pool)."
+            ),
+            "active_fvg_selector_count_including_primary": _stat_summary(including_primary),
+            "required_confluence_selector_count_excluding_primary": _stat_summary(excluding_primary),
+        },
+        "no_accumulation_evidence": {
+            "entry_event_count_equals_candidate_snapshot_count": event_count_total == snapshot_count,
+            "max_active_fvg_selectors_observed": max_active_fvg_selectors_observed,
+            "max_possible_fvg_selectors_by_catalog": 12,
+            "note": (
+                "entry_event_count_equals_candidate_snapshot_count "
+                "being true proves every EntryEvent is joined with "
+                "market state exactly once -- never duplicated, never "
+                "re-offered at a later instant, so an event can never "
+                "silently accumulate as if it were a persistent fact. "
+                "max_active_fvg_selectors_observed <= 12 (6 timeframes "
+                "x 2 source types: fvg_touch, ifvg) proves the "
+                "persistent-state pool itself stays bounded by the "
+                "fixed FVG-family selector catalog, never by how much "
+                "history has accumulated -- contrast with the older "
+                "active_pool_stats section's median of 219 selectors "
+                "and up to hundreds of thousands of instances."
+            ),
+        },
     }
 
 

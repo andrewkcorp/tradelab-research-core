@@ -18,15 +18,24 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from tradelab.bias import BEARISH as BIAS_BEARISH
+from tradelab.bias import BULLISH as BIAS_BULLISH
+from tradelab.bias import NEUTRAL as BIAS_NEUTRAL
+from tradelab.bias import ConfluenceSource, ConfluenceType, HTFBiasResult, TimeframeBiasChange, bias_at
 from tradelab.entry_signal_timeline import (
     LONG,
     SHORT,
+    CandidateEntrySnapshot,
+    EntryEventKind,
+    MarketStateSnapshot,
     SignalRestoration,
     SignalSuspension,
     SourceKind,
+    build_entry_events,
     build_entry_signal_timeline,
     iter_active_pool_scalar_snapshots,
     iter_active_signal_snapshots,
+    iter_candidate_entry_snapshots,
     iter_fvg_lifecycle_transitions,
     query_active_signals,
 )
@@ -1344,6 +1353,252 @@ class ActivePoolScalarSnapshotPerformanceTests(unittest.TestCase):
             f"scalar stream ({scalar_duration:.4f}s) should be substantially faster than the full "
             f"snapshot stream ({full_duration:.4f}s) on a large, persistently-growing active pool",
         )
+
+
+def make_bias_result(changes_by_timeframe: dict[str, list[TimeframeBiasChange]]) -> HTFBiasResult:
+    from tradelab.bias import SUPPORTED_TIMEFRAMES
+
+    return HTFBiasResult(timeframe_changes={tf: changes_by_timeframe.get(tf, []) for tf in SUPPORTED_TIMEFRAMES})
+
+
+def bias_change(timeframe: str, state: str, known_at: datetime) -> TimeframeBiasChange:
+    source = ConfluenceSource(ConfluenceType.FVG_FORMATION, BIAS_BULLISH if state == BIAS_BULLISH else BIAS_BEARISH, "z-bias", known_at)
+    return TimeframeBiasChange(timeframe=timeframe, known_at=known_at, state=state, sources=(source,))
+
+
+EMPTY_BIAS = make_bias_result({})
+
+
+class EntryEventBuildingTests(unittest.TestCase):
+    """``build_entry_events``: FVG touch/iFVG/liquidity sweep normalize
+    into ``EntryEvent``s identically to how ``EntrySignal`` already
+    normalizes the exact same facts (same selector/timeframe/direction/
+    known_at, built via the same private helpers) -- never re-derived
+    independently. Zone mitigations never become an ``EntryEvent``,
+    exactly like they never become an ``EntrySignal``."""
+
+    def test_touch_ifvg_and_sweep_get_the_correct_kind_and_matching_selector(self):
+        touch = fvg_candidate(zone_id="A", source_type=SourceType.FVG_TOUCH, direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        ifvg = fvg_candidate(zone_id="B", source_type=SourceType.IFVG, direction=SHORT, known_at=ny_dt(2026, 1, 5, 10, 1))
+        sweep = liquidity_candidate(known_at=ny_dt(2026, 1, 5, 10, 2))
+
+        events = build_entry_events(fvg_result(touch, ifvg), liquidity_result(sweep))
+        by_id = {e.event_id: e for e in events}
+
+        self.assertEqual(by_id[touch.candidate_id].kind, EntryEventKind.FVG_TOUCH)
+        self.assertEqual(by_id[touch.candidate_id].selector, "fvg-1m-fvg_touch")
+        self.assertEqual(by_id[touch.candidate_id].zone_id, "A")
+        self.assertIsNone(by_id[touch.candidate_id].level_id)
+
+        self.assertEqual(by_id[ifvg.candidate_id].kind, EntryEventKind.IFVG)
+        self.assertEqual(by_id[ifvg.candidate_id].selector, "fvg-1m-ifvg")
+
+        self.assertEqual(by_id[sweep.candidate_id].kind, EntryEventKind.LIQUIDITY_SWEEP)
+        self.assertIsNone(by_id[sweep.candidate_id].zone_id)
+        self.assertEqual(by_id[sweep.candidate_id].level_id, sweep.level_id)
+
+    def test_mitigations_never_become_entry_events(self):
+        touch, mitigation = fvg_touch_then_mitigation("A", "1m", LONG, ny_dt(2026, 1, 5, 10, 0), ny_dt(2026, 1, 5, 12, 0))
+        events = build_entry_events(fvg_result(touch, mitigations=(mitigation,)), EMPTY_LIQUIDITY)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_id, touch.candidate_id)
+
+    def test_events_are_chronological_by_known_at(self):
+        rng = random.Random(24681357)
+        candidates, mitigations = _random_fvg_zone_stories(rng, 40, ny_dt(2026, 1, 5, 9, 0), "chrono")
+        liquidity_signals = _random_liquidity_signals(rng, 40, ny_dt(2026, 1, 5, 9, 0), "chrono-liq")
+        events = build_entry_events(fvg_result(*candidates, mitigations=mitigations), liquidity_result(*liquidity_signals))
+        self.assertEqual([e.known_at for e in events], sorted(e.known_at for e in events))
+
+    def test_empty_inputs_yield_no_events(self):
+        self.assertEqual(build_entry_events(EMPTY_FVG, EMPTY_LIQUIDITY), [])
+
+
+class MarketStateVsEntryEventRegressionTests(unittest.TestCase):
+    """The five focused regressions this task requires: (a) a touch is
+    available at its own timestamp but never becomes an everlasting
+    entry condition, (b) FVG suspension/restoration remains correct
+    after a later iFVG, (c) a liquidity sweep is a one-shot event,
+    (d) HTF bias survives across later entry events until a valid
+    opposite bias changes it, (e) no look-ahead."""
+
+    def test_a_fvg_touch_is_available_at_its_own_timestamp_but_not_an_everlasting_entry_condition(self):
+        touch = fvg_candidate(zone_id="A", timeframe="1m", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        # A much later, unrelated touch on a different timeframe (so same-timeframe
+        # suspension never interferes) -- roughly 400 days later.
+        later = fvg_candidate(zone_id="C", timeframe="5m", direction=LONG, known_at=ny_dt(2027, 2, 9, 10, 0))
+        result = fvg_result(touch, later)
+
+        events = build_entry_events(result, EMPTY_LIQUIDITY)
+        # The touch is a real EntryEvent exactly once, at its own known_at -- never re-offered.
+        self.assertEqual([e.event_id for e in events], [touch.candidate_id, later.candidate_id])
+        self.assertEqual(events[0].known_at, touch.known_at)
+
+        snapshots = {s.event.event_id: s for s in iter_candidate_entry_snapshots(result, EMPTY_LIQUIDITY, EMPTY_BIAS)}
+        self.assertEqual(len(snapshots), 2)
+        # The touch's own zone never resolved -- its STATE (not the event itself) legitimately
+        # persists as context for the later, unrelated event. This is the intended distinction,
+        # not a bug: the event fires once; the zone's structural state persists until resolved.
+        self.assertIn("fvg-1m-fvg_touch", snapshots[later.candidate_id].market_state.active_fvg_selectors_by_direction[LONG])
+        # But the touch is never itself re-listed as an event at the later instant.
+        self.assertNotEqual(snapshots[later.candidate_id].event.event_id, touch.candidate_id)
+
+    def test_fvg_suspension_and_restoration_remains_correct_after_a_later_ifvg(self):
+        bullish = fvg_candidate(zone_id="A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        bearish_touch, bearish_ifvg = fvg_touch_then_inversion("B", "1m", SHORT, ny_dt(2026, 1, 5, 11, 0), ny_dt(2026, 1, 5, 13, 0))
+        later_long = fvg_candidate(zone_id="C", direction=LONG, known_at=ny_dt(2026, 1, 5, 14, 0))
+        result = fvg_result(bullish, bearish_touch, bearish_ifvg, later_long)
+
+        snapshots = {s.event.event_id: s for s in iter_candidate_entry_snapshots(result, EMPTY_LIQUIDITY, EMPTY_BIAS)}
+        later_state = snapshots[later_long.candidate_id].market_state
+        # bullish was suspended by bearish_touch, then restored when bearish_touch's own
+        # zone inverted (a partially-touched opposing FVG never permanently cancels the
+        # prior FVG) -- both the restored touch and the new iFVG are active by now.
+        self.assertIn("fvg-1m-fvg_touch", later_state.active_fvg_selectors_by_direction[LONG])
+        self.assertIn("fvg-1m-ifvg", later_state.active_fvg_selectors_by_direction[LONG])
+
+    def test_liquidity_sweep_is_a_one_shot_event(self):
+        sweep = liquidity_candidate(known_at=ny_dt(2026, 1, 5, 10, 0))
+        later = fvg_candidate(zone_id="Z", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 5))
+        result_fvg = fvg_result(later)
+        result_liq = liquidity_result(sweep)
+
+        events = build_entry_events(result_fvg, result_liq)
+        self.assertEqual(len([e for e in events if e.event_id == sweep.candidate_id]), 1)
+
+        snapshots = list(iter_candidate_entry_snapshots(result_fvg, result_liq, EMPTY_BIAS))
+        sweep_snapshots = [s for s in snapshots if s.event.event_id == sweep.candidate_id]
+        self.assertEqual(len(sweep_snapshots), 1)
+        # The sweep never contributes to, or appears in, persistent FVG-family state.
+        later_snapshot = next(s for s in snapshots if s.event.event_id == later.candidate_id)
+        all_selectors = set(later_snapshot.market_state.active_fvg_selectors_by_direction[LONG]) | set(
+            later_snapshot.market_state.active_fvg_selectors_by_direction[SHORT]
+        )
+        self.assertTrue(all(not selector.startswith("liquidity-") for selector in all_selectors))
+
+    def test_htf_bias_survives_across_later_entry_events_until_a_valid_opposite_bias_changes_it(self):
+        t_bull = ny_dt(2026, 1, 5, 9, 0)
+        t_bear = ny_dt(2026, 1, 5, 15, 0)
+        bias_result = make_bias_result({"1H": [bias_change("1H", BIAS_BULLISH, t_bull), bias_change("1H", BIAS_BEARISH, t_bear)]})
+
+        event_a = fvg_candidate(zone_id="A", direction=LONG, known_at=t_bull + timedelta(hours=1))
+        event_b = fvg_candidate(zone_id="B", direction=LONG, known_at=t_bull + timedelta(hours=2))
+        event_c = fvg_candidate(zone_id="C", direction=LONG, known_at=t_bear + timedelta(hours=1))
+        result = fvg_result(event_a, event_b, event_c)
+
+        snapshots = {s.event.event_id: s for s in iter_candidate_entry_snapshots(result, EMPTY_LIQUIDITY, bias_result)}
+        self.assertEqual(snapshots[event_a.candidate_id].market_state.bias.global_bias, BIAS_BULLISH)
+        self.assertEqual(snapshots[event_b.candidate_id].market_state.bias.global_bias, BIAS_BULLISH)
+        self.assertEqual(snapshots[event_c.candidate_id].market_state.bias.global_bias, BIAS_BEARISH)
+
+    def test_no_look_ahead_every_market_state_fact_known_at_or_before_event_known_at(self):
+        rng = random.Random(998877)
+        candidates, mitigations = _random_fvg_zone_stories(rng, 25, ny_dt(2026, 1, 5, 9, 0), "nla")
+        liquidity_signals = _random_liquidity_signals(rng, 15, ny_dt(2026, 1, 5, 9, 0), "nla-liq")
+        bias_result = make_bias_result(
+            {
+                "1H": [bias_change("1H", BIAS_BULLISH, ny_dt(2026, 1, 5, 9, 30)), bias_change("1H", BIAS_BEARISH, ny_dt(2026, 1, 6, 3, 0))],
+                "4H": [bias_change("4H", BIAS_BEARISH, ny_dt(2026, 1, 5, 20, 0))],
+            }
+        )
+        fvg_res = fvg_result(*candidates, mitigations=mitigations)
+        liq_res = liquidity_result(*liquidity_signals)
+
+        full_snapshots = {s.event.event_id: s for s in iter_candidate_entry_snapshots(fvg_res, liq_res, bias_result)}
+        all_events = build_entry_events(fvg_res, liq_res)
+
+        checked = 0
+        for cut_event in all_events[::5]:  # a representative sample of cut points, not every one (keeps the test fast)
+            cutoff = cut_event.known_at
+            truncated_fvg_candidates = [c for c in fvg_res.candidates if c.known_at <= cutoff]
+            truncated_mitigations = tuple(m for m in fvg_res.zone_mitigations if m.known_at <= cutoff)
+            truncated_liquidity = [c for c in liq_res.candidates if c.known_at <= cutoff]
+            truncated_bias = make_bias_result(
+                {tf: [c for c in changes if c.known_at <= cutoff] for tf, changes in bias_result.timeframe_changes.items()}
+            )
+            truncated_snapshots = {
+                s.event.event_id: s
+                for s in iter_candidate_entry_snapshots(
+                    fvg_result(*truncated_fvg_candidates, mitigations=truncated_mitigations),
+                    liquidity_result(*truncated_liquidity),
+                    truncated_bias,
+                )
+            }
+            full_state = full_snapshots[cut_event.event_id].market_state
+            truncated_state = truncated_snapshots[cut_event.event_id].market_state
+            self.assertEqual(
+                full_state.active_fvg_selectors_by_direction, truncated_state.active_fvg_selectors_by_direction,
+                f"future data leaked into {cut_event.event_id!r}'s own market state",
+            )
+            self.assertEqual(full_state.bias, truncated_state.bias, f"future bias data leaked into {cut_event.event_id!r}'s own market state")
+            checked += 1
+        self.assertGreater(checked, 0)
+
+
+class BiasIncrementalTrackingEquivalenceTests(unittest.TestCase):
+    """``iter_candidate_entry_snapshots`` tracks HTF bias incrementally
+    (never by calling ``tradelab.bias.bias_at`` per event, which would
+    rescan its own change list from the start every time) -- must agree
+    exactly with a fresh ``bias_at`` call at every real event's own
+    known_at."""
+
+    def test_incremental_bias_matches_bias_at_on_a_randomized_multi_timeframe_timeline(self):
+        base = ny_dt(2026, 1, 5, 9, 0)
+        bias_result = make_bias_result(
+            {
+                "1H": [
+                    bias_change("1H", BIAS_BULLISH, base + timedelta(hours=1)),
+                    bias_change("1H", BIAS_BEARISH, base + timedelta(hours=5)),
+                    bias_change("1H", BIAS_BULLISH, base + timedelta(hours=9)),
+                ],
+                "4H": [
+                    bias_change("4H", BIAS_BEARISH, base + timedelta(hours=3)),
+                    bias_change("4H", BIAS_BULLISH, base + timedelta(hours=7)),
+                ],
+                "1D": [bias_change("1D", BIAS_BEARISH, base + timedelta(hours=6))],
+            }
+        )
+        rng = random.Random(13571113)
+        events = _random_fvg_signals(rng, 60, base, "bias-eq")
+        result = fvg_result(*events)
+
+        for snapshot in iter_candidate_entry_snapshots(result, EMPTY_LIQUIDITY, bias_result):
+            expected = bias_at(bias_result, snapshot.event.known_at)
+            self.assertEqual(snapshot.market_state.bias, expected, f"mismatch at known_at={snapshot.event.known_at!r}")
+
+
+class CandidateEntrySnapshotStructuralTests(unittest.TestCase):
+    def test_snapshot_count_equals_event_count(self):
+        rng = random.Random(2468)
+        candidates, mitigations = _random_fvg_zone_stories(rng, 30, ny_dt(2026, 1, 5, 9, 0), "count")
+        liquidity_signals = _random_liquidity_signals(rng, 30, ny_dt(2026, 1, 5, 9, 0), "count-liq")
+        result_fvg = fvg_result(*candidates, mitigations=mitigations)
+        result_liq = liquidity_result(*liquidity_signals)
+
+        events = build_entry_events(result_fvg, result_liq)
+        snapshots = list(iter_candidate_entry_snapshots(result_fvg, result_liq, EMPTY_BIAS))
+        self.assertEqual(len(snapshots), len(events))
+        self.assertEqual([s.event.event_id for s in snapshots], [e.event_id for e in events])
+
+    def test_empty_inputs_yield_no_snapshots(self):
+        self.assertEqual(list(iter_candidate_entry_snapshots(EMPTY_FVG, EMPTY_LIQUIDITY, EMPTY_BIAS)), [])
+
+    def test_market_state_as_of_matches_the_events_own_known_at(self):
+        touch = fvg_candidate(zone_id="A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        (snapshot,) = list(iter_candidate_entry_snapshots(fvg_result(touch), EMPTY_LIQUIDITY, EMPTY_BIAS))
+        self.assertEqual(snapshot.market_state.as_of, touch.known_at)
+
+    def test_active_fvg_selector_pool_never_exceeds_the_fixed_selector_catalog_size(self):
+        """At most 6 timeframes x 2 source types = 12 possible FVG-family
+        selector strings, system-wide, ever -- bounded by the catalog
+        itself, never by how much history accumulated (the exact
+        property this refactor exists to guarantee)."""
+        rng = random.Random(112233)
+        candidates, mitigations = _random_fvg_zone_stories(rng, 300, ny_dt(2026, 1, 5, 9, 0), "bounded")
+        result = fvg_result(*candidates, mitigations=mitigations)
+        for snapshot in iter_candidate_entry_snapshots(result, EMPTY_LIQUIDITY, EMPTY_BIAS):
+            for direction in (LONG, SHORT):
+                self.assertLessEqual(len(snapshot.market_state.active_fvg_selectors_by_direction[direction]), 12)
 
 
 if __name__ == "__main__":

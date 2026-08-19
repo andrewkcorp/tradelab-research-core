@@ -31,11 +31,12 @@ from tradelab.entry_signal_timeline import (
     SourceKind,
     build_entry_signal_timeline,
 )
+from tradelab.entry_signal_timeline import EntryEventKind
 from tradelab.fvg import BEARISH, BULLISH, FVGDetectionResult, FVGEvent, FVGMitigationEvent, FVGZone, FVGStatus
 from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, FVGEntryCandidateResult
 from tradelab.fvg_entry import SourceType as FVGCandidateSourceType
 from tradelab.liquidity import LiquidityDetectionResult, LiquidityLevel, LiquidityStatus, LiquidityType
-from tradelab.liquidity_entry import LiquidityEntryCandidateResult
+from tradelab.liquidity_entry import CandidatePhase, EntryMode, LiquidityEntryCandidate, LiquidityEntryCandidateResult, SourceFamily
 from tradelab.profile_research_context import (
     PROFILE_WINDOWS,
     _active_pool_stats,
@@ -43,6 +44,7 @@ from tradelab.profile_research_context import (
     _comparison_section,
     _compare_raw_signal_counts,
     _data_wick_counts,
+    _entry_event_model_section,
     _entry_signal_timeline_stats,
     _fvg_event_counts,
     _fvg_ifvg_candidate_counts,
@@ -973,6 +975,24 @@ class ProfileSchemaVersionAndProvenanceEndToEndTests(unittest.TestCase):
             self.assertIn("active_selector_count_including_primary", profile["active_pool_stats"]["global"])
             self.assertIn("required_confluence_selector_count_excluding_primary", profile["active_pool_stats"]["global"])
             self.assertIn("active_signal_instance_count", profile["active_pool_stats"]["global"])
+            self.assertIn("entry_event_model", profile)
+            self.assertIn("persistent_state_fact_counts", profile["entry_event_model"])
+            self.assertIn("fvg_zone_count_total", profile["entry_event_model"]["persistent_state_fact_counts"])
+            self.assertIn("htf_bias_change_count_total", profile["entry_event_model"]["persistent_state_fact_counts"])
+            self.assertIn("entry_event_count_by_kind", profile["entry_event_model"])
+            self.assertEqual(
+                set(profile["entry_event_model"]["entry_event_count_by_kind"]), {"fvg_touch", "ifvg", "liquidity_sweep", "total"}
+            )
+            self.assertIn("candidate_entry_snapshot_count", profile["entry_event_model"])
+            self.assertEqual(
+                profile["entry_event_model"]["candidate_entry_snapshot_count"],
+                profile["entry_event_model"]["entry_event_count_by_kind"]["total"],
+            )
+            self.assertIn("active_persistent_context_at_candidate_timestamps", profile["entry_event_model"])
+            self.assertIn("no_accumulation_evidence", profile["entry_event_model"])
+            self.assertIn("entry_event_count_equals_candidate_snapshot_count", profile["entry_event_model"]["no_accumulation_evidence"])
+            self.assertLessEqual(profile["entry_event_model"]["no_accumulation_evidence"]["max_active_fvg_selectors_observed"], 12)
+            self.assertEqual(profile["entry_event_model"]["no_accumulation_evidence"]["max_possible_fvg_selectors_by_catalog"], 12)
             self.assertEqual(profile["provenance"]["command"], "python3 -m tradelab.profile_research_context --test")
             self.assertEqual(profile["provenance"]["market_artifact_sha256"], profile["market_artifact"]["sha256"])
             self.assertEqual(profile["provenance"]["news_csv_sha256"], profile["news"]["sha256"])
@@ -1028,7 +1048,7 @@ class PhaseCallbackTests(unittest.TestCase):
     hook. Must never appear in, or affect, the deterministic JSON
     output, and must never be required (omitting it changes nothing)."""
 
-    def test_callback_receives_all_five_expected_phases_in_order(self):
+    def test_callback_receives_all_six_expected_phases_in_order(self):
         with tempfile.TemporaryDirectory() as tmp_name:
             tmp = Path(tmp_name)
             manifest_path, news_path = write_valid_fixture(tmp)
@@ -1037,7 +1057,10 @@ class PhaseCallbackTests(unittest.TestCase):
             observed_phases: list[str] = []
             profile_research_context(manifest_path, news_path, output_json, phase_callback=lambda phase, duration: observed_phases.append(phase))
 
-            self.assertEqual(observed_phases, ["preparation", "lifecycle_profiling", "pool_statistics", "serialization", "total"])
+            self.assertEqual(
+                observed_phases,
+                ["preparation", "lifecycle_profiling", "pool_statistics", "entry_event_model", "serialization", "total"],
+            )
 
     def test_callback_receives_non_negative_float_durations(self):
         with tempfile.TemporaryDirectory() as tmp_name:
@@ -1098,6 +1121,78 @@ class PhaseCallbackTests(unittest.TestCase):
             # byte_identical, which would fail the instant any wall-clock duration leaked in.
             for phase_key in ("lifecycle_profiling", "pool_statistics", "serialization", "phase_timings", "phase_timings_seconds"):
                 self.assertNotIn(phase_key, all_keys)
+
+
+def liquidity_candidate_for_model(cid: str, tf: str, direction: str, known_at: datetime) -> LiquidityEntryCandidate:
+    return LiquidityEntryCandidate(
+        candidate_id=cid,
+        source_family=SourceFamily.SWING_EQUAL,
+        timeframe=tf,
+        level_id="l1",
+        liquidity_type=LiquidityType.SWING_HIGH,
+        side="high" if direction == "short" else "low",
+        lower=100.0,
+        upper=100.0,
+        trigger_phase=CandidatePhase.TAKE,
+        entry_mode=EntryMode.REVERSAL,
+        direction=direction,
+        timestamp=known_at,
+        known_at=known_at,
+    )
+
+
+class EntryEventModelSectionTests(unittest.TestCase):
+    """``_entry_event_model_section``: persistent-state fact counts,
+    atomic EntryEvent counts by kind, candidate-entry snapshot count,
+    active-persistent-context distribution, and machine-checkable
+    no-accumulation evidence -- see task 036's own requirement to
+    report these separately from the older, EntrySignal-based
+    ``active_pool_stats`` section."""
+
+    def test_persistent_state_fact_counts_and_event_counts_by_kind(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        touch = fvg_touch_candidate("z1", "1m", "long", FVGContactType.PARTIAL_TOUCH, t0)
+        ifvg = fvg_ifvg_candidate("z2", "1m", "long", t0 + timedelta(minutes=1))
+        sweep = liquidity_candidate_for_model("sw1", "1m", "long", t0 + timedelta(minutes=2))
+
+        fvg_results = {"1m": FVGDetectionResult(zones=[zone("z1", "1m", BULLISH), zone("z2", "1m", BULLISH)], events=[])}
+        fvg_entry_result = FVGEntryCandidateResult(candidates=[touch, ifvg])
+        liquidity_entry_result = LiquidityEntryCandidateResult(candidates=[sweep])
+        htf_bias_result = HTFBiasResult(timeframe_changes={"1H": [], "4H": [], "1D": []})
+
+        section = _entry_event_model_section(fvg_results, fvg_entry_result, liquidity_entry_result, htf_bias_result)
+
+        self.assertEqual(section["persistent_state_fact_counts"], {"fvg_zone_count_total": 2, "htf_bias_change_count_total": 0})
+        self.assertEqual(section["entry_event_count_by_kind"], {"fvg_touch": 1, "ifvg": 1, "liquidity_sweep": 1, "total": 3})
+        self.assertEqual(section["candidate_entry_snapshot_count"], 3)
+
+    def test_no_accumulation_evidence_holds_on_a_realistic_fixture(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        candidates = [
+            fvg_touch_candidate(f"z{i}", tf, direction, FVGContactType.PARTIAL_TOUCH, t0 + timedelta(minutes=i))
+            for i, (tf, direction) in enumerate([("1m", "long"), ("5m", "short"), ("15m", "long"), ("1m", "short")])
+        ]
+        fvg_entry_result = FVGEntryCandidateResult(candidates=candidates)
+        liquidity_entry_result = LiquidityEntryCandidateResult(candidates=[])
+        htf_bias_result = HTFBiasResult(timeframe_changes={"1H": [], "4H": [], "1D": []})
+
+        section = _entry_event_model_section({}, fvg_entry_result, liquidity_entry_result, htf_bias_result)
+
+        self.assertTrue(section["no_accumulation_evidence"]["entry_event_count_equals_candidate_snapshot_count"])
+        self.assertLessEqual(section["no_accumulation_evidence"]["max_active_fvg_selectors_observed"], 12)
+        self.assertEqual(section["no_accumulation_evidence"]["max_possible_fvg_selectors_by_catalog"], 12)
+
+    def test_empty_inputs_report_all_zero_and_still_hold_the_evidence(self):
+        fvg_entry_result = FVGEntryCandidateResult(candidates=[])
+        liquidity_entry_result = LiquidityEntryCandidateResult(candidates=[])
+        htf_bias_result = HTFBiasResult(timeframe_changes={"1H": [], "4H": [], "1D": []})
+
+        section = _entry_event_model_section({}, fvg_entry_result, liquidity_entry_result, htf_bias_result)
+
+        self.assertEqual(section["entry_event_count_by_kind"]["total"], 0)
+        self.assertEqual(section["candidate_entry_snapshot_count"], 0)
+        self.assertTrue(section["no_accumulation_evidence"]["entry_event_count_equals_candidate_snapshot_count"])
+        self.assertEqual(section["no_accumulation_evidence"]["max_active_fvg_selectors_observed"], 0)
 
 
 class NoRealDataInRepoTests(unittest.TestCase):

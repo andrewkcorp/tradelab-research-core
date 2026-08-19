@@ -169,9 +169,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
 from enum import Enum
 from itertools import groupby
-from typing import Iterator
+from typing import Iterator, Mapping
 from zoneinfo import ZoneInfo
 
+from tradelab.bias import BEARISH, BULLISH, NEUTRAL, BiasSnapshot, HTFBiasResult, TimeframeBiasChange
+from tradelab.bias import SUPPORTED_TIMEFRAMES as _BIAS_TIMEFRAMES
 from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, FVGEntryCandidateResult, FVGMitigationEvent
 from tradelab.fvg_entry import SourceType as FVGSourceType
 from tradelab.liquidity_entry import LiquidityEntryCandidate, LiquidityEntryCandidateResult
@@ -821,6 +823,15 @@ class _ActivePoolRefCounter:
     def instance_count(self, direction: str) -> int:
         return self._instance_counts.get(direction, 0)
 
+    def active_selectors(self, direction: str) -> frozenset[str]:
+        """The actual set of selector strings currently active in
+        ``direction`` -- O(number of currently active unique selectors),
+        never O(pool size): reads back the counter's own keys, never
+        rescans any signal pool. Used by ``MarketStateSnapshot`` (see
+        ``iter_candidate_entry_snapshots``), which needs real selector
+        identities, not just a count."""
+        return frozenset(self._selector_counts.get(direction, {}).keys())
+
 
 class _RefCountingDict(dict):
     """A drop-in replacement for the plain ``{}`` used at every level of
@@ -960,3 +971,300 @@ def iter_active_pool_scalar_snapshots(timeline: EntrySignalTimeline) -> Iterator
                 required_confluence_selector_count_excluding_primary=active_selector_count - 1,
                 active_signal_instance_count=instance_count,
             )
+
+
+# ---------------------------------------------------------------------------
+# Market state vs. entry events (this task): the ``EntrySignal``/``query_
+# active_signals``/``iter_active_signal_snapshots`` model above treats every
+# FVG touch, iFVG, and liquidity signal as "active until specifically
+# invalidated" -- correct for the FVG *zone*'s own structural lifecycle
+# (formalized on purpose, see module docstring), but semantically wrong when
+# the same rule is applied to the *event* of a touch/sweep itself: a real-
+# MNQ profile showed a median 219 simultaneously "active" required-
+# confluence selectors and 255,886 "active" signal instances at real primary
+# signal timestamps -- old, one-off historical occurrences that nothing
+# later specifically invalidated, not a genuinely large simultaneous market
+# state. This is not a performance bug (``iter_active_pool_scalar_snapshots``
+# above already makes computing that number fast); it is that the number
+# itself does not mean what a future strategy enumerator needs it to mean.
+#
+# This section adds a second, explicit, additive API -- ``EntryEvent``/
+# ``MarketStateSnapshot``/``CandidateEntrySnapshot`` -- that never changes
+# ``EntrySignal``/``query_active_signals``/``iter_active_signal_snapshots``/
+# ``iter_active_pool_scalar_snapshots`` themselves (every existing consumer
+# of those keeps working, unchanged). See ``docs/market-state-vs-entry-
+# events-v1.md`` for the full rationale; in short:
+#
+# - A **persistent state fact** (an FVG zone's own active/suspended/
+#   retired structural status, or the current HTF bias) genuinely does not
+#   expire on its own -- it stays valid, unbounded, until its own explicit
+#   structural terminal rule fires (a same-timeframe opposite challenger's
+#   resolution, or its own inversion/mitigation; a bias change). This is
+#   exactly the FVG suspend/restore/retire engine ``_apply_fvg_batch``
+#   already implements, and ``tradelab.bias.bias_at``'s own contract --
+#   reused here completely unmodified, never reimplemented, so this
+#   refactor cannot introduce semantic drift from the already-correct,
+#   already-tested lifecycle rules.
+# - An **atomic entry event** (an FVG touch, a confirmed iFVG, or a
+#   liquidity sweep) is known exactly once, at its own ``known_at`` -- it
+#   may be a strategy's primary trigger *at that instant*, but there is no
+#   function here that lets a caller ask "which events are still eligible
+#   as of some later T" the way ``query_active_signals`` does for
+#   ``EntrySignal``. A historical event that nothing later specifically
+#   invalidated does not thereby remain an eligible primary indefinitely --
+#   it simply is not offered again after its own instant.
+# ---------------------------------------------------------------------------
+
+
+class EntryEventKind(str, Enum):
+    FVG_TOUCH = "fvg_touch"
+    IFVG = "ifvg"
+    LIQUIDITY_SWEEP = "liquidity_sweep"
+
+
+@dataclass(frozen=True)
+class EntryEvent:
+    """One atomic, one-shot market-entry trigger, known exactly once at
+    its own ``known_at`` -- an FVG touch, a confirmed iFVG, or a
+    liquidity sweep (never a data wick -- spec 4.3, TP-only, and this
+    module is never given data wicks as an input to begin with). Never
+    an everlasting/reusable confluence fact: ``iter_candidate_entry_
+    snapshots`` yields exactly one ``CandidateEntrySnapshot`` per
+    ``EntryEvent``, at its own ``known_at`` -- there is no query
+    anywhere in this section that re-offers an ``EntryEvent`` as a
+    fresh primary trigger at any later instant, unlike ``EntrySignal``/
+    ``query_active_signals``'s persist-until-invalidated model above.
+
+    ``event_id`` is the underlying candidate's own ``candidate_id`` --
+    stable, deterministic provenance, identical to what ``EntrySignal``
+    uses for the exact same fact (built via the exact same ``_signal_
+    from_fvg``/``_signal_from_liquidity`` normalization, so ``selector``/
+    ``timeframe``/``direction``/``known_at`` can never drift from what
+    ``EntrySignal`` would report). ``zone_id``/``level_id`` are
+    mutually exclusive FVG/liquidity provenance -- ``None`` for
+    whichever family does not apply."""
+
+    event_id: str
+    kind: EntryEventKind
+    selector: str
+    timeframe: str
+    direction: str
+    timestamp: datetime
+    known_at: datetime
+    zone_id: str | None
+    level_id: str | None
+    source: FVGEntryCandidate | LiquidityEntryCandidate
+
+
+@dataclass(frozen=True)
+class MarketStateSnapshot:
+    """Persistent, structural market state as of exactly one instant --
+    never a list of historical events, never accumulated across
+    ``EntryEvent``s. Two components, both genuinely, unboundedly
+    persistent by design (a real structural fact, not a cap or
+    approximation -- see ``docs/market-state-vs-entry-events-v1.md``):
+
+    - ``active_fvg_selectors_by_direction``: for each direction, the
+      set of FVG-family selectors (``"fvg-{timeframe}-{fvg_touch|
+      ifvg}"``) with at least one zone that is currently structurally
+      ACTIVE -- not currently suspended by a same-timeframe opposite-
+      direction challenger, and not permanently retired by its own
+      resolution. This is exactly the same active/suspended/retired FVG
+      zone lifecycle ``_apply_fvg_batch`` already implements (reused
+      here completely unmodified), just exposed as *state* rather than
+      folded into an ever-accumulating list of individual touch/iFVG
+      facts. At most 6 timeframes x 2 source types = 12 possible
+      strings per direction, system-wide, ever -- bounded by the FVG-
+      family selector catalog itself, never by how much history has
+      accumulated.
+    - ``bias``: the HTF bias snapshot (``tradelab.bias.BiasSnapshot``,
+      identical to what ``tradelab.bias.bias_at`` would return at this
+      same instant -- proven equivalent by randomized test, computed
+      here incrementally instead of by calling ``bias_at`` per event,
+      since that function's own linear rescan-from-the-start would
+      reintroduce an ``O(events x bias changes so far)`` blowup at
+      real-MNQ scale) as of this exact instant.
+
+    Liquidity has **no persistent role here at all**, by design (spec,
+    this task): a liquidity sweep is only ever a one-shot ``EntryEvent``,
+    never reusable confluence context for a later, unrelated event --
+    unlike the older ``EntrySignal``/``query_active_signals`` model,
+    where a liquidity signal stayed "active" until a same-selector
+    opposite signal specifically invalidated it, letting old sweeps
+    silently become perpetual context."""
+
+    as_of: datetime
+    active_fvg_selectors_by_direction: Mapping[str, frozenset[str]]
+    bias: BiasSnapshot
+
+
+@dataclass(frozen=True)
+class CandidateEntrySnapshot:
+    """The deterministic join of exactly one real ``EntryEvent`` with
+    the ``MarketStateSnapshot`` known at that event's own ``known_at``
+    -- the sole, explicit API for "what could this event's own strategy
+    trigger see as context." One snapshot per real event, in the
+    timeline's own chronological order -- never more, never re-derived
+    later, so it is structurally impossible to accidentally treat an
+    ``EntryEvent`` as an indefinitely active selector: there is no
+    function anywhere in this section that returns "every event still
+    eligible as of instant T" the way ``query_active_signals`` does for
+    ``EntrySignal``."""
+
+    event: EntryEvent
+    market_state: MarketStateSnapshot
+
+
+def _entry_event_from_signal(signal: EntrySignal) -> EntryEvent:
+    if signal.source_kind == SourceKind.FVG:
+        fvg_candidate: FVGEntryCandidate = signal.source
+        kind = EntryEventKind.IFVG if fvg_candidate.source_type == FVGSourceType.IFVG else EntryEventKind.FVG_TOUCH
+        zone_id, level_id = fvg_candidate.zone_id, None
+    else:
+        liquidity_candidate: LiquidityEntryCandidate = signal.source
+        kind = EntryEventKind.LIQUIDITY_SWEEP
+        zone_id, level_id = None, liquidity_candidate.level_id
+    return EntryEvent(
+        event_id=signal.candidate_id,
+        kind=kind,
+        selector=signal.selector,
+        timeframe=signal.timeframe,
+        direction=signal.direction,
+        timestamp=signal.timestamp,
+        known_at=signal.known_at,
+        zone_id=zone_id,
+        level_id=level_id,
+        source=signal.source,
+    )
+
+
+def build_entry_events(
+    fvg_result: FVGEntryCandidateResult, liquidity_result: LiquidityEntryCandidateResult
+) -> list[EntryEvent]:
+    """Every FVG touch, confirmed iFVG, and liquidity sweep, normalized
+    into one atomic ``EntryEvent`` each -- chronological by ``known_at``
+    (ties broken by ``event_id``, matching ``build_entry_signal_
+    timeline``'s own ``EntrySignal`` ordering convention exactly).
+    Reuses the exact same ``_signal_from_fvg``/``_signal_from_liquidity``
+    normalization ``build_entry_signal_timeline`` uses, so an event's
+    ``selector``/``timeframe``/``direction``/``known_at`` are always
+    identical to what ``EntrySignal`` would report for the same
+    underlying fact -- this function never re-derives them
+    independently. Zone mitigations are never represented as an
+    ``EntryEvent`` -- exactly like they are never an ``EntrySignal``
+    either: a pure zone-resolution fact, never itself a new confluence
+    (see ``tradelab.fvg.FVGMitigationEvent``'s own docstring)."""
+    signals = [_signal_from_fvg(c) for c in fvg_result.candidates] + [
+        _signal_from_liquidity(c) for c in liquidity_result.candidates
+    ]
+    events = [_entry_event_from_signal(s) for s in signals]
+    events.sort(key=lambda e: (e.known_at, e.event_id))
+    return events
+
+
+def _merge_confluence_streams(
+    fvg_signals: list[EntrySignal],
+    mitigations: list[FVGMitigationEvent],
+    bias_changes: list[TimeframeBiasChange],
+    liquidity_signals: list[EntrySignal],
+):
+    """Yields ``(fvg_signal_batch, mitigation_batch, bias_change_batch,
+    liquidity_batch)`` tuples, one per distinct ``known_at`` across all
+    four streams combined, chronological -- generalizes ``_merge_known_
+    at_groups`` to the two additional streams ``iter_candidate_entry_
+    snapshots`` needs (bias changes, liquidity events), with the exact
+    same guarantee: batch members sharing one ``known_at`` never affect
+    each other, only strictly earlier batches do."""
+    tagged = (
+        [(s.known_at, s.candidate_id, 0, s) for s in fvg_signals]
+        + [(m.known_at, m.zone_id, 1, m) for m in mitigations]
+        + [(c.known_at, c.timeframe, 2, c) for c in bias_changes]
+        + [(s.known_at, s.candidate_id, 3, s) for s in liquidity_signals]
+    )
+    tagged.sort(key=lambda t: (t[0], t[2], t[1]))
+    for _known_at, group_iter in groupby(tagged, key=lambda t: t[0]):
+        group = list(group_iter)
+        yield (
+            [t[3] for t in group if t[2] == 0],
+            [t[3] for t in group if t[2] == 1],
+            [t[3] for t in group if t[2] == 2],
+            [t[3] for t in group if t[2] == 3],
+        )
+
+
+def iter_candidate_entry_snapshots(
+    fvg_result: FVGEntryCandidateResult,
+    liquidity_result: LiquidityEntryCandidateResult,
+    htf_bias_result: HTFBiasResult,
+) -> Iterator[CandidateEntrySnapshot]:
+    """Yield one ``CandidateEntrySnapshot`` per real ``EntryEvent`` (see
+    ``build_entry_events``), in chronological order -- the deterministic
+    join of that event with the ``MarketStateSnapshot`` known at its own
+    ``known_at``, and the primary, intended entry point for future
+    strategy-discovery confluence semantics (spec, this task).
+
+    One linear forward sweep, merging FVG signals, zone mitigations,
+    HTF bias changes, and liquidity signals by ``known_at``
+    (``_merge_confluence_streams``). FVG zone state is tracked via the
+    exact same, completely unmodified ``_apply_fvg_batch`` engine every
+    other function in this module already uses (never reimplemented --
+    same suspend/restore/retire/mitigation-resolution rules, so this
+    cannot semantically drift from them), wrapped in a ``_RefCountingDict``
+    so reading ``active_fvg_selectors_by_direction`` is ``O(1)`` per
+    snapshot rather than rescanning the whole active pool (same
+    technique as ``iter_active_pool_scalar_snapshots``). HTF bias is
+    tracked incrementally (never by calling ``tradelab.bias.bias_at``
+    per event, which would rescan from the start of its own change list
+    every time -- proven exactly equivalent to ``bias_at`` by randomized
+    test instead). Liquidity signals never touch FVG or bias state at
+    all (no persistent role -- see ``MarketStateSnapshot``'s own
+    docstring); they only ever appear as the primary event of their own,
+    single snapshot. Total: ``O(N log N)``, memory ``O(number of
+    currently active unique FVG selectors)`` -- never ``O(number of
+    snapshots x active pool size)``.
+    """
+    fvg_signals = [_signal_from_fvg(c) for c in fvg_result.candidates]
+    liquidity_signals = [_signal_from_liquidity(c) for c in liquidity_result.candidates]
+    bias_changes = [change for timeframe in _BIAS_TIMEFRAMES for change in htf_bias_result.timeframe_changes[timeframe]]
+
+    counter = _ActivePoolRefCounter()
+    fvg_active: dict[str, dict[str, dict[str, EntrySignal]]] = _RefCountingDict(counter)
+    fvg_suspended: dict[str, EntrySignal] = {}
+    fvg_suspended_by: dict[str, SignalSuspension] = {}
+    fvg_pending_resolution: dict[str, list[str]] = {}
+    fvg_touch_by_zone: dict[str, tuple[str, str]] = {}
+
+    bias_timeframe_states: dict[str, str] = {tf: NEUTRAL for tf in _BIAS_TIMEFRAMES}
+    bias_global = NEUTRAL
+
+    for fvg_batch, mitigation_batch, bias_batch, liquidity_batch in _merge_confluence_streams(
+        fvg_signals, fvg_result.zone_mitigations, bias_changes, liquidity_signals
+    ):
+        if fvg_batch or mitigation_batch:
+            _apply_fvg_batch(fvg_batch, mitigation_batch, fvg_active, fvg_suspended, fvg_suspended_by, fvg_pending_resolution, fvg_touch_by_zone)
+
+        if bias_batch:
+            for change in bias_batch:
+                bias_timeframe_states[change.timeframe] = change.state
+            # Mirrors tradelab.bias.bias_at's own combine rule exactly
+            # (proven equivalent by randomized test) -- never re-derived
+            # differently here.
+            directions = set(bias_timeframe_states.values())
+            if BULLISH in directions and BEARISH not in directions:
+                bias_global = BULLISH
+            elif BEARISH in directions and BULLISH not in directions:
+                bias_global = BEARISH
+            else:
+                bias_global = NEUTRAL
+
+        real_events = fvg_batch + liquidity_batch
+        if not real_events:
+            continue
+
+        market_state = MarketStateSnapshot(
+            as_of=real_events[0].known_at,
+            active_fvg_selectors_by_direction={LONG: counter.active_selectors(LONG), SHORT: counter.active_selectors(SHORT)},
+            bias=BiasSnapshot(timeframe_states=dict(bias_timeframe_states), global_bias=bias_global),
+        )
+        for signal in real_events:
+            yield CandidateEntrySnapshot(event=_entry_event_from_signal(signal), market_state=market_state)
