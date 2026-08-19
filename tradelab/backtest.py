@@ -154,11 +154,13 @@ re-running a single detector per strategy.
 """
 from __future__ import annotations
 
+import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
-from typing import Mapping
+from typing import Callable, Mapping
 
 from tradelab.aggregate import SUPPORTED_TIMEFRAMES as _AGGREGATE_TIMEFRAMES
 from tradelab.aggregate import aggregate_bars
@@ -334,6 +336,29 @@ class _OpenPosition:
     sl_candidate: SLTargetCandidate
 
 
+def _peak_rss_bytes() -> int | None:
+    """Best-effort peak (not current) resident set size of this process,
+    in bytes, since process start -- ``None`` if unavailable (``resource``
+    is POSIX-only; never fabricated on platforms without it). This is
+    ``resource.getrusage(...).ru_maxrss``, a monotonically non-decreasing
+    high-water mark for the *whole process*, not a per-phase delta --
+    sampling it after a phase completes reports "the peak RSS observed by
+    the end of this phase," which still pinpoints which phase pushes
+    memory up, but two phases both reporting a similar number does not
+    mean either phase is itself cheap; it may mean an earlier phase's
+    peak was never released. ``ru_maxrss`` is kibibytes on Linux but
+    already bytes on macOS (a well-known platform inconsistency in the
+    POSIX ``getrusage`` API) -- normalized to bytes here so every caller
+    gets one consistent unit regardless of platform.
+    """
+    try:
+        import resource
+    except ImportError:
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak if sys.platform == "darwin" else peak * 1024
+
+
 def prepare_backtest_context(
     bars_1m: list[Bar1m],
     news_events: list[NewsEvent],
@@ -341,6 +366,7 @@ def prepare_backtest_context(
     tick_size: float = DEFAULT_TICK_SIZE,
     pivot_strength: int,
     reclaim_window_bars: int,
+    phase_callback: Callable[[str, float, int | None], None] | None = None,
 ) -> PreparedBacktestContext:
     """Validate ``bars_1m`` and run every strategy-independent detector
     exactly once, returning the result as an auditable, reusable
@@ -352,6 +378,24 @@ def prepare_backtest_context(
     ``tradelab.session_liquidity`` already enforce, since both are meant
     to be swept by a future parameter grid) are passed straight through
     to every detector that needs them.
+
+    ``phase_callback``, if given, is called with ``(phase_name,
+    duration_seconds, peak_rss_bytes)`` as each diagnostic phase
+    completes, in this exact order: ``"1m_validation_loading"``,
+    ``"timeframe_aggregation"``, one ``"fvg_detection:{timeframe}"`` per
+    native FVG timeframe, ``"fvg_entry_candidate_construction"``, one
+    ``"liquidity_detection:swing_equal:{timeframe}"`` per native
+    liquidity timeframe, one ``"liquidity_detection:session:{timeframe}"``
+    per session-liquidity timeframe,
+    ``"liquidity_entry_candidate_construction"``, ``"data_wick_
+    detection"``, ``"htf_bias_construction"``,
+    ``"entry_signal_timeline_construction"``, then ``"total"``. This is
+    purely a diagnostic, side-effecting hook (see ``tradelab.diagnose_
+    context_preparation``) -- it changes no detector's inputs, outputs,
+    or call order, and every phase below runs exactly the same
+    computation, in exactly the same order, whether or not a callback is
+    given; ``peak_rss_bytes`` is ``None`` where unavailable (see
+    ``_peak_rss_bytes``).
     """
     if tick_size <= 0:
         raise ValueError(f"tick_size must be positive, got {tick_size!r}")
@@ -360,43 +404,81 @@ def prepare_backtest_context(
     if not isinstance(reclaim_window_bars, int) or reclaim_window_bars < 1:
         raise ValueError(f"reclaim_window_bars must be a positive integer, got {reclaim_window_bars!r}")
 
+    def _report(phase: str, phase_start: float) -> None:
+        if phase_callback is not None:
+            phase_callback(phase, time.perf_counter() - phase_start, _peak_rss_bytes())
+
+    total_start = time.perf_counter()
+
     # Snapshot the inputs into tuples *before* anything else runs, so a
     # caller mutating the list they originally passed in can never
     # retroactively change what this context describes or desynchronize
     # it from the facts already computed from the original data (see
     # PreparedBacktestContext's own docstring).
+    validation_start = time.perf_counter()
     bars_1m = tuple(bars_1m)
     news_events = tuple(news_events)
 
     validate_bars(bars_1m)
-    candles = _build_candles(bars_1m)
+    candles: dict[str, list] = {"1m": [from_bar1m(b) for b in bars_1m]}
+    _report("1m_validation_loading", validation_start)
 
-    fvg_results: dict[str, FVGDetectionResult] = {
-        tf: detect_fvgs(candles[tf], tf, tick_size=tick_size) for tf in _FVG_TIMEFRAMES
-    }
+    # tradelab.aggregate.SUPPORTED_TIMEFRAMES is exactly {"5m","15m","1H",
+    # "4H","1D"} -- every native FVG/liquidity timeframe except 1m, which
+    # aggregate_bars does not (and cannot) produce from itself.
+    aggregation_start = time.perf_counter()
+    for tf in _AGGREGATE_TIMEFRAMES:
+        candles[tf] = [from_aggregated_bar(b) for b in aggregate_bars(bars_1m, tf)]
+    _report("timeframe_aggregation", aggregation_start)
+
+    fvg_results: dict[str, FVGDetectionResult] = {}
+    for tf in sorted(_FVG_TIMEFRAMES):
+        tf_start = time.perf_counter()
+        fvg_results[tf] = detect_fvgs(candles[tf], tf, tick_size=tick_size)
+        _report(f"fvg_detection:{tf}", tf_start)
+
+    fvg_entry_start = time.perf_counter()
     touch_results = {
         tf: detect_fvg_touch_events(candles[tf], fvg_results[tf], tf) for tf in _FVG_ENTRY_TIMEFRAMES
     }
     fvg_entry_result = detect_fvg_entry_candidates(
         {tf: fvg_results[tf] for tf in _FVG_ENTRY_TIMEFRAMES}, touch_results
     )
+    _report("fvg_entry_candidate_construction", fvg_entry_start)
 
-    swing_equal_results: dict[str, LiquidityDetectionResult] = {
-        tf: detect_liquidity(candles[tf], tf, pivot_strength=pivot_strength, reclaim_window_bars=reclaim_window_bars, tick_size=tick_size)
-        for tf in _LIQUIDITY_TIMEFRAMES
-    }
-    session_results: dict[str, LiquidityDetectionResult] = {
-        tf: detect_session_liquidity(candles[tf], tf, reclaim_window_bars=reclaim_window_bars) for tf in _SESSION_TIMEFRAMES
-    }
+    swing_equal_results: dict[str, LiquidityDetectionResult] = {}
+    for tf in sorted(_LIQUIDITY_TIMEFRAMES):
+        tf_start = time.perf_counter()
+        swing_equal_results[tf] = detect_liquidity(
+            candles[tf], tf, pivot_strength=pivot_strength, reclaim_window_bars=reclaim_window_bars, tick_size=tick_size
+        )
+        _report(f"liquidity_detection:swing_equal:{tf}", tf_start)
+
+    session_results: dict[str, LiquidityDetectionResult] = {}
+    for tf in sorted(_SESSION_TIMEFRAMES):
+        tf_start = time.perf_counter()
+        session_results[tf] = detect_session_liquidity(candles[tf], tf, reclaim_window_bars=reclaim_window_bars)
+        _report(f"liquidity_detection:session:{tf}", tf_start)
+
+    liquidity_entry_start = time.perf_counter()
     liquidity_entry_result = detect_liquidity_entry_candidates(
         {tf: swing_equal_results[tf] for tf in _LIQUIDITY_ENTRY_TIMEFRAMES}, session_results
     )
+    _report("liquidity_entry_candidate_construction", liquidity_entry_start)
 
+    data_wick_start = time.perf_counter()
     data_wick_result: DataWickDetectionResult = detect_data_wicks(candles["1m"], news_events, tick_size=tick_size)
+    _report("data_wick_detection", data_wick_start)
 
+    htf_bias_start = time.perf_counter()
     htf_bias_result = compute_htf_bias({tf: fvg_results[tf] for tf in _BIAS_TIMEFRAMES})
+    _report("htf_bias_construction", htf_bias_start)
 
+    timeline_start = time.perf_counter()
     timeline = build_entry_signal_timeline(fvg_entry_result, liquidity_entry_result)
+    _report("entry_signal_timeline_construction", timeline_start)
+
+    _report("total", total_start)
 
     return PreparedBacktestContext(
         bars_1m=bars_1m,
@@ -501,16 +583,6 @@ def backtest_prepared_strategy(strategy: StrategySpec, context: PreparedBacktest
         open_unresolved_count=open_unresolved_count,
         gross_pnl_points_total=gross_pnl_points_total,
     )
-
-
-def _build_candles(bars_1m: tuple[Bar1m, ...]) -> dict[str, list]:
-    # tradelab.aggregate.SUPPORTED_TIMEFRAMES is exactly {"5m","15m","1H",
-    # "4H","1D"} -- every native FVG/liquidity timeframe except 1m, which
-    # aggregate_bars does not (and cannot) produce from itself.
-    candles = {"1m": [from_bar1m(b) for b in bars_1m]}
-    for tf in _AGGREGATE_TIMEFRAMES:
-        candles[tf] = [from_aggregated_bar(b) for b in aggregate_bars(bars_1m, tf)]
-    return candles
 
 
 def _evaluate_entry(

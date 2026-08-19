@@ -867,5 +867,113 @@ class PrepareBacktestContextValidationTests(unittest.TestCase):
             prepare_backtest_context(bad_bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
 
 
+_EXPECTED_PHASE_ORDER = [
+    "1m_validation_loading",
+    "timeframe_aggregation",
+    "fvg_detection:15m",
+    "fvg_detection:1D",
+    "fvg_detection:1H",
+    "fvg_detection:1m",
+    "fvg_detection:4H",
+    "fvg_detection:5m",
+    "fvg_entry_candidate_construction",
+    "liquidity_detection:swing_equal:15m",
+    "liquidity_detection:swing_equal:1D",
+    "liquidity_detection:swing_equal:1H",
+    "liquidity_detection:swing_equal:1m",
+    "liquidity_detection:swing_equal:4H",
+    "liquidity_detection:swing_equal:5m",
+    "liquidity_detection:session:15m",
+    "liquidity_detection:session:1m",
+    "liquidity_detection:session:5m",
+    "liquidity_entry_candidate_construction",
+    "data_wick_detection",
+    "htf_bias_construction",
+    "entry_signal_timeline_construction",
+    "total",
+]
+
+
+class PhaseCallbackTests(unittest.TestCase):
+    """``prepare_backtest_context``'s optional ``phase_callback`` --
+    diagnostic-only instrumentation for ``tradelab.diagnose_context_
+    preparation``. Must never change what ``PreparedBacktestContext`` a
+    given input produces, must fire in a fixed, deterministic order
+    (``_FVG_TIMEFRAMES``/``_LIQUIDITY_TIMEFRAMES``/``_SESSION_
+    TIMEFRAMES`` are ``frozenset``s -- sorted explicitly so hash-order
+    randomization can never reorder these calls across processes), and
+    must report sane (non-negative) durations."""
+
+    def test_callback_receives_every_phase_in_the_exact_deterministic_order(self):
+        observed = []
+        prepare_backtest_context(
+            long_base_bars(), [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS,
+            phase_callback=lambda phase, duration, peak_rss: observed.append(phase),
+        )
+        self.assertEqual(observed, _EXPECTED_PHASE_ORDER)
+
+    def test_phase_order_is_identical_across_repeated_calls(self):
+        first_run: list[str] = []
+        second_run: list[str] = []
+        prepare_backtest_context(
+            long_base_bars(), [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS,
+            phase_callback=lambda phase, duration, peak_rss: first_run.append(phase),
+        )
+        prepare_backtest_context(
+            long_base_bars(), [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS,
+            phase_callback=lambda phase, duration, peak_rss: second_run.append(phase),
+        )
+        self.assertEqual(first_run, second_run)
+
+    def test_each_phase_name_is_reported_exactly_once(self):
+        observed = []
+        prepare_backtest_context(
+            long_base_bars(), [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS,
+            phase_callback=lambda phase, duration, peak_rss: observed.append(phase),
+        )
+        self.assertEqual(len(observed), len(set(observed)))
+
+    def test_durations_are_non_negative_floats_and_total_covers_the_sub_phases(self):
+        durations: dict[str, float] = {}
+        prepare_backtest_context(
+            long_base_bars(), [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS,
+            phase_callback=lambda phase, duration, peak_rss: durations.__setitem__(phase, duration),
+        )
+        for phase, duration in durations.items():
+            self.assertIsInstance(duration, float, f"{phase} duration should be a float")
+            self.assertGreaterEqual(duration, 0.0, f"{phase} duration should never be negative")
+        sub_phase_total = sum(d for p, d in durations.items() if p != "total")
+        self.assertGreaterEqual(durations["total"], sub_phase_total)
+
+    def test_peak_rss_is_none_or_a_non_negative_int(self):
+        peak_rss_values = []
+        prepare_backtest_context(
+            long_base_bars(), [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS,
+            phase_callback=lambda phase, duration, peak_rss: peak_rss_values.append(peak_rss),
+        )
+        for value in peak_rss_values:
+            if value is not None:
+                self.assertIsInstance(value, int)
+                self.assertGreaterEqual(value, 0)
+
+    def test_omitting_the_callback_produces_an_identical_context(self):
+        bars = long_base_bars()
+        with_callback = prepare_backtest_context(
+            bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS,
+            phase_callback=lambda phase, duration, peak_rss: None,
+        )
+        without_callback = prepare_backtest_context(bars, [], pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+
+        self.assertEqual(with_callback.bars_1m, without_callback.bars_1m)
+        self.assertEqual(dict(with_callback.fvg_results), dict(without_callback.fvg_results))
+        self.assertEqual(dict(with_callback.swing_equal_liquidity_results), dict(without_callback.swing_equal_liquidity_results))
+        self.assertEqual(dict(with_callback.session_liquidity_results), dict(without_callback.session_liquidity_results))
+        self.assertEqual(with_callback.fvg_entry_result, without_callback.fvg_entry_result)
+        self.assertEqual(with_callback.liquidity_entry_result, without_callback.liquidity_entry_result)
+        self.assertEqual(with_callback.data_wick_result, without_callback.data_wick_result)
+        self.assertEqual(with_callback.htf_bias_result, without_callback.htf_bias_result)
+        self.assertEqual(with_callback.timeline, without_callback.timeline)
+
+
 if __name__ == "__main__":
     unittest.main()
