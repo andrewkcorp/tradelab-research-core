@@ -457,8 +457,14 @@ class FVGSuspensionAndRestorationTests(unittest.TestCase):
         )
 
     def test_nested_fvg_conflicts_resolve_deterministically_in_order(self):
-        # A suspended by B; B (while itself suspended by C) later inverts,
-        # restoring A; C later inverts too, restoring B's own touch.
+        # A suspended by B's touch; B's touch (while itself suspended by
+        # C's touch) later inverts, retiring itself (terminal -- it is no
+        # longer a valid bearish FVG at all) and restoring A. C's touch
+        # later inverts too, retiring itself the same way -- but by then
+        # its own zone's touch is the *only* thing it could restore, and
+        # that touch (B's) was already permanently retired at B's own
+        # inversion, not by C -- so nothing is left for C's inversion to
+        # restore. B's touch never comes back.
         a = fvg_candidate(zone_id="Z-A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
         b_touch, b_ifvg = fvg_touch_then_inversion("Z-B", "1m", SHORT, ny_dt(2026, 1, 5, 11, 0), ny_dt(2026, 1, 5, 13, 0))
         c_touch, c_ifvg = fvg_touch_then_inversion("Z-C", "1m", LONG, ny_dt(2026, 1, 5, 12, 0), ny_dt(2026, 1, 5, 14, 0))
@@ -477,7 +483,9 @@ class FVGSuspensionAndRestorationTests(unittest.TestCase):
         after_c_long = query_active_signals(timeline, selectors, LONG, ny_dt(2026, 1, 5, 12, 30))
         self.assertEqual([s.candidate_id for s in after_c_long.active_signals], [c_touch.candidate_id])
 
-        # after B inverts: A restored, C still active, iFVG(B) active LONG; b_touch still suspended by C
+        # after B inverts: A restored, C still active, iFVG(B) active LONG;
+        # b_touch itself is now permanently retired (terminal), not just
+        # suspended -- it can never come back, regardless of what C does.
         after_b_ifvg_long = query_active_signals(timeline, selectors, LONG, ny_dt(2026, 1, 5, 13, 30))
         self.assertEqual(
             sorted(s.candidate_id for s in after_b_ifvg_long.active_signals),
@@ -486,17 +494,20 @@ class FVGSuspensionAndRestorationTests(unittest.TestCase):
         after_b_ifvg_short = query_active_signals(timeline, selectors, SHORT, ny_dt(2026, 1, 5, 13, 30))
         self.assertEqual(after_b_ifvg_short.active_signals, [])
 
-        # after C inverts: b_touch restored, iFVG(C) active SHORT
+        # after C inverts: c_touch is itself retired (it is no longer a
+        # valid bullish FVG either -- same rule, symmetric); it had
+        # nothing left to restore, since b_touch was already retired, not
+        # merely suspended, at B's own inversion. b_touch never returns.
         final_long = query_active_signals(timeline, selectors, LONG, ny_dt(2026, 1, 5, 15, 0))
         self.assertEqual(
             sorted(s.candidate_id for s in final_long.active_signals),
-            sorted([a.candidate_id, c_touch.candidate_id, b_ifvg.candidate_id]),
+            sorted([a.candidate_id, b_ifvg.candidate_id]),
         )
         final_short = query_active_signals(timeline, selectors, SHORT, ny_dt(2026, 1, 5, 15, 0))
-        self.assertEqual(
-            sorted(s.candidate_id for s in final_short.active_signals),
-            sorted([b_touch.candidate_id, c_ifvg.candidate_id]),
-        )
+        self.assertEqual([s.candidate_id for s in final_short.active_signals], [c_ifvg.candidate_id])
+        active_ids = {s.candidate_id for s in final_long.active_signals} | {s.candidate_id for s in final_short.active_signals}
+        self.assertNotIn(b_touch.candidate_id, active_ids)
+        self.assertNotIn(c_touch.candidate_id, active_ids)
 
     def test_a_suspended_fvg_does_not_reappear_due_to_an_unrelated_same_direction_signal(self):
         bullish = fvg_candidate(zone_id="1m-FVG-1", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
@@ -508,6 +519,60 @@ class FVGSuspensionAndRestorationTests(unittest.TestCase):
         active_ids = {s.candidate_id for s in result.active_signals}
         self.assertNotIn(bullish.candidate_id, active_ids)
         self.assertIn(unrelated_bullish.candidate_id, active_ids)
+
+
+class FVGTouchTerminalAfterOwnInversionTests(unittest.TestCase):
+    """Regression coverage for the specific bug reported in review: a
+    touch that itself later converts to its own iFVG is a terminally
+    superseded fact from that instant on -- it is no longer a valid
+    original-direction FVG at all, so it must never be restored
+    afterward by the resolution of some other, unrelated challenger,
+    even if that challenger happened to have suspended it in the
+    meantime."""
+
+    def test_bug_scenario_bullish_original_suspended_by_bearish_then_by_bullish_challenger(self):
+        # A(bullish) suspended by B(bearish touch); B suspended by
+        # C(bullish touch); B inverts (restores A, and B's own touch is
+        # now terminal); C later inverts too -- must NOT restore B.
+        a = fvg_candidate(zone_id="Z-A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        b_touch, b_ifvg = fvg_touch_then_inversion("Z-B", "1m", SHORT, ny_dt(2026, 1, 5, 11, 0), ny_dt(2026, 1, 5, 13, 0))
+        c_touch, c_ifvg = fvg_touch_then_inversion("Z-C", "1m", LONG, ny_dt(2026, 1, 5, 12, 0), ny_dt(2026, 1, 5, 14, 0))
+        timeline = build_entry_signal_timeline(fvg_result(a, b_touch, b_ifvg, c_touch, c_ifvg), EMPTY_LIQUIDITY)
+        selectors = {"fvg-1m-fvg_touch", "fvg-1m-ifvg"}
+
+        result = query_active_signals(timeline, selectors, SHORT, ny_dt(2026, 1, 5, 15, 0))
+        active_ids = {s.candidate_id for s in result.active_signals}
+        self.assertNotIn(b_touch.candidate_id, active_ids)
+        self.assertIn(c_ifvg.candidate_id, active_ids)
+        # its absence is not because it is "currently suspended" -- it is
+        # permanently retired, out of both active_signals and the
+        # suspension audit trail.
+        self.assertNotIn(b_touch.candidate_id, {s.signal.candidate_id for s in result.suspensions})
+
+    def test_symmetric_bearish_original_suspended_by_bullish_then_by_bearish_challenger(self):
+        a = fvg_candidate(zone_id="Z-A2", direction=SHORT, known_at=ny_dt(2026, 1, 5, 10, 0))
+        b_touch, b_ifvg = fvg_touch_then_inversion("Z-B2", "1m", LONG, ny_dt(2026, 1, 5, 11, 0), ny_dt(2026, 1, 5, 13, 0))
+        c_touch, c_ifvg = fvg_touch_then_inversion("Z-C2", "1m", SHORT, ny_dt(2026, 1, 5, 12, 0), ny_dt(2026, 1, 5, 14, 0))
+        timeline = build_entry_signal_timeline(fvg_result(a, b_touch, b_ifvg, c_touch, c_ifvg), EMPTY_LIQUIDITY)
+        selectors = {"fvg-1m-fvg_touch", "fvg-1m-ifvg"}
+
+        result = query_active_signals(timeline, selectors, LONG, ny_dt(2026, 1, 5, 15, 0))
+        active_ids = {s.candidate_id for s in result.active_signals}
+        self.assertNotIn(b_touch.candidate_id, active_ids)
+        self.assertIn(c_ifvg.candidate_id, active_ids)
+        self.assertNotIn(b_touch.candidate_id, {s.signal.candidate_id for s in result.suspensions})
+
+    def test_a_touch_that_inverts_while_still_active_is_also_retired_not_just_suspended_signals(self):
+        # simpler case, no suspension involved at all: a touch that
+        # inverts while it is itself still plainly active (never
+        # suspended by anyone) must still disappear for good -- an
+        # unrelated later same-direction event must never revive it.
+        touch = fvg_candidate(zone_id="Z-X", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        ifvg = fvg_candidate(zone_id="Z-X", timeframe="1m", source_type=SourceType.IFVG, direction=SHORT, known_at=ny_dt(2026, 1, 5, 11, 0))
+        timeline = build_entry_signal_timeline(fvg_result(touch, ifvg), EMPTY_LIQUIDITY)
+
+        result = query_active_signals(timeline, {"fvg-1m-fvg_touch", "fvg-1m-ifvg"}, LONG, ny_dt(2026, 1, 5, 12, 0))
+        self.assertEqual([s.candidate_id for s in result.active_signals], [])
 
 
 class UnselectedFVGSelectorTests(unittest.TestCase):

@@ -92,12 +92,26 @@ lifted, restoring the earlier signal to active. Modeled directly on
   resolution, the suspending FVG is treated as still valid, exactly as
   persist-until-invalidated already treats any other unresolved fact.
   Reported via ``SignalRestoration``.
+- **A touch that inverts is itself a terminal, superseded fact from that
+  instant on.** The ``IFVG`` does not merely restore what its own touch
+  had suspended -- it also permanently retires that touch: the touch is
+  removed from wherever it currently lives (``active_signals``, or
+  suspended by some unrelated, still-unresolved challenger) and, if it
+  was suspended, dropped from that challenger's own pending restoration
+  list. A retired touch never appears in ``active_signals`` again and
+  is never restored by anyone's later resolution -- including its own
+  challenger's -- because the zone it represented is no longer a valid
+  FVG in its original direction at all; only the ``IFVG`` itself (and
+  whatever it restores) carries that zone's confluence forward.
 - **Nesting** is handled deterministically: each suspension records
   *which* signal it was caused by, keyed by that signal's own zone; a
   chain of suspensions (A suspended by B, B suspended by C, ...) unwinds
   one link at a time, each only when *that* link's own suspending zone
   resolves -- independent of whether the signal in between is itself
-  currently active or suspended.
+  currently active or suspended. If a link's own touch is retired by its
+  own inversion (previous bullet) before the outer challenger resolves,
+  the outer challenger's own eventual resolution finds nothing left to
+  restore for that link.
 - **Known scope limitation**: ``tradelab.fvg_touch`` only ever records a
   zone's *first* touch, whatever kind it is -- a zone whose first touch
   was ``PARTIAL_TOUCH`` and which only *later*, on a different candle,
@@ -385,6 +399,7 @@ def _apply_fvg_batch(
     suspended: dict[str, EntrySignal],
     suspended_by: dict[str, SignalSuspension],
     pending_resolution: dict[str, list[str]],
+    touch_by_zone: dict[str, str],
 ) -> list[SignalRestoration]:
     """Mutates ``active`` (``timeframe -> direction -> {candidate_id:
     signal}``), ``suspended`` (``candidate_id -> signal``, everything
@@ -393,20 +408,53 @@ def _apply_fvg_batch(
     FVG-family signals, and returns the restorations this batch caused.
     ``pending_resolution`` maps a zone_id to the candidate_ids its own
     ``PARTIAL_TOUCH`` suspended, so that zone's own later ``IFVG`` (if
-    any) can restore exactly those. See module docstring for the full
-    suspend/restore rules. Batch members share this exact ``known_at``
-    and never suspend or restore each other: restoration only ever uses
-    a strictly earlier zone's pending entry, and suspension targets are
+    any) can restore exactly those. ``touch_by_zone`` maps a zone_id to
+    its own ``PARTIAL_TOUCH`` candidate_id, so that zone's own later
+    ``IFVG`` (if any) can retire that touch -- it is now a superseded,
+    terminal fact (the zone is no longer a valid original-direction FVG
+    at all, it inverted), never eligible for restoration by anyone,
+    regardless of whether it is currently active or suspended by some
+    unrelated challenger. See module docstring for the full suspend/
+    restore rules. Batch members share this exact ``known_at`` and never
+    suspend or restore each other: restoration only ever uses a
+    strictly earlier zone's pending entry, and suspension targets are
     the active pool as it stood before this batch's own suspensions.
     """
     restorations: list[SignalRestoration] = []
 
-    # 1. Restorations: an IFVG candidate in this batch resolves its own
+    # 1. An IFVG candidate in this batch permanently retires its own
+    #    zone's own, strictly earlier PARTIAL_TOUCH (if any) -- that
+    #    touch represented "this zone is still a valid FVG in its
+    #    original direction", which is no longer true now that the zone
+    #    has inverted. Remove it from wherever it currently lives
+    #    (active, or suspended by some unrelated later challenger) and
+    #    drop it from that challenger's own pending_resolution list, so
+    #    the challenger's own eventual resolution can never restore it.
+    for signal in batch:
+        candidate: FVGEntryCandidate = signal.source
+        if candidate.source_type != FVGSourceType.IFVG:
+            continue
+        touch_candidate_id = touch_by_zone.pop(candidate.zone_id, None)
+        if touch_candidate_id is None:
+            continue
+        if touch_candidate_id in suspended:
+            touch_signal = suspended.pop(touch_candidate_id)
+            challenger_zone = suspended_by.pop(touch_candidate_id).suspended_by.source.zone_id
+            still_pending = [cid for cid in pending_resolution.get(challenger_zone, []) if cid != touch_candidate_id]
+            if still_pending:
+                pending_resolution[challenger_zone] = still_pending
+            else:
+                pending_resolution.pop(challenger_zone, None)
+        else:
+            tf_pool = active.get(signal.timeframe, {}).get(_OPPOSITE_DIRECTION[signal.direction], {})
+            tf_pool.pop(touch_candidate_id, None)
+
+    # 2. Restorations: an IFVG candidate in this batch resolves its own
     #    zone's own, strictly earlier PARTIAL_TOUCH (if any) -- a zone
     #    produces at most one touch event ever, so this can only ever be
     #    that same zone's own prior suspension, never someone else's.
     for signal in batch:
-        candidate: FVGEntryCandidate = signal.source
+        candidate = signal.source
         if candidate.source_type != FVGSourceType.IFVG:
             continue
         pending = pending_resolution.pop(candidate.zone_id, None)
@@ -418,10 +466,10 @@ def _apply_fvg_batch(
             active.setdefault(restored_signal.timeframe, {}).setdefault(restored_signal.direction, {})[candidate_id] = restored_signal
             restorations.append(SignalRestoration(signal=restored_signal, restored_by=signal))
 
-    # 2. Challenges: a still-open PARTIAL_TOUCH ("remains a valid FVG")
+    # 3. Challenges: a still-open PARTIAL_TOUCH ("remains a valid FVG")
     #    durably suspends the opposite-direction pool on its own
     #    timeframe -- an unresolved challenge, until some future event
-    #    resolves it (step 1, above, on a later batch). A
+    #    resolves it (step 2, above, on a later batch). A
     #    FULL_MITIGATION_NO_INVERSION touch is already resolved the
     #    instant it is known (its own zone is immediately, terminally
     #    MITIGATED without inverting, per tradelab.fvg) -- it still
@@ -433,8 +481,12 @@ def _apply_fvg_batch(
     #    SignalRestoration is still recorded for full audit transparency
     #    ("the competing FVG became inactive without becoming iFVG ->
     #    restore"). IFVG candidates never challenge anything (see the
-    #    module docstring); they only restore (step 1) and become a new
-    #    active confluence (step 3).
+    #    module docstring); they only retire their own zone's touch and
+    #    restore whatever it suspended (steps 1-2) and become a new
+    #    active confluence (step 4). A durable PARTIAL_TOUCH also
+    #    records itself under ``touch_by_zone``, so its own zone's later
+    #    IFVG (if any) can find and retire it (step 1 above, on that
+    #    later batch).
     #    Targets are the pre-batch active pool (captured before any of
     #    this batch's own challenges are applied), so batch members
     #    never challenge each other.
@@ -446,6 +498,8 @@ def _apply_fvg_batch(
         if candidate.contact_type not in (FVGContactType.PARTIAL_TOUCH, FVGContactType.FULL_MITIGATION_NO_INVERSION):
             continue
         is_durable = candidate.contact_type == FVGContactType.PARTIAL_TOUCH
+        if is_durable:
+            touch_by_zone[candidate.zone_id] = signal.candidate_id
         opposite = _OPPOSITE_DIRECTION[signal.direction]
         for target in active.get(signal.timeframe, {}).get(opposite, {}).values():
             challenge_actions.append((target, signal, is_durable))
@@ -462,7 +516,7 @@ def _apply_fvg_batch(
         suspended_by[target.candidate_id] = SignalSuspension(signal=target, suspended_by=challenger)
         pending_resolution.setdefault(challenger.source.zone_id, []).append(target.candidate_id)
 
-    # 3. Every signal in this batch becomes (or remains) active, under
+    # 4. Every signal in this batch becomes (or remains) active, under
     #    its own timeframe/direction, regardless of source_type/
     #    contact_type -- FVG-family "invalidation" is replaced by
     #    "suspension"; a newly-known signal itself is never suspended.
@@ -496,9 +550,10 @@ def _resolve_fvg_conflicts(
     suspended: dict[str, EntrySignal] = {}
     suspended_by: dict[str, SignalSuspension] = {}
     pending_resolution: dict[str, list[str]] = {}
+    touch_by_zone: dict[str, str] = {}
     restorations: list[SignalRestoration] = []
     for _known_at, batch_iter in groupby(ordered, key=lambda s: s.known_at):
-        restorations.extend(_apply_fvg_batch(list(batch_iter), active, suspended, suspended_by, pending_resolution))
+        restorations.extend(_apply_fvg_batch(list(batch_iter), active, suspended, suspended_by, pending_resolution, touch_by_zone))
     all_active = [s for tf_pools in active.values() for direction_pool in tf_pools.values() for s in direction_pool.values()]
     return all_active, list(suspended_by.values()), restorations
 
@@ -588,6 +643,7 @@ def iter_active_signal_snapshots(timeline: EntrySignalTimeline) -> Iterator[Sign
     fvg_suspended: dict[str, EntrySignal] = {}
     fvg_suspended_by: dict[str, SignalSuspension] = {}
     fvg_pending_resolution: dict[str, list[str]] = {}
+    fvg_touch_by_zone: dict[str, str] = {}
 
     for _known_at, group_iter in groupby(timeline.signals, key=lambda s: s.known_at):
         group = list(group_iter)
@@ -597,7 +653,7 @@ def iter_active_signal_snapshots(timeline: EntrySignalTimeline) -> Iterator[Sign
         if liquidity_batch:
             _apply_liquidity_batch(liquidity_batch, liquidity_active)
         if fvg_batch:
-            _apply_fvg_batch(fvg_batch, fvg_active, fvg_suspended, fvg_suspended_by, fvg_pending_resolution)
+            _apply_fvg_batch(fvg_batch, fvg_active, fvg_suspended, fvg_suspended_by, fvg_pending_resolution, fvg_touch_by_zone)
 
         for signal in group:
             active_by_selector: dict[str, list[EntrySignal]] = {}
