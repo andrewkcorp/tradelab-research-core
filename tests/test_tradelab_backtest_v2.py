@@ -11,10 +11,13 @@ small, independent reference exit-resolution scan."""
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import random
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from tradelab.accounting import Instrument, RiskConfig, UntradeableReason, apply_accounting, point_value_usd
 from tradelab.backtest import BacktestResult, TradeExitReason, prepare_backtest_context
@@ -31,12 +34,16 @@ from tradelab.backtest_v2 import (
     _expand_and_simulate,
     _leaderboard_sort_key,
     _linked_fvg_candidate,
+    _open_journal,
     _resolve_sl_candidate,
     _TopNTracker,
     _yearly_monthly_breakdown,
     build_synthetic_smoke_context,
     enumerate_exit_variants,
     main as backtest_v2_main,
+    read_preflight,
+    run_preflight_v2,
+    run_production_backtest_v2,
     run_strategy_variant_backtest,
     simulate_market_execution,
 )
@@ -46,11 +53,58 @@ from tradelab.entry_strategy_universe import ObservedEntry, discover_entry_strat
 from tradelab.equity import build_equity_curve
 from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, SourceType
 from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityLevel, LiquidityStatus, LiquidityType
+from tradelab.market_data_artifact import MarketDataArtifact, SeriesKind
 from tradelab.news import NewsEvent
-from tradelab.research_run import read_leaderboard, read_live_status, read_progress_events, read_run_manifest
+from tradelab.research_run import RunReporter, create_run, read_leaderboard, read_live_status, read_progress_events, read_run_manifest
 from tradelab.sweep_fvg_setup import SweepFVGSetupEvent
 
 UTC = timezone.utc
+
+
+def _write_smoke_market_artifact(tmp: Path) -> tuple[Path, Path]:
+    """Writes the exact same zigzag 1m bar series ``build_synthetic_smoke_
+    context`` builds in-memory (reliable, real FVGs/swing highs+lows on
+    1m/5m/15m in few bars -- see that function's own docstring) to a real
+    market-data-artifact CSV + manifest + an empty news CSV, so file-based
+    entry points (``run_production_backtest_v2``/``run_preflight_v2``) can
+    be exercised end-to-end against a non-trivial (non-zero equivalence
+    class count) universe without needing real market data."""
+    start = datetime(2024, 12, 31, 23, 5, tzinfo=UTC)
+    lines = ["timestamp,open,high,low,close,volume,contract\n"]
+    price = 20000.0
+    leg_length = 30
+    for i in range(900):
+        ts = start + timedelta(minutes=i)
+        cycle_bar = i % (2 * leg_length)
+        cycle_index = i // (2 * leg_length)
+        amplitude = 20.0 + cycle_index * 5.0
+        move = amplitude if cycle_bar < leg_length else -amplitude
+        open_p = price
+        close_p = price + move
+        high_p = max(open_p, close_p) + 3.0
+        low_p = min(open_p, close_p) - 3.0
+        lines.append(f"{ts.strftime('%Y-%m-%dT%H:%M:%SZ')},{open_p},{high_p},{low_p},{close_p},100,SMOKE\n")
+        price = close_p
+
+    bars_path = tmp / "bars.csv"
+    bars_path.write_text("".join(lines), encoding="utf-8")
+    sha256 = hashlib.sha256(bars_path.read_bytes()).hexdigest()
+
+    artifact = MarketDataArtifact(
+        schema_version="1.0", source_name="test-fixture", instrument_root=Instrument.NQ, bar_interval="1m",
+        timestamp_timezone="UTC", series_kind=SeriesKind.CONTINUOUS, data_path="bars.csv",
+        coverage_start=start, coverage_end=start + timedelta(minutes=900), sha256=sha256,
+        normalization_method="additive_back_adjustment",
+    )
+    manifest_path = tmp / "manifest.json"
+    manifest_path.write_text(json.dumps(artifact.to_dict()), encoding="utf-8")
+
+    news_csv_path = tmp / "news.csv"
+    news_csv_path.write_text(
+        "event_id,scheduled_at,country,currency,event_type,source_agency,source_url,source_reference,time_is_exact,schema_version\n",
+        encoding="utf-8",
+    )
+    return manifest_path, news_csv_path
 
 
 def bar(ts: datetime, o: float, h: float, l: float, c: float) -> Bar1m:
@@ -652,13 +706,19 @@ class MemoryBoundedProductionOrchestrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={}, is_demo=True)
-            completed, final_top = _expand_and_simulate(
-                reporter, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, context,
+            journal = _open_journal(
+                reporter, market_artifact_path=None, news_csv_path=None, parameters={},
+                risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG,
+                exit_variants=ALL_EXIT_VARIANTS, instruments=DEFAULT_INSTRUMENTS,
+            )
+            completed, final_leaderboard = _expand_and_simulate(
+                reporter, journal, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, context,
                 risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG, top_n_leaderboard=top_n, checkpoint_every=7,
             )
+            journal.close()
 
             self.assertEqual(completed, total_expected)
-            self.assertLessEqual(len(final_top), top_n)
+            self.assertLessEqual(len(final_leaderboard), top_n)
 
             # (a) durable: every single variant landed in the summary stream.
             import json as _json
@@ -735,6 +795,332 @@ class RandomizedExitResolutionReferenceTests(unittest.TestCase):
                 expected = None
 
             self.assertEqual(actual, expected)
+
+
+class ResumabilityTests(unittest.TestCase):
+    """Proves the SQLite journal actually delivers resumability at the
+    orchestration layer (task 043): a "crash" mid-run (a handful of
+    variants committed directly to the journal, exactly as ``_expand_
+    and_simulate`` itself would have, but without ever calling that
+    function) followed by a fresh process re-attaching to the same run
+    directory (a) skips every already-completed variant rather than
+    re-running or duplicating it, (b) still reaches exactly the same
+    total completed count as an uninterrupted run would, and (c)
+    reconstructs a leaderboard -- both the durable historical top-N and
+    the final merged one -- that exactly matches an independent
+    brute-force recomputation over the *entire* durable summary stream
+    (both the pre-crash and post-resume rows), proving durable Top-N
+    reconstruction is exact, not approximate."""
+
+    def _universe_and_context(self):
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=1
+        )
+        self.assertGreater(universe.equivalence_class_count, 0)
+        return context, universe
+
+    def test_interrupted_run_resumes_without_duplicating_completed_work(self):
+        context, universe = self._universe_and_context()
+        total_expected = universe.equivalence_class_count * len(ALL_EXIT_VARIANTS) * len(DEFAULT_INSTRUMENTS)
+        top_n = 3
+        self.assertGreater(total_expected, 10)  # confirms there is real work left after the "crash"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_id = "resume-test-run"
+
+            # --- "first process": completes a handful of variants directly
+            # against the journal (exactly what _expand_and_simulate itself
+            # would persist), then crashes -- it never calls _expand_and_
+            # simulate, and never reports the run as completed.
+            reporter1 = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={}, run_id=run_id, is_demo=True)
+            journal1 = _open_journal(
+                reporter1, market_artifact_path=None, news_csv_path=None, parameters={}, risk_config=DEFAULT_RISK_CONFIG,
+                equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS, instruments=DEFAULT_INSTRUMENTS,
+            )
+            precomputed_ids = []
+            combos = [
+                (equivalence_class, variant, instrument)
+                for equivalence_class in universe.equivalence_classes
+                for variant in ALL_EXIT_VARIANTS
+                for instrument in DEFAULT_INSTRUMENTS
+            ][:5]
+            for equivalence_class, variant, instrument in combos:
+                result = run_strategy_variant_backtest(equivalence_class, variant, instrument, context, risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG)
+                journal1.commit_summary(VariantSummaryRow.from_result(result).to_dict())
+                precomputed_ids.append(result.strategy_variant_id)
+            self.assertEqual(journal1.completed_count(), 5)
+            created_at_before_resume = reporter1.manifest.created_at
+            journal1.close()
+
+            # --- "second process": resumes against the exact same run_dir/run_id.
+            reporter2 = RunReporter(reporter1.run_dir, read_run_manifest(reporter1.run_dir))
+            self.assertEqual(reporter2.manifest.created_at, created_at_before_resume)  # never re-created
+            journal2 = _open_journal(
+                reporter2, market_artifact_path=None, news_csv_path=None, parameters={}, risk_config=DEFAULT_RISK_CONFIG,
+                equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS, instruments=DEFAULT_INSTRUMENTS,
+            )
+            self.assertEqual(journal2.completed_count(), 5)  # durable across the reopen
+
+            completed, final_leaderboard = _expand_and_simulate(
+                reporter2, journal2, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, context,
+                risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG, top_n_leaderboard=top_n, checkpoint_every=7,
+            )
+
+            # (a)/(b): exactly total_expected, never total_expected + the 5
+            # precomputed duplicates -- if the skip logic were broken, the
+            # journal's own PRIMARY KEY would have raised sqlite3.
+            # IntegrityError on the first duplicate INSERT rather than
+            # silently double-counting, so this also proves no duplicate
+            # commit was even attempted.
+            self.assertEqual(completed, total_expected)
+            self.assertEqual(journal2.completed_count(), total_expected)
+            for pid in precomputed_ids:
+                self.assertTrue(journal2.is_completed(pid))
+
+            # (c): durable Top-N reconstruction is exact against a brute
+            # force recomputation over every row in the durable journal
+            # (both the pre-crash and post-resume ones).
+            all_rows = journal2.top_n_summaries(total_expected)
+            self.assertEqual(len(all_rows), total_expected)
+            brute_force_ranked = sorted(all_rows, key=lambda s: (s.net_pnl_usd, -s.max_drawdown_usd, s.strategy_variant_id), reverse=True)
+            expected_top_ids = [s.strategy_variant_id for s in brute_force_ranked[:top_n]]
+            self.assertEqual([e.strategy_id for e in final_leaderboard], expected_top_ids)
+
+            # the dashboard-visible leaderboard.json matches too.
+            dashboard_leaderboard = read_leaderboard(reporter2.run_dir)
+            self.assertEqual([e.strategy_id for e in dashboard_leaderboard.entries], expected_top_ids)
+
+            journal2.close()
+
+    def test_resume_rebuilds_dashboard_visible_progress_immediately(self):
+        context, universe = self._universe_and_context()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_id = "resume-progress-run"
+            reporter1 = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={}, run_id=run_id, is_demo=True)
+            journal1 = _open_journal(
+                reporter1, market_artifact_path=None, news_csv_path=None, parameters={}, risk_config=DEFAULT_RISK_CONFIG,
+                equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS, instruments=DEFAULT_INSTRUMENTS,
+            )
+            equivalence_class = universe.equivalence_classes[0]
+            variant = ALL_EXIT_VARIANTS[0]
+            instrument = DEFAULT_INSTRUMENTS[0]
+            result = run_strategy_variant_backtest(equivalence_class, variant, instrument, context, risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG)
+            journal1.commit_summary(VariantSummaryRow.from_result(result).to_dict())
+            journal1.close()
+
+            reporter2 = RunReporter(reporter1.run_dir, read_run_manifest(reporter1.run_dir))
+            journal2 = _open_journal(
+                reporter2, market_artifact_path=None, news_csv_path=None, parameters={}, risk_config=DEFAULT_RISK_CONFIG,
+                equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS, instruments=DEFAULT_INSTRUMENTS,
+            )
+            # _expand_and_simulate reports progress/leaderboard from the
+            # durable journal BEFORE simulating anything new -- so the
+            # dashboard is never left showing stale pre-crash progress
+            # while the resumed process works through the remainder.
+            _expand_and_simulate(
+                reporter2, journal2, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, context,
+                risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG, top_n_leaderboard=5, checkpoint_every=1000000,
+            )
+            journal2.close()
+
+            status = read_live_status(reporter2.run_dir)
+            self.assertGreaterEqual(status.items_completed, 1)
+
+
+class IncompatibleResumeRejectionTests(unittest.TestCase):
+    """Resuming with any changed compatibility field must be refused
+    clearly, naming the mismatched field, and must never touch the
+    already-durable data."""
+
+    def _fresh_run(self, tmp, **journal_kwargs):
+        reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="incompat-run", is_demo=True)
+        kwargs = dict(
+            market_artifact_path=None, news_csv_path=None, parameters={"min_entries_per_year": 1}, risk_config=DEFAULT_RISK_CONFIG,
+            equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS, instruments=DEFAULT_INSTRUMENTS,
+        )
+        kwargs.update(journal_kwargs)
+        journal = _open_journal(reporter, **kwargs)
+        journal.close()
+        return reporter
+
+    def test_resuming_with_different_parameters_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = self._fresh_run(tmp)
+            reporter2 = RunReporter(reporter.run_dir, read_run_manifest(reporter.run_dir))
+            with self.assertRaises(ValueError) as ctx:
+                _open_journal(
+                    reporter2, market_artifact_path=None, news_csv_path=None, parameters={"min_entries_per_year": 999},
+                    risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS, instruments=DEFAULT_INSTRUMENTS,
+                )
+            self.assertIn("parameters_json", str(ctx.exception))
+
+    def test_resuming_with_different_risk_config_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = self._fresh_run(tmp)
+            reporter2 = RunReporter(reporter.run_dir, read_run_manifest(reporter.run_dir))
+            other_risk_config = dataclasses.replace(DEFAULT_RISK_CONFIG, target_risk_usd=DEFAULT_RISK_CONFIG.target_risk_usd + 1.0)
+            with self.assertRaises(ValueError) as ctx:
+                _open_journal(
+                    reporter2, market_artifact_path=None, news_csv_path=None, parameters={"min_entries_per_year": 1},
+                    risk_config=other_risk_config, equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS, instruments=DEFAULT_INSTRUMENTS,
+                )
+            self.assertIn("risk_config_json", str(ctx.exception))
+
+    def test_resuming_with_different_instruments_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = self._fresh_run(tmp)
+            reporter2 = RunReporter(reporter.run_dir, read_run_manifest(reporter.run_dir))
+            with self.assertRaises(ValueError) as ctx:
+                _open_journal(
+                    reporter2, market_artifact_path=None, news_csv_path=None, parameters={"min_entries_per_year": 1},
+                    risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS, instruments=(Instrument.MNQ,),
+                )
+            self.assertIn("instruments_json", str(ctx.exception))
+
+    def test_resuming_with_different_exit_variants_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = self._fresh_run(tmp)
+            reporter2 = RunReporter(reporter.run_dir, read_run_manifest(reporter.run_dir))
+            with self.assertRaises(ValueError) as ctx:
+                _open_journal(
+                    reporter2, market_artifact_path=None, news_csv_path=None, parameters={"min_entries_per_year": 1},
+                    risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS[:5], instruments=DEFAULT_INSTRUMENTS,
+                )
+            self.assertIn("exit_variant_ids_json", str(ctx.exception))
+
+
+class ProductionRunnerResumeIntegrationTests(unittest.TestCase):
+    """The same resumability contract, but through the real, file-based
+    ``run_production_backtest_v2`` entry point (never the internal
+    ``_expand_and_simulate`` helper directly) -- proving the CLI-adjacent
+    ``run_id`` reuse mechanism itself, not just the journal underneath
+    it: calling it twice with the same ``run_id`` re-attaches (preserving
+    the original ``created_at``) rather than creating a second run, and
+    calling it a second time with a changed parameter is refused clearly
+    before any new work is attempted."""
+
+    def test_same_run_id_reattaches_and_preserves_created_at(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
+            runs_dir = tmp / "runs"
+
+            reporter1 = run_production_backtest_v2(
+                market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                run_id="prod-resume-run", command="test",
+            )
+            created_at_1 = reporter1.manifest.created_at
+            self.assertEqual(read_live_status(reporter1.run_dir).phase, "completed")
+
+            reporter2 = run_production_backtest_v2(
+                market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                run_id="prod-resume-run", command="test",
+            )
+            self.assertEqual(reporter2.run_dir, reporter1.run_dir)
+            self.assertEqual(reporter2.manifest.created_at, created_at_1)  # re-attached, never re-created
+            self.assertEqual(read_live_status(reporter2.run_dir).phase, "completed")
+
+    def test_resuming_with_a_different_pivot_strength_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
+            runs_dir = tmp / "runs"
+
+            run_production_backtest_v2(
+                market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                run_id="prod-mismatch-run", command="test",
+            )
+            with self.assertRaises(ValueError) as ctx:
+                run_production_backtest_v2(
+                    market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                    pivot_strength=3, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                    run_id="prod-mismatch-run", command="test",
+                )
+            self.assertIn("parameters_json", str(ctx.exception))
+
+
+class PreflightTests(unittest.TestCase):
+    """Preflight correctness (task 043 requirement 2): the artifact's
+    counts must exactly match an independent, direct call to ``discover_
+    entry_strategy_universe`` over the same prepared context (proving
+    preflight can never omit or alter the final universe), the total
+    simulation count must be the exact product of the three cardinalities,
+    it must never write a journal or simulate every variant by default,
+    and it must integrate with the same dashboard-visible telemetry model
+    a production run uses."""
+
+    def test_preflight_counts_match_a_direct_universe_discovery_and_never_simulates_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
+            runs_dir = tmp / "runs"
+
+            reporter = run_preflight_v2(
+                market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1, command="test",
+            )
+
+            preflight = read_preflight(reporter.run_dir)
+            self.assertEqual(preflight["bar_count"], 900)
+            self.assertIsNotNone(preflight["covered_time_range"]["start"])
+            self.assertIsNotNone(preflight["covered_time_range"]["end"])
+
+            # independent, direct recomputation -- must match exactly.
+            expected_context = build_synthetic_smoke_context()
+            expected_universe = discover_entry_strategy_universe(
+                expected_context.fvg_results, expected_context.fvg_entry_result, expected_context.liquidity_entry_result,
+                expected_context.htf_bias_result, min_entries_per_year=1,
+            )
+            self.assertGreater(expected_universe.equivalence_class_count, 0)
+            self.assertEqual(preflight["syntactically_enumerated_spec_count"], expected_universe.syntactically_enumerated_spec_count)
+            self.assertEqual(preflight["eligible_spec_count"], expected_universe.eligible_spec_count)
+            self.assertEqual(preflight["equivalence_class_count"], expected_universe.equivalence_class_count)
+            self.assertEqual(preflight["exit_variant_count"], len(ALL_EXIT_VARIANTS))
+            self.assertEqual(sorted(preflight["instruments"]), sorted(i.value for i in DEFAULT_INSTRUMENTS))
+
+            expected_total = expected_universe.equivalence_class_count * len(ALL_EXIT_VARIANTS) * len(DEFAULT_INSTRUMENTS)
+            self.assertEqual(preflight["total_strategy_variant_simulations"], expected_total)
+            self.assertGreater(expected_total, 0)
+
+            self.assertIn("disk_space_estimate", preflight)
+            self.assertGreater(preflight["disk_space_estimate"]["estimated_total_bytes"], 0)
+            self.assertIsNone(preflight["throughput_estimate"])  # default sample size 0 -- never measured
+
+            # never simulates anything by default: no journal, no summaries export.
+            self.assertFalse((reporter.run_dir / "backtest_v2_journal.sqlite3").exists())
+            self.assertFalse((reporter.run_dir / "variant_summaries.jsonl").exists())
+
+            # dashboard-compatible: same telemetry artifacts a production run writes.
+            self.assertEqual(read_live_status(reporter.run_dir).phase, "completed")
+            self.assertIsNotNone(read_run_manifest(reporter.run_dir))
+
+    def test_throughput_sample_size_measures_a_bounded_real_sample_without_completing_the_universe(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
+            runs_dir = tmp / "runs"
+
+            reporter = run_preflight_v2(
+                market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                throughput_sample_size=4, command="test",
+            )
+            preflight = read_preflight(reporter.run_dir)
+            sample = preflight["throughput_estimate"]
+            self.assertIsNotNone(sample)
+            self.assertEqual(sample["sample_size_requested"], 4)
+            self.assertEqual(sample["sample_size_measured"], 4)
+            self.assertLess(sample["sample_size_measured"], preflight["total_strategy_variant_simulations"])
+            self.assertIsNotNone(sample["variants_per_second"])
+            self.assertIn("MEASURED", sample["note"])
+            self.assertEqual(preflight["disk_space_estimate"]["basis"].split(":")[0], "measured")
+
+            # still never wrote a journal or completed the universe.
+            self.assertFalse((reporter.run_dir / "backtest_v2_journal.sqlite3").exists())
 
 
 if __name__ == "__main__":
