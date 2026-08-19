@@ -3,10 +3,11 @@
 reopen with identical configuration, refusal to reopen with any mismatched
 compatibility field (naming exactly which field(s) differ), commit_summary
 durability + the primary-key uniqueness constraint (a duplicate strategy_
-variant_id raises rather than being silently ignored), completed_ids/
-completed_count/is_completed, and top_n_summaries ordering (net P&L desc,
-then max drawdown asc, then strategy_variant_id desc -- ties broken
-deterministically)."""
+variant_id raises rather than being silently ignored), completed_count/
+is_completed (the memory-bounded resume-check pair -- there is
+deliberately no method that loads every completed id into a Python set),
+and top_n_summaries ordering (net P&L desc, then max drawdown asc, then
+strategy_variant_id desc -- ties broken deterministically)."""
 from __future__ import annotations
 
 import sqlite3
@@ -116,14 +117,15 @@ class ManifestCreateAndVerifyTests(unittest.TestCase):
 
 
 class CommitSummaryAndUniquenessTests(unittest.TestCase):
-    def test_commit_summary_is_durable_and_readable_via_is_completed_and_completed_ids(self):
+    def test_commit_summary_is_durable_and_readable_via_is_completed_and_completed_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "journal.sqlite3"
             j = _open(db_path)
             self.assertFalse(j.is_completed("v1"))
+            self.assertFalse(j.is_completed("v2"))
             j.commit_summary(_summary_row("v1"))
             self.assertTrue(j.is_completed("v1"))
-            self.assertEqual(j.completed_ids(), {"v1"})
+            self.assertFalse(j.is_completed("v2"))  # per-candidate lookup, never a full-table load
             self.assertEqual(j.completed_count(), 1)
             j.close()
 

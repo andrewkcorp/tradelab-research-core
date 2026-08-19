@@ -264,23 +264,21 @@ class BacktestV2Journal:
             )
 
     def is_completed(self, strategy_variant_id: str) -> bool:
+        """The resumed run's own skip-check -- one bounded, indexed
+        lookup by primary key per candidate variant. Deliberately never
+        backed by loading every completed id into a Python set first:
+        at real-data scale (a full exhaustive run can be millions of
+        variants) that set would itself be a significant, unbounded-
+        with-run-size memory allocation. Correctness and bounded memory
+        matter more here than the per-lookup query overhead."""
         row = self._conn.execute(
             "SELECT 1 FROM variant_summaries WHERE strategy_variant_id = ? LIMIT 1", (strategy_variant_id,)
         ).fetchone()
         return row is not None
 
-    def completed_ids(self) -> set[str]:
-        """Every already-completed ``strategy_variant_id`` -- loaded
-        once, up front, for O(1) skip-checking during a resumed run's
-        simulation loop. Bounded by the number of *variants* (plain
-        short strings), never by the size of any rich trade/equity
-        payload -- an entirely different, much smaller memory profile
-        than retaining ``StrategyVariantResult`` objects (see
-        ``tradelab.backtest_v2``'s own "Memory-bounded production
-        orchestration" docstring section)."""
-        return {row[0] for row in self._conn.execute("SELECT strategy_variant_id FROM variant_summaries")}
-
     def completed_count(self) -> int:
+        """A single ``COUNT(*)`` -- used to initialize a resumed run's
+        progress counter without reading any row's own data into Python."""
         return self._conn.execute("SELECT COUNT(*) FROM variant_summaries").fetchone()[0]
 
     def commit_summary(self, row: Mapping[str, Any]) -> None:

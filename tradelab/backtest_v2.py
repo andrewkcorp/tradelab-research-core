@@ -209,6 +209,7 @@ from tradelab.fvg import DEFAULT_TICK_SIZE
 from tradelab.fvg_entry import FVGEntryCandidate
 from tradelab.news import is_entry_blocked
 from tradelab.research_run import LeaderboardEntry, RunPhase, RunReporter, append_jsonl, atomic_write_json, create_run, read_run_manifest
+from tradelab.research_run import _git_provenance as _current_git_provenance
 from tradelab.research_run import _sha256_of_file as _hash_file
 from tradelab.sl_targets import FVG_SL_TIMEFRAMES, SelectedFVGConfluence, SLTargetCandidate, detect_sl_target_candidates
 from tradelab.sweep_fvg_setup import SweepFVGSetupEvent
@@ -815,11 +816,13 @@ def _expand_and_simulate(
     in-memory top-N tracker or counted toward ``completed`` -- crash
     safety (spec, task 043): a process dying at any point still leaves
     the journal exactly reflecting real, durable progress, never more,
-    never less. Already-completed ``strategy_variant_id``s (loaded once,
-    up front, as a plain set of strings -- see ``BacktestV2Journal.
-    completed_ids``'s own docstring for why this is a different, much
-    smaller memory profile than retaining rich results) are never
-    recomputed. Returns ``(completed_count, final_top_n_leaderboard)``.
+    never less. Already-completed variants are never recomputed --
+    checked one at a time via ``journal.is_completed()`` (a single bounded
+    SQL lookup by primary key), never by loading every completed id into
+    a Python set: at real-data scale (millions of variants) that set
+    would itself be a significant, unbounded-with-run-size memory
+    allocation, which this loop deliberately avoids. Returns
+    ``(completed_count, final_top_n_leaderboard)``.
     """
     total_variant_runs = universe.equivalence_class_count * len(exit_variants) * len(instruments)
     reporter.phase_started(RunPhase.EXPANDING_EXIT_VARIANTS, items_total=max(total_variant_runs, 1))
@@ -828,8 +831,7 @@ def _expand_and_simulate(
     reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=max(total_variant_runs, 1))
     summary_path = reporter.run_dir / "variant_summaries.jsonl"
 
-    already_completed_ids = journal.completed_ids()
-    completed = len(already_completed_ids)
+    completed = journal.completed_count()
     durable_top_n = [_leaderboard_entry_from_journal_summary(s) for s in journal.top_n_summaries(top_n_leaderboard)]
 
     top_n = _TopNTracker(top_n_leaderboard)
@@ -841,7 +843,7 @@ def _expand_and_simulate(
         for variant in exit_variants:
             for instrument in instruments:
                 variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value)
-                if variant_id in already_completed_ids:
+                if journal.is_completed(variant_id):
                     continue  # durably completed in a previous process -- never recomputed
 
                 result = run_strategy_variant_backtest(equivalence_class, variant, instrument, context, risk_config=risk_config, equity_config=equity_config)
@@ -884,9 +886,22 @@ def _open_journal(
     on disk between runs at the same path is caught, not just a changed
     path. Raises ``ValueError`` immediately on any unsafe mismatch
     against an already-existing journal -- see ``BacktestV2Journal``'s
-    own docstring."""
+    own docstring.
+
+    **``git_commit`` is independently discovered here, never read from
+    ``reporter.manifest.git_commit``.** On resume, ``reporter`` is
+    re-attached from the *original* run's own ``run_manifest.json`` (see
+    ``run_production_backtest_v2``), so its ``git_commit`` field is
+    whatever commit produced that original run -- comparing it against
+    itself would trivially always match, even if the code actually
+    executing right now has since changed. This function instead calls
+    ``tradelab.research_run._git_provenance`` fresh, exactly as
+    ``create_run`` itself does for a brand-new run, so the compatibility
+    check always reflects the commit genuinely running this call."""
     market_artifact_path = Path(market_artifact_path) if market_artifact_path is not None else None
     news_csv_path = Path(news_csv_path) if news_csv_path is not None else None
+    repo_root = Path(__file__).resolve().parents[1]
+    current_git_commit, _dirty = _current_git_provenance(repo_root)
     return BacktestV2Journal(
         reporter.run_dir / "backtest_v2_journal.sqlite3",
         run_id=reporter.run_id,
@@ -894,7 +909,7 @@ def _open_journal(
         market_artifact_sha256=(_hash_file(market_artifact_path) if market_artifact_path is not None else None),
         news_csv_path=(str(news_csv_path) if news_csv_path is not None else None),
         news_csv_sha256=(_hash_file(news_csv_path) if news_csv_path is not None else None),
-        git_commit=reporter.manifest.git_commit,
+        git_commit=current_git_commit,
         parameters=parameters,
         risk_config={"target_risk_usd": risk_config.target_risk_usd, "max_stop_risk_usd": risk_config.max_stop_risk_usd, "entry_cost_usd": risk_config.entry_cost_usd},
         equity_config={"initial_balance_usd": equity_config.initial_balance_usd, "drawdown_threshold_usd": equity_config.drawdown_threshold_usd},

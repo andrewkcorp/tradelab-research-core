@@ -18,6 +18,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from tradelab.accounting import Instrument, RiskConfig, UntradeableReason, apply_accounting, point_value_usd
 from tradelab.backtest import BacktestResult, TradeExitReason, prepare_backtest_context
@@ -988,6 +989,39 @@ class IncompatibleResumeRejectionTests(unittest.TestCase):
                     risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS[:5], instruments=DEFAULT_INSTRUMENTS,
                 )
             self.assertIn("exit_variant_ids_json", str(ctx.exception))
+
+    def test_resuming_under_a_different_current_git_commit_is_refused_before_any_simulation(self):
+        # _open_journal must independently rediscover the CURRENT commit at
+        # execution time (never trust reporter.manifest.git_commit, which
+        # is only the commit that produced the *original*, possibly now-
+        # stale, run) -- patch tradelab.backtest_v2._current_git_provenance
+        # itself (the exact call site) to simulate the code under test
+        # actually changing between the interrupted run and the resume.
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tradelab.backtest_v2._current_git_provenance", return_value=("commit-aaa", False)):
+                reporter = self._fresh_run(tmp)
+
+            reporter2 = RunReporter(reporter.run_dir, read_run_manifest(reporter.run_dir))
+            with patch("tradelab.backtest_v2._current_git_provenance", return_value=("commit-bbb", False)):
+                with self.assertRaises(ValueError) as ctx:
+                    _open_journal(
+                        reporter2, market_artifact_path=None, news_csv_path=None, parameters={"min_entries_per_year": 1},
+                        risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS, instruments=DEFAULT_INSTRUMENTS,
+                    )
+            self.assertIn("git_commit", str(ctx.exception))
+
+    def test_resuming_under_the_same_current_git_commit_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tradelab.backtest_v2._current_git_provenance", return_value=("commit-aaa", False)):
+                reporter = self._fresh_run(tmp)
+
+            reporter2 = RunReporter(reporter.run_dir, read_run_manifest(reporter.run_dir))
+            with patch("tradelab.backtest_v2._current_git_provenance", return_value=("commit-aaa", False)):
+                journal2 = _open_journal(  # must not raise -- identical current commit both times
+                    reporter2, market_artifact_path=None, news_csv_path=None, parameters={"min_entries_per_year": 1},
+                    risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS, instruments=DEFAULT_INSTRUMENTS,
+                )
+            journal2.close()
 
 
 class ProductionRunnerResumeIntegrationTests(unittest.TestCase):
