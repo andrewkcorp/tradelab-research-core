@@ -136,6 +136,7 @@ from tradelab.market_data_artifact import (
 from tradelab.news import NewsEvent
 from tradelab.news_loaders import read_news_events_csv
 from tradelab.research_runner import ResearchWindow
+from tradelab.sweep_fvg_setup import PendingSweepTransitionKind, iter_sweep_fvg_setup_events, iter_sweep_pending_transitions
 
 # v2.0 (this task): adds FVG-entry-candidate touch/iFVG/mitigation counts,
 # entry_signal_timeline suspension/restoration counts and active-FVG-
@@ -154,6 +155,11 @@ from tradelab.research_runner import ResearchWindow
 # and an optional comparison against a prior profile JSON. v1.0 profiles
 # do not have any of these fields -- see `comparison` below for exactly
 # what a v1.0-vs-v2.0 comparison can and cannot show.
+#
+# v2.0 also gained `entry_event_model` (task 036) and, additively, this
+# task's `sweep_fvg_setup_model` -- both purely additive sections, so the
+# schema version itself is not bumped again (matches the precedent task
+# 036 already set for `entry_event_model`).
 PROFILE_SCHEMA_VERSION = "2.0"
 
 # MNQ, explicit -- never DEFAULT_TICK_SIZE relied upon implicitly (this
@@ -194,6 +200,7 @@ class ContextProfileResult:
     fvg_mitigation_count_total: int
     suspension_count_total: int
     restoration_count_total: int
+    sweep_fvg_setup_event_count_total: int
 
 
 def profile_research_context(
@@ -226,10 +233,10 @@ def profile_research_context(
     profile's invocation.
 
     ``phase_callback``, if given, is called with ``(phase_name,
-    duration_seconds)`` as each of the six phases below completes --
+    duration_seconds)`` as each of the seven phases below completes --
     ``"preparation"``, ``"lifecycle_profiling"``, ``"pool_statistics"``,
-    ``"entry_event_model"``, ``"serialization"``, ``"total"`` (in that
-    order). Purely a side-
+    ``"entry_event_model"``, ``"sweep_fvg_setup_model"``,
+    ``"serialization"``, ``"total"`` (in that order). Purely a side-
     effecting hook for CLI progress visibility on a long real run
     (``main()`` uses it to print); it never affects the return value or
     ``output_json_path``'s own content -- wall-clock durations are
@@ -276,6 +283,10 @@ def profile_research_context(
     )
     _report("entry_event_model", entry_event_model_start)
 
+    sweep_fvg_setup_model_start = time.perf_counter()
+    sweep_fvg_setup_model = _sweep_fvg_setup_model_section(context.fvg_entry_result, context.liquidity_entry_result)
+    _report("sweep_fvg_setup_model", sweep_fvg_setup_model_start)
+
     serialization_start = time.perf_counter()
     entry_signals_by_selector_direction = _selector_direction_counts(context.timeline)
 
@@ -294,6 +305,7 @@ def profile_research_context(
         timeline_stats=timeline_stats,
         active_pool_stats=active_pool_stats,
         entry_event_model=entry_event_model,
+        sweep_fvg_setup_model=sweep_fvg_setup_model,
         entry_signals_by_selector_direction=entry_signals_by_selector_direction,
         previous_profile_json_path=previous_profile_json_path,
         previous_profile=previous_profile,
@@ -320,6 +332,7 @@ def profile_research_context(
         restoration_count_total=timeline_stats["restoration_count_total"],
         bias_event_count_total=sum(len(changes) for changes in context.htf_bias_result.timeframe_changes.values()),
         entry_signal_count_total=len(context.timeline.signals),
+        sweep_fvg_setup_event_count_total=sweep_fvg_setup_model["setup_event_count_total"],
     )
 
 
@@ -335,6 +348,7 @@ def _build_profile(
     timeline_stats: dict,
     active_pool_stats: dict,
     entry_event_model: dict,
+    sweep_fvg_setup_model: dict,
     entry_signals_by_selector_direction: list[dict],
     previous_profile_json_path: Path | None,
     previous_profile: dict | None,
@@ -390,6 +404,7 @@ def _build_profile(
         "entry_signal_timeline": timeline_stats,
         "active_pool_stats": active_pool_stats,
         "entry_event_model": entry_event_model,
+        "sweep_fvg_setup_model": sweep_fvg_setup_model,
         "provenance": _provenance_section(
             market_artifact_sha256=artifact.sha256, news_csv_sha256=news_sha256, command=command
         ),
@@ -962,6 +977,96 @@ def _entry_event_model_section(
     }
 
 
+_SWEEP_FVG_SETUP_MODEL_NOTE = (
+    "tradelab.sweep_fvg_setup (task 038): a liquidity sweep is still a "
+    "one-shot EntryEvent exactly as in the entry_event_model section "
+    "above -- this never changes that. It additionally creates a pending "
+    "directional setup context, keyed by the sweep's own liquidity "
+    "selector, that a later (or same-instant), direction-compatible FVG "
+    "touch or confirmed iFVG may consume exactly once, producing a "
+    "SweepFVGSetupEvent. At most one pending context exists per selector "
+    "at any instant (a newer sweep on that selector always supersedes "
+    "the old one -- invalidating it if opposite-direction, replacing it "
+    "if same-direction), so the pending pool is bounded by the fixed "
+    "liquidity-selector catalog, never by history -- this is not a time "
+    "window, a cap, or sampling. See docs/sweep-fvg-setup-chains-v1.md."
+)
+
+
+def _sweep_fvg_setup_model_section(
+    fvg_entry_result: FVGEntryCandidateResult, liquidity_entry_result: LiquidityEntryCandidateResult
+) -> dict:
+    """Sweep counts, pending-context transition counts (created/replaced/
+    invalidated/consumed), setup-event counts by sweep timeframe/FVG
+    timeframe/FVG kind/direction, sweep-to-setup age statistics, and a
+    machine-checkable proof that no pending context is ever consumed
+    more than once except via deterministic same-instant ties (see
+    ``tradelab.sweep_fvg_setup``'s own docstring). Two independent
+    ``O(N log N)`` passes (``iter_sweep_pending_transitions``, ``iter_
+    sweep_fvg_setup_events``) -- mirrors this module's existing pattern
+    of never re-implementing lifecycle rules, only re-sweeping them (see
+    ``_entry_signal_timeline_stats`` vs. ``_active_pool_stats``)."""
+    sweep_count = sum(1 for event in build_entry_events(fvg_entry_result, liquidity_entry_result) if event.kind == EntryEventKind.LIQUIDITY_SWEEP)
+
+    transition_counts = {kind.value: 0 for kind in PendingSweepTransitionKind}
+    for transition in iter_sweep_pending_transitions(fvg_entry_result, liquidity_entry_result):
+        transition_counts[transition.kind.value] += 1
+
+    setup_count_by_sweep_timeframe: dict[str, int] = {}
+    setup_count_by_fvg_timeframe: dict[str, int] = {}
+    setup_count_by_fvg_kind: dict[str, int] = {}
+    setup_count_by_direction: dict[str, int] = {}
+    age_minutes: list[float] = []
+    setups_by_sweep_event_id: dict[str, list] = {}
+    setup_count = 0
+
+    for setup in iter_sweep_fvg_setup_events(fvg_entry_result, liquidity_entry_result):
+        setup_count += 1
+        setup_count_by_sweep_timeframe[setup.sweep_timeframe] = setup_count_by_sweep_timeframe.get(setup.sweep_timeframe, 0) + 1
+        setup_count_by_fvg_timeframe[setup.fvg_timeframe] = setup_count_by_fvg_timeframe.get(setup.fvg_timeframe, 0) + 1
+        setup_count_by_fvg_kind[setup.fvg_kind.value] = setup_count_by_fvg_kind.get(setup.fvg_kind.value, 0) + 1
+        setup_count_by_direction[setup.direction] = setup_count_by_direction.get(setup.direction, 0) + 1
+        age_minutes.append((setup.fvg_known_at - setup.sweep_known_at).total_seconds() / 60.0)
+        setups_by_sweep_event_id.setdefault(setup.sweep_event.event_id, []).append(setup)
+
+    multi_use_sweep_groups = [group for group in setups_by_sweep_event_id.values() if len(group) > 1]
+    multi_use_groups_are_same_instant_ties = all(
+        len({setup.fvg_known_at for setup in group}) == 1 for group in multi_use_sweep_groups
+    )
+
+    return {
+        "note": _SWEEP_FVG_SETUP_MODEL_NOTE,
+        "sweep_count_total": sweep_count,
+        "pending_context_transition_counts": transition_counts,
+        "setup_event_count_total": setup_count,
+        "setup_event_counts_by_sweep_timeframe": dict(sorted(setup_count_by_sweep_timeframe.items())),
+        "setup_event_counts_by_fvg_timeframe": dict(sorted(setup_count_by_fvg_timeframe.items())),
+        "setup_event_counts_by_fvg_kind": dict(sorted(setup_count_by_fvg_kind.items())),
+        "setup_event_counts_by_direction": dict(sorted(setup_count_by_direction.items())),
+        "age_minutes_sweep_known_at_to_setup_known_at": _stat_summary(age_minutes),
+        "one_time_consumption_evidence": {
+            "distinct_sweeps_consumed": len(setups_by_sweep_event_id),
+            "sweeps_consumed_by_more_than_one_tied_event": len(multi_use_sweep_groups),
+            "every_multi_use_is_a_same_instant_tie": multi_use_groups_are_same_instant_ties,
+            "created_count_equals_sweep_count": transition_counts[PendingSweepTransitionKind.CREATED.value] == sweep_count,
+            "note": (
+                "distinct_sweeps_consumed counts unique pending contexts "
+                "that were ever actually used; sweeps_consumed_by_more_"
+                "than_one_tied_event counts only those consumed by more "
+                "than one FVG/iFVG event -- every_multi_use_is_a_same_"
+                "instant_tie being true proves each such case is exactly "
+                "the deterministic same-instant tie this module's own "
+                "docstring specifies (all consuming events share the "
+                "exact same fvg_known_at), never an accidental double-"
+                "consumption across distinct instants. created_count_"
+                "equals_sweep_count being true proves every sweep "
+                "EntryEvent creates exactly one pending context, no more "
+                "and no fewer."
+            ),
+        },
+    }
+
+
 def _git_provenance() -> dict[str, str | bool | None]:
     """Best-effort git commit/dirty-state of the checkout this module
     itself is running from -- ``None``/``None`` (never fabricated) if
@@ -1159,6 +1264,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  entry signals:              {result.entry_signal_count_total}")
     print(f"  FVG suspensions (total):    {result.suspension_count_total}")
     print(f"  FVG restorations (total):   {result.restoration_count_total}")
+    print(f"  sweep->FVG setup events:    {result.sweep_fvg_setup_event_count_total}")
     return 0
 
 

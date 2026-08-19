@@ -59,6 +59,7 @@ from tradelab.profile_research_context import (
     _selector_direction_counts,
     _selector_direction_counts_in_window,
     _stat_summary,
+    _sweep_fvg_setup_model_section,
     profile_research_context,
 )
 
@@ -996,6 +997,22 @@ class ProfileSchemaVersionAndProvenanceEndToEndTests(unittest.TestCase):
             self.assertIn("entry_event_count_equals_candidate_snapshot_count", profile["entry_event_model"]["no_accumulation_evidence"])
             self.assertLessEqual(profile["entry_event_model"]["no_accumulation_evidence"]["max_active_fvg_selectors_observed"], 6)
             self.assertEqual(profile["entry_event_model"]["no_accumulation_evidence"]["max_possible_fvg_selectors_by_catalog"], 6)
+            self.assertIn("sweep_fvg_setup_model", profile)
+            self.assertIn("sweep_count_total", profile["sweep_fvg_setup_model"])
+            self.assertIn("pending_context_transition_counts", profile["sweep_fvg_setup_model"])
+            self.assertEqual(
+                set(profile["sweep_fvg_setup_model"]["pending_context_transition_counts"]),
+                {"created", "replaced", "invalidated", "consumed"},
+            )
+            self.assertIn("setup_event_count_total", profile["sweep_fvg_setup_model"])
+            self.assertIn("setup_event_counts_by_sweep_timeframe", profile["sweep_fvg_setup_model"])
+            self.assertIn("setup_event_counts_by_fvg_timeframe", profile["sweep_fvg_setup_model"])
+            self.assertIn("setup_event_counts_by_fvg_kind", profile["sweep_fvg_setup_model"])
+            self.assertIn("setup_event_counts_by_direction", profile["sweep_fvg_setup_model"])
+            self.assertIn("age_minutes_sweep_known_at_to_setup_known_at", profile["sweep_fvg_setup_model"])
+            self.assertIn("one_time_consumption_evidence", profile["sweep_fvg_setup_model"])
+            self.assertTrue(profile["sweep_fvg_setup_model"]["one_time_consumption_evidence"]["every_multi_use_is_a_same_instant_tie"])
+            self.assertTrue(profile["sweep_fvg_setup_model"]["one_time_consumption_evidence"]["created_count_equals_sweep_count"])
             self.assertEqual(profile["provenance"]["command"], "python3 -m tradelab.profile_research_context --test")
             self.assertEqual(profile["provenance"]["market_artifact_sha256"], profile["market_artifact"]["sha256"])
             self.assertEqual(profile["provenance"]["news_csv_sha256"], profile["news"]["sha256"])
@@ -1051,7 +1068,7 @@ class PhaseCallbackTests(unittest.TestCase):
     hook. Must never appear in, or affect, the deterministic JSON
     output, and must never be required (omitting it changes nothing)."""
 
-    def test_callback_receives_all_six_expected_phases_in_order(self):
+    def test_callback_receives_all_seven_expected_phases_in_order(self):
         with tempfile.TemporaryDirectory() as tmp_name:
             tmp = Path(tmp_name)
             manifest_path, news_path = write_valid_fixture(tmp)
@@ -1062,7 +1079,15 @@ class PhaseCallbackTests(unittest.TestCase):
 
             self.assertEqual(
                 observed_phases,
-                ["preparation", "lifecycle_profiling", "pool_statistics", "entry_event_model", "serialization", "total"],
+                [
+                    "preparation",
+                    "lifecycle_profiling",
+                    "pool_statistics",
+                    "entry_event_model",
+                    "sweep_fvg_setup_model",
+                    "serialization",
+                    "total",
+                ],
             )
 
     def test_callback_receives_non_negative_float_durations(self):
@@ -1233,6 +1258,66 @@ class EntryEventModelSectionTests(unittest.TestCase):
         self.assertEqual(section["candidate_entry_snapshot_count"], 0)
         self.assertTrue(section["no_accumulation_evidence"]["entry_event_count_equals_candidate_snapshot_count"])
         self.assertEqual(section["no_accumulation_evidence"]["max_active_fvg_selectors_observed"], 0)
+
+
+class SweepFVGSetupModelSectionTests(unittest.TestCase):
+    """``_sweep_fvg_setup_model_section`` (task 038): sweep counts,
+    pending-context transition counts, setup-event breakdowns, age
+    distribution, and the one-time-consumption proof."""
+
+    def test_one_sweep_and_one_compatible_touch_produce_one_setup_and_the_expected_transitions(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        sweep = liquidity_candidate_for_model("sw1", "1m", "long", t0)
+        touch = fvg_touch_candidate("z1", "5m", "long", FVGContactType.PARTIAL_TOUCH, t0 + timedelta(minutes=5))
+
+        fvg_entry_result = FVGEntryCandidateResult(candidates=[touch])
+        liquidity_entry_result = LiquidityEntryCandidateResult(candidates=[sweep])
+
+        section = _sweep_fvg_setup_model_section(fvg_entry_result, liquidity_entry_result)
+
+        self.assertEqual(section["sweep_count_total"], 1)
+        self.assertEqual(
+            section["pending_context_transition_counts"], {"created": 1, "replaced": 0, "invalidated": 0, "consumed": 1}
+        )
+        self.assertEqual(section["setup_event_count_total"], 1)
+        self.assertEqual(section["setup_event_counts_by_sweep_timeframe"], {"1m": 1})
+        self.assertEqual(section["setup_event_counts_by_fvg_timeframe"], {"5m": 1})
+        self.assertEqual(section["setup_event_counts_by_fvg_kind"], {"fvg_touch": 1})
+        self.assertEqual(section["setup_event_counts_by_direction"], {"long": 1})
+        self.assertEqual(section["age_minutes_sweep_known_at_to_setup_known_at"]["min"], 5.0)
+        self.assertEqual(section["age_minutes_sweep_known_at_to_setup_known_at"]["max"], 5.0)
+
+    def test_one_time_consumption_evidence_holds_and_flags_a_genuine_tie(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        t1 = t0 + timedelta(minutes=5)
+        sweep = liquidity_candidate_for_model("sw1", "1m", "long", t0)
+        touch_a = fvg_touch_candidate("za", "1m", "long", FVGContactType.PARTIAL_TOUCH, t1)
+        touch_b = fvg_touch_candidate("zb", "5m", "long", FVGContactType.PARTIAL_TOUCH, t1)  # exact same known_at -- a tie
+
+        fvg_entry_result = FVGEntryCandidateResult(candidates=[touch_a, touch_b])
+        liquidity_entry_result = LiquidityEntryCandidateResult(candidates=[sweep])
+
+        section = _sweep_fvg_setup_model_section(fvg_entry_result, liquidity_entry_result)
+
+        self.assertEqual(section["setup_event_count_total"], 2)
+        evidence = section["one_time_consumption_evidence"]
+        self.assertEqual(evidence["distinct_sweeps_consumed"], 1)
+        self.assertEqual(evidence["sweeps_consumed_by_more_than_one_tied_event"], 1)
+        self.assertTrue(evidence["every_multi_use_is_a_same_instant_tie"])
+        self.assertTrue(evidence["created_count_equals_sweep_count"])
+        self.assertEqual(section["pending_context_transition_counts"]["consumed"], 1)  # one context, consumed once
+
+    def test_empty_inputs_report_all_zero(self):
+        fvg_entry_result = FVGEntryCandidateResult(candidates=[])
+        liquidity_entry_result = LiquidityEntryCandidateResult(candidates=[])
+
+        section = _sweep_fvg_setup_model_section(fvg_entry_result, liquidity_entry_result)
+
+        self.assertEqual(section["sweep_count_total"], 0)
+        self.assertEqual(section["setup_event_count_total"], 0)
+        self.assertEqual(section["pending_context_transition_counts"], {"created": 0, "replaced": 0, "invalidated": 0, "consumed": 0})
+        self.assertTrue(section["one_time_consumption_evidence"]["every_multi_use_is_a_same_instant_tie"])
+        self.assertTrue(section["one_time_consumption_evidence"]["created_count_equals_sweep_count"])
 
 
 class NoRealDataInRepoTests(unittest.TestCase):
