@@ -34,7 +34,15 @@ forming candle:
 - ``MITIGATED``: a wick reaches or crosses the far boundary (full
   pass-through) but the candle does not close beyond the opposite
   boundary -- including closing back inside the zone. Terminal: a
-  mitigated zone never returns to ``ACTIVE``.
+  mitigated zone never returns to ``ACTIVE``. Exactly one
+  ``FVGMitigationEvent`` is emitted for this transition, carrying the
+  zone's own, unchanged direction -- whether it is the zone's first
+  contact ever or a later one, on any candle strictly after the zone's
+  own forming candle. A consumer that only needs a zone's own first
+  contact (``tradelab.fvg_touch``) and one that needs to know whenever
+  a zone's ``ACTIVE`` life ends without inversion, even long after an
+  earlier partial touch (``tradelab.entry_signal_timeline``'s FVG
+  suspend/restore mechanic), each use exactly the stream they need.
 - iFVG event: full pass-through *and* a close beyond the opposite
   boundary (below the lower bound for a bullish zone, above the upper
   bound for a bearish zone). The zone becomes ``MITIGATED`` (its
@@ -45,13 +53,14 @@ forming candle:
 
 No lookahead: this module only ever reasons about a candle once it is
 processed in the given chronological order, and every recorded timestamp
-(``formed_at``, ``resolved_at``, ``FVGEvent.timestamp``/``known_at``) is
-the ``known_at`` of the candle that actually confirmed it -- never an
-open time, and never a value derived from a candle not yet processed.
+(``formed_at``, ``resolved_at``, ``FVGEvent``/``FVGMitigationEvent``'s
+own ``timestamp``/``known_at``) is the ``known_at`` of the candle that
+actually confirmed it -- never an open time, and never a value derived
+from a candle not yet processed.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
@@ -177,9 +186,39 @@ class FVGEvent:
 
 
 @dataclass(frozen=True)
+class FVGMitigationEvent:
+    """A one-shot event: a zone became ``MITIGATED`` *without* inverting
+    (full pass-through, but the candle did not close beyond the opposite
+    boundary) -- no lifecycle, no retests, just an audit record that
+    this zone's ``ACTIVE`` life ended here, terminally, without ever
+    producing an ``FVGEvent``. ``direction`` is the zone's own,
+    unchanged direction (nothing inverted). ``timestamp`` and
+    ``known_at`` are always equal, both set to the confirming candle's
+    known_at, exactly like ``FVGEvent``. Emitted unconditionally
+    whenever a zone resolves this way -- whether that resolution
+    happens to be the zone's very first contact or a later one, on any
+    candle strictly after the zone's own forming candle -- so a
+    consumer that only cares about a zone's *first* contact (e.g.
+    ``tradelab.fvg_touch``) and one that needs to know *whenever* a
+    zone's ``ACTIVE`` life ends without inversion (e.g.
+    ``tradelab.entry_signal_timeline``'s FVG suspend/restore mechanic)
+    can each use exactly the stream they need, without either
+    re-detecting anything."""
+
+    zone_id: str
+    timeframe: str
+    direction: str
+    lower: float
+    upper: float
+    timestamp: datetime
+    known_at: datetime
+
+
+@dataclass(frozen=True)
 class FVGDetectionResult:
     zones: list[FVGZone]
     events: list[FVGEvent]
+    mitigations: list[FVGMitigationEvent] = field(default_factory=list)
 
 
 def _zone_width_qualifies(lower: float, upper: float, tick_size: float) -> bool:
@@ -210,6 +249,7 @@ def detect_fvgs(candles: list[Candle], timeframe: str, *, tick_size: float = DEF
     formation_order: list[str] = []
     active_ids: list[str] = []
     events: list[FVGEvent] = []
+    mitigations: list[FVGMitigationEvent] = []
     next_zone_number = 1
     previous_timestamp: datetime | None = None
     previous_known_at: datetime | None = None
@@ -232,13 +272,15 @@ def detect_fvgs(candles: list[Candle], timeframe: str, *, tick_size: float = DEF
         still_active_ids: list[str] = []
         for zone_id in active_ids:
             zone = zones_by_id[zone_id]
-            resolved, event = _apply_lifecycle(zone, candle)
+            resolved, event, mitigation = _apply_lifecycle(zone, candle)
             if resolved is None:
                 still_active_ids.append(zone_id)
             else:
                 zones_by_id[zone_id] = resolved
                 if event is not None:
                     events.append(event)
+                if mitigation is not None:
+                    mitigations.append(mitigation)
         active_ids = still_active_ids
 
         # 2. Check whether this candle completes a new 3-candle pattern.
@@ -251,7 +293,7 @@ def detect_fvgs(candles: list[Candle], timeframe: str, *, tick_size: float = DEF
                 active_ids.append(new_zone.zone_id)
 
     zones = [zones_by_id[zone_id] for zone_id in formation_order]
-    return FVGDetectionResult(zones=zones, events=events)
+    return FVGDetectionResult(zones=zones, events=events, mitigations=mitigations)
 
 
 def _try_form_zone(candle_1: Candle, candle_2: Candle, candle_3: Candle, timeframe: str, tick_size: float, zone_number: int) -> FVGZone | None:
@@ -283,10 +325,12 @@ def _try_form_zone(candle_1: Candle, candle_2: Candle, candle_3: Candle, timefra
     )
 
 
-def _apply_lifecycle(zone: FVGZone, candle: Candle) -> tuple[FVGZone | None, FVGEvent | None]:
-    """Returns (resolved_zone_or_None, event_or_None). resolved_zone is
-    None if the zone stays ACTIVE (no state change, whether untouched or
-    only partially touched)."""
+def _apply_lifecycle(zone: FVGZone, candle: Candle) -> tuple[FVGZone | None, FVGEvent | None, FVGMitigationEvent | None]:
+    """Returns (resolved_zone_or_None, ifvg_event_or_None,
+    mitigation_event_or_None). resolved_zone is None if the zone stays
+    ACTIVE (no state change, whether untouched or only partially
+    touched); otherwise exactly one of the two events is set, matching
+    which terminal outcome the zone reached."""
     if zone.direction == BULLISH:
         full_pass_through = candle.low <= zone.lower
         closed_beyond_opposite = candle.close < zone.lower
@@ -295,7 +339,7 @@ def _apply_lifecycle(zone: FVGZone, candle: Candle) -> tuple[FVGZone | None, FVG
         closed_beyond_opposite = candle.close > zone.upper
 
     if not full_pass_through:
-        return None, None  # untouched or only a partial wick entry: stays ACTIVE either way
+        return None, None, None  # untouched or only a partial wick entry: stays ACTIVE either way
 
     if closed_beyond_opposite:
         event = FVGEvent(
@@ -309,7 +353,16 @@ def _apply_lifecycle(zone: FVGZone, candle: Candle) -> tuple[FVGZone | None, FVG
             known_at=candle.known_at,
         )
         resolved = replace(zone, status=FVGStatus.MITIGATED, resolved_at=candle.known_at, produced_ifvg=True)
-        return resolved, event
+        return resolved, event, None
 
+    mitigation = FVGMitigationEvent(
+        zone_id=zone.zone_id,
+        timeframe=zone.timeframe,
+        direction=zone.direction,
+        lower=zone.lower,
+        upper=zone.upper,
+        timestamp=candle.known_at,
+        known_at=candle.known_at,
+    )
     resolved = replace(zone, status=FVGStatus.MITIGATED, resolved_at=candle.known_at, produced_ifvg=False)
-    return resolved, None
+    return resolved, None, mitigation

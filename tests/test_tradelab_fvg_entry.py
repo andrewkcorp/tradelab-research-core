@@ -17,6 +17,7 @@ from tradelab.fvg import (
     Candle,
     FVGDetectionResult,
     FVGEvent,
+    FVGMitigationEvent,
     FVGStatus,
     FVGZone,
     detect_fvgs,
@@ -136,8 +137,28 @@ def touch_event(
     )
 
 
-def fvg_result_with(zones: list[FVGZone], events: list[FVGEvent]) -> FVGDetectionResult:
-    return FVGDetectionResult(zones=zones, events=events)
+def mitigation_event(
+    zone_id: str = "1m-FVG-1",
+    timeframe: str = "1m",
+    direction: str = BULLISH,
+    lower: float = 100.0,
+    upper: float = 102.0,
+    known_at: datetime = T0 + timedelta(minutes=5),
+    timestamp: datetime | None = None,
+) -> FVGMitigationEvent:
+    return FVGMitigationEvent(
+        zone_id=zone_id,
+        timeframe=timeframe,
+        direction=direction,
+        lower=lower,
+        upper=upper,
+        timestamp=known_at if timestamp is None else timestamp,
+        known_at=known_at,
+    )
+
+
+def fvg_result_with(zones: list[FVGZone], events: list[FVGEvent], mitigations: list[FVGMitigationEvent] = ()) -> FVGDetectionResult:
+    return FVGDetectionResult(zones=zones, events=events, mitigations=list(mitigations))
 
 
 def touch_result_with(events: list[FVGTouchEvent]) -> FVGTouchDetectionResult:
@@ -432,6 +453,70 @@ class ValidationTests(unittest.TestCase):
 
     def test_duplicate_zone_id_is_rejected(self):
         fvg_result = fvg_result_with([zone(), zone()], [])
+        with self.assertRaises(ValueError):
+            detect_fvg_entry_candidates({"1m": fvg_result}, {})
+
+
+class ZoneMitigationTests(unittest.TestCase):
+    """``FVGEntryCandidateResult.zone_mitigations``: forwarded and re-
+    validated exactly like iFVG events, but never an entry candidate --
+    never in ``.candidates``, unconditionally forwarded regardless of
+    whether the zone was ever touched."""
+
+    def test_mitigation_is_forwarded_and_never_a_candidate(self):
+        fvg_result = fvg_result_with([zone(direction=BULLISH)], [], [mitigation_event()])
+        entry_result = detect_fvg_entry_candidates({"1m": fvg_result}, {})
+        self.assertEqual(len(entry_result.zone_mitigations), 1)
+        self.assertEqual(entry_result.zone_mitigations[0].zone_id, "1m-FVG-1")
+        self.assertEqual(entry_result.candidates, [])
+
+    def test_mitigation_is_forwarded_even_alongside_an_unrelated_touch(self):
+        touch_candle_result = touch_result_with([touch_event(contact_type=FVGContactType.PARTIAL_TOUCH)])
+        fvg_result = fvg_result_with([zone(direction=BULLISH)], [], [mitigation_event()])
+        entry_result = detect_fvg_entry_candidates({"1m": fvg_result}, {"1m": touch_candle_result})
+        self.assertEqual(len(entry_result.zone_mitigations), 1)
+        self.assertEqual(len(entry_result.candidates), 1)  # the touch, unaffected
+        self.assertEqual(entry_result.candidates[0].source_type, SourceType.FVG_TOUCH)
+
+    def test_mitigation_referencing_nonexistent_zone_is_rejected(self):
+        fvg_result = fvg_result_with([], [], [mitigation_event()])
+        with self.assertRaises(ValueError):
+            detect_fvg_entry_candidates({"1m": fvg_result}, {})
+
+    def test_mitigation_with_wrong_timeframe_is_rejected(self):
+        fvg_result = fvg_result_with([zone()], [], [mitigation_event(timeframe="5m")])
+        with self.assertRaises(ValueError):
+            detect_fvg_entry_candidates({"1m": fvg_result}, {})
+
+    def test_mitigation_with_direction_not_matching_the_zone_is_rejected(self):
+        # unlike an iFVG, a mitigation must carry the zone's OWN,
+        # unchanged direction -- never the opposite.
+        fvg_result = fvg_result_with([zone(direction=BULLISH)], [], [mitigation_event(direction=BEARISH)])
+        with self.assertRaises(ValueError):
+            detect_fvg_entry_candidates({"1m": fvg_result}, {})
+
+    def test_mitigation_with_wrong_bounds_is_rejected(self):
+        fvg_result = fvg_result_with([zone(lower=100.0, upper=102.0)], [], [mitigation_event(lower=99.0, upper=101.0)])
+        with self.assertRaises(ValueError):
+            detect_fvg_entry_candidates({"1m": fvg_result}, {})
+
+    def test_mitigation_known_at_equal_to_or_before_formed_at_is_rejected(self):
+        # zone().formed_at == T0 + 3min
+        for known_at in (T0 + timedelta(minutes=3), T0 + timedelta(minutes=2, seconds=30)):
+            with self.subTest(known_at=known_at):
+                fvg_result = fvg_result_with([zone(direction=BULLISH)], [], [mitigation_event(known_at=known_at)])
+                with self.assertRaises(ValueError):
+                    detect_fvg_entry_candidates({"1m": fvg_result}, {})
+
+    def test_mitigation_timestamp_not_equal_known_at_is_rejected(self):
+        fvg_result = fvg_result_with(
+            [zone(direction=BULLISH)], [], [mitigation_event(known_at=T0 + timedelta(minutes=5), timestamp=T0 + timedelta(minutes=4))]
+        )
+        with self.assertRaises(ValueError):
+            detect_fvg_entry_candidates({"1m": fvg_result}, {})
+
+    def test_duplicate_mitigation_for_same_zone_is_rejected(self):
+        fvg_result = fvg_result_with([zone(direction=BULLISH)], [], [mitigation_event(), mitigation_event()])
         with self.assertRaises(ValueError):
             detect_fvg_entry_candidates({"1m": fvg_result}, {})
 

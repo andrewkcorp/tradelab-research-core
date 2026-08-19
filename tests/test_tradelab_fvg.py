@@ -10,6 +10,7 @@ from tradelab.fvg import (
     DEFAULT_TICK_SIZE,
     SUPPORTED_TIMEFRAMES,
     Candle,
+    FVGMitigationEvent,
     FVGStatus,
     detect_fvgs,
 )
@@ -152,6 +153,72 @@ class LifecycleTests(unittest.TestCase):
         later_partial_looking = candle(4, 100.8, 100.9, 100.6, 100.7)  # would look like a "partial touch" if still active
         result = detect_fvgs(self.bullish + [full, later_partial_looking], "1m")
         self.assertEqual(result.zones[0].status, FVGStatus.MITIGATED)
+
+
+class MitigationEventTests(unittest.TestCase):
+    """``FVGMitigationEvent``: emitted whenever a zone becomes MITIGATED
+    without inverting -- whether that happens on the zone's very first
+    contact or, critically, on a later, separate candle after an
+    earlier partial touch (the scenario ``tradelab.fvg_touch`` itself
+    can never surface, since it only ever records a zone's first
+    contact)."""
+
+    def setUp(self):
+        self.bullish = bullish_setup(5)  # zone [100.0, 101.25]
+
+    def test_full_mitigation_on_first_contact_produces_exactly_one_event(self):
+        full = candle(3, 101.0, 101.2, 99.9, 100.5)  # full pass-through, closes inside -> mitigated, no inversion
+        result = detect_fvgs(self.bullish + [full], "1m")
+        self.assertEqual(len(result.mitigations), 1)
+        event = result.mitigations[0]
+        self.assertIsInstance(event, FVGMitigationEvent)
+        self.assertEqual(event.zone_id, result.zones[0].zone_id)
+        self.assertEqual(event.direction, "bullish")  # unchanged -- no inversion happened
+        self.assertEqual((event.lower, event.upper), (100.0, 101.25))
+        self.assertEqual(event.timestamp, full.known_at)
+        self.assertEqual(event.known_at, full.known_at)
+        self.assertEqual(result.events, [])  # never also an FVGEvent
+
+    def test_full_mitigation_after_an_earlier_partial_touch_still_produces_an_event(self):
+        # the exact scenario tradelab.fvg_touch itself can never surface:
+        # a genuinely later, separate candle mitigates a zone that was
+        # already partially touched earlier.
+        partial = candle(3, 100.9, 101.0, 100.5, 100.8)  # stays ACTIVE
+        full = candle(4, 100.6, 100.7, 99.9, 100.3)  # low<=100 (full), close 100.3 inside zone -> mitigated
+        result = detect_fvgs(self.bullish + [partial, full], "1m")
+        self.assertEqual(result.zones[0].status, FVGStatus.MITIGATED)
+        self.assertFalse(result.zones[0].produced_ifvg)
+        self.assertEqual(len(result.mitigations), 1)
+        event = result.mitigations[0]
+        self.assertEqual(event.timestamp, full.known_at)
+        self.assertNotEqual(event.timestamp, partial.known_at)
+
+    def test_inversion_never_also_produces_a_mitigation_event(self):
+        invert = candle(3, 100.8, 100.9, 99.9, 99.5)  # full pass-through, closes beyond -> inverts
+        result = detect_fvgs(self.bullish + [invert], "1m")
+        self.assertEqual(len(result.events), 1)
+        self.assertEqual(result.mitigations, [])
+
+    def test_partial_touch_alone_never_produces_a_mitigation_event(self):
+        touch = candle(3, 100.9, 101.0, 100.5, 100.8)
+        result = detect_fvgs(self.bullish + [touch], "1m")
+        self.assertEqual(result.mitigations, [])
+
+    def test_bearish_mitigation_mirrors_bullish(self):
+        bearish = bearish_setup(5)  # zone [98.75, 100.0]
+        partial = candle(3, 99.5, 99.7, 99.2, 99.4)  # stays ACTIVE
+        full = candle(4, 99.5, 100.05, 99.4, 99.7)  # high>=100 (full), close 99.7 inside -> mitigated
+        result = detect_fvgs(bearish + [partial, full], "1m")
+        self.assertEqual(result.zones[0].status, FVGStatus.MITIGATED)
+        self.assertFalse(result.zones[0].produced_ifvg)
+        self.assertEqual(len(result.mitigations), 1)
+        self.assertEqual(result.mitigations[0].direction, "bearish")  # unchanged
+
+    def test_mitigated_zone_never_produces_a_second_mitigation_event(self):
+        full = candle(3, 101.0, 101.2, 99.9, 100.5)
+        further = candle(4, 99.4, 99.6, 98.0, 98.5)  # keeps trading through the already-terminal zone
+        result = detect_fvgs(self.bullish + [full, further], "1m")
+        self.assertEqual(len(result.mitigations), 1)
 
 
 class OverlappingZonesTests(unittest.TestCase):

@@ -112,20 +112,25 @@ lifted, restoring the earlier signal to active. Modeled directly on
   own inversion (previous bullet) before the outer challenger resolves,
   the outer challenger's own eventual resolution finds nothing left to
   restore for that link.
-- **Known scope limitation**: ``tradelab.fvg_touch`` only ever records a
-  zone's *first* touch, whatever kind it is -- a zone whose first touch
-  was ``PARTIAL_TOUCH`` and which only *later*, on a different candle,
-  becomes ``MITIGATED`` without inverting produces **no further event at
-  all** (this module does not re-detect anything, and that transition is
-  not surfaced anywhere in ``FVGEntryCandidateResult``). A suspension
-  such a zone caused therefore cannot be observed to resolve this way;
-  it persists until/unless something else resolves it. The archetypal
-  case the spec calls out -- a zone's *first* touch already being a full
-  traversal without a close beyond the far boundary
-  (``FULL_MITIGATION_NO_INVERSION``) -- is fully handled (see above);
-  only the narrower "partial touch, then a later, separate, non-
-  inverting full traversal" case is not observable at this module's
-  input granularity.
+- **A zone that later, separately, becomes ``MITIGATED`` without
+  inverting also resolves whatever its own touch suspended.**
+  ``tradelab.fvg_touch`` only ever records a zone's *first* touch,
+  whatever kind it is -- so a zone whose first touch was
+  ``PARTIAL_TOUCH`` and which only *later*, on a different candle,
+  fully traverses without a close beyond the far boundary produces no
+  further *touch* event of its own. ``tradelab.fvg`` itself, however,
+  still emits a standalone, timestamped, no-look-ahead
+  ``FVGMitigationEvent`` for that exact transition (``tradelab.fvg_entry``
+  forwards it as ``FVGEntryCandidateResult.zone_mitigations`` -- never a
+  new entry candidate or a new selectable confluence, purely a
+  resolution fact this module consumes). At that event's own
+  ``known_at``, this module resolves the zone exactly as it would for
+  an ``IFVG``: the zone's own earlier ``PARTIAL_TOUCH`` is permanently
+  retired (same rule as the previous bullet -- never eligible for
+  restoration afterward, by anyone), and everything that touch had
+  suspended is restored. Unlike an ``IFVG``, a mitigation is never
+  itself a new active confluence -- the zone simply closes out, with no
+  replacement.
 - Same-direction FVG-family signals never suspend or invalidate each
   other, on any timeframe -- they simply coexist.
 - Never crosses timeframes, exactly like the base same-timeframe scoping
@@ -160,14 +165,14 @@ nested FVG conflicts together.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
 from enum import Enum
 from itertools import groupby
 from typing import Iterator
 from zoneinfo import ZoneInfo
 
-from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, FVGEntryCandidateResult
+from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, FVGEntryCandidateResult, FVGMitigationEvent
 from tradelab.fvg_entry import SourceType as FVGSourceType
 from tradelab.liquidity_entry import LiquidityEntryCandidate, LiquidityEntryCandidateResult
 
@@ -229,6 +234,14 @@ class EntrySignal:
 class EntrySignalTimeline:
     signals: list[EntrySignal]  # all signals, chronological by known_at
     signals_by_selector: dict[str, list[EntrySignal]]  # each list chronological by known_at
+    # Pure zone-resolution facts (never a confluence signal, never in
+    # `signals`/`signals_by_selector`, never selectable, never returned
+    # by `active_signals`) -- used solely by the FVG suspend/restore
+    # mechanic to learn when a zone's ACTIVE life ends without inverting,
+    # even long after an earlier partial touch. Chronological by known_at.
+    # Defaults to `()` so existing direct construction (bypassing
+    # `build_entry_signal_timeline`, e.g. in tests) keeps working.
+    zone_mitigations: list[FVGMitigationEvent] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -263,14 +276,17 @@ class SignalRestoration:
     """**FVG family only** (this task): ``signal`` had been suspended
     (see ``SignalSuspension``) and has since been restored, because the
     zone that suspended it has itself now resolved via ``restored_by`` --
-    always an ``IFVG`` candidate for that same zone, carrying the same
-    direction as ``signal`` (a zone's inversion always flips its own
-    direction, so the thing that suspended ``signal`` is, by resolving
-    this way, no longer opposite to it). ``signal`` is active again and
-    included in ``active_signals``."""
+    either an ``IFVG`` candidate for that same zone (carrying the same
+    direction as ``signal``, since a zone's inversion always flips its
+    own direction, so the thing that suspended ``signal`` is, by
+    resolving this way, no longer opposite to it), or a
+    ``tradelab.fvg.FVGMitigationEvent`` for that same zone (the zone
+    became ``MITIGATED`` *without* inverting -- never itself a new
+    confluence, just a pure resolution fact). ``signal`` is active again
+    and included in ``active_signals``."""
 
     signal: EntrySignal
-    restored_by: EntrySignal
+    restored_by: EntrySignal | FVGMitigationEvent
 
 
 @dataclass(frozen=True)
@@ -360,7 +376,9 @@ def build_entry_signal_timeline(
     for signal in signals:
         signals_by_selector.setdefault(signal.selector, []).append(signal)
 
-    return EntrySignalTimeline(signals=signals, signals_by_selector=signals_by_selector)
+    zone_mitigations = sorted(fvg_result.zone_mitigations, key=lambda m: (m.known_at, m.zone_id))
+
+    return EntrySignalTimeline(signals=signals, signals_by_selector=signals_by_selector, zone_mitigations=zone_mitigations)
 
 
 def _apply_liquidity_batch(
@@ -393,52 +411,36 @@ def _apply_liquidity_batch(
     return invalidations
 
 
-def _apply_fvg_batch(
-    batch: list[EntrySignal],
+def _resolve_zone(
+    zone_id: str,
+    resolving_fact: EntrySignal | FVGMitigationEvent,
     active: dict[str, dict[str, dict[str, EntrySignal]]],
     suspended: dict[str, EntrySignal],
     suspended_by: dict[str, SignalSuspension],
     pending_resolution: dict[str, list[str]],
-    touch_by_zone: dict[str, str],
+    touch_by_zone: dict[str, tuple[str, str]],
 ) -> list[SignalRestoration]:
-    """Mutates ``active`` (``timeframe -> direction -> {candidate_id:
-    signal}``), ``suspended`` (``candidate_id -> signal``, everything
-    currently suspended) and ``suspended_by`` (``candidate_id -> its
-    current SignalSuspension``) in place for one ``known_at`` batch of
-    FVG-family signals, and returns the restorations this batch caused.
-    ``pending_resolution`` maps a zone_id to the candidate_ids its own
-    ``PARTIAL_TOUCH`` suspended, so that zone's own later ``IFVG`` (if
-    any) can restore exactly those. ``touch_by_zone`` maps a zone_id to
-    its own ``PARTIAL_TOUCH`` candidate_id, so that zone's own later
-    ``IFVG`` (if any) can retire that touch -- it is now a superseded,
-    terminal fact (the zone is no longer a valid original-direction FVG
-    at all, it inverted), never eligible for restoration by anyone,
-    regardless of whether it is currently active or suspended by some
-    unrelated challenger. See module docstring for the full suspend/
-    restore rules. Batch members share this exact ``known_at`` and never
-    suspend or restore each other: restoration only ever uses a
-    strictly earlier zone's pending entry, and suspension targets are
-    the active pool as it stood before this batch's own suspensions.
+    """Shared resolution step for a zone whose ``ACTIVE`` life has just
+    ended -- whether via its own ``IFVG`` (inversion) or via a later,
+    separate ``FVGMitigationEvent`` (full traversal without inversion).
+    Permanently retires that zone's own earlier ``PARTIAL_TOUCH`` (if
+    any) -- removed from wherever it currently lives (``active``, or
+    suspended by some unrelated, still-unresolved challenger, in which
+    case it is also dropped from that challenger's own pending
+    restoration list) -- and restores everything that touch itself had
+    suspended, attributing the restoration to ``resolving_fact``. Never
+    adds anything new to ``active`` itself: that is the caller's own job
+    for an ``IFVG`` signal (it is a new confluence in its own right, on
+    top of resolving its zone), and never happens for a plain mitigation
+    (never itself a new confluence).
     """
     restorations: list[SignalRestoration] = []
 
-    # 1. An IFVG candidate in this batch permanently retires its own
-    #    zone's own, strictly earlier PARTIAL_TOUCH (if any) -- that
-    #    touch represented "this zone is still a valid FVG in its
-    #    original direction", which is no longer true now that the zone
-    #    has inverted. Remove it from wherever it currently lives
-    #    (active, or suspended by some unrelated later challenger) and
-    #    drop it from that challenger's own pending_resolution list, so
-    #    the challenger's own eventual resolution can never restore it.
-    for signal in batch:
-        candidate: FVGEntryCandidate = signal.source
-        if candidate.source_type != FVGSourceType.IFVG:
-            continue
-        touch_candidate_id = touch_by_zone.pop(candidate.zone_id, None)
-        if touch_candidate_id is None:
-            continue
+    touch_entry = touch_by_zone.pop(zone_id, None)
+    if touch_entry is not None:
+        touch_candidate_id, touch_direction = touch_entry
         if touch_candidate_id in suspended:
-            touch_signal = suspended.pop(touch_candidate_id)
+            suspended.pop(touch_candidate_id)
             challenger_zone = suspended_by.pop(touch_candidate_id).suspended_by.source.zone_id
             still_pending = [cid for cid in pending_resolution.get(challenger_zone, []) if cid != touch_candidate_id]
             if still_pending:
@@ -446,30 +448,71 @@ def _apply_fvg_batch(
             else:
                 pending_resolution.pop(challenger_zone, None)
         else:
-            tf_pool = active.get(signal.timeframe, {}).get(_OPPOSITE_DIRECTION[signal.direction], {})
+            tf_pool = active.get(resolving_fact.timeframe, {}).get(touch_direction, {})
             tf_pool.pop(touch_candidate_id, None)
 
-    # 2. Restorations: an IFVG candidate in this batch resolves its own
-    #    zone's own, strictly earlier PARTIAL_TOUCH (if any) -- a zone
-    #    produces at most one touch event ever, so this can only ever be
-    #    that same zone's own prior suspension, never someone else's.
-    for signal in batch:
-        candidate = signal.source
-        if candidate.source_type != FVGSourceType.IFVG:
-            continue
-        pending = pending_resolution.pop(candidate.zone_id, None)
-        if not pending:
-            continue
+    pending = pending_resolution.pop(zone_id, None)
+    if pending:
         for candidate_id in pending:
             restored_signal = suspended.pop(candidate_id)
             suspended_by.pop(candidate_id, None)
             active.setdefault(restored_signal.timeframe, {}).setdefault(restored_signal.direction, {})[candidate_id] = restored_signal
-            restorations.append(SignalRestoration(signal=restored_signal, restored_by=signal))
+            restorations.append(SignalRestoration(signal=restored_signal, restored_by=resolving_fact))
 
-    # 3. Challenges: a still-open PARTIAL_TOUCH ("remains a valid FVG")
+    return restorations
+
+
+def _apply_fvg_batch(
+    signal_batch: list[EntrySignal],
+    mitigation_batch: list[FVGMitigationEvent],
+    active: dict[str, dict[str, dict[str, EntrySignal]]],
+    suspended: dict[str, EntrySignal],
+    suspended_by: dict[str, SignalSuspension],
+    pending_resolution: dict[str, list[str]],
+    touch_by_zone: dict[str, tuple[str, str]],
+) -> list[SignalRestoration]:
+    """Mutates ``active`` (``timeframe -> direction -> {candidate_id:
+    signal}``), ``suspended`` (``candidate_id -> signal``, everything
+    currently suspended) and ``suspended_by`` (``candidate_id -> its
+    current SignalSuspension``) in place for one ``known_at`` batch --
+    ``signal_batch`` (real FVG-family confluence signals: touches and
+    IFVGs) and ``mitigation_batch`` (pure zone-resolution facts, never
+    confluence signals) sharing that exact ``known_at`` -- and returns
+    the restorations this batch caused. ``pending_resolution`` maps a
+    zone_id to the candidate_ids its own ``PARTIAL_TOUCH`` suspended, so
+    that zone's own later resolution (``IFVG`` or ``FVGMitigationEvent``)
+    can restore exactly those. ``touch_by_zone`` maps a zone_id to
+    ``(candidate_id, direction)`` of its own ``PARTIAL_TOUCH``, so that
+    zone's own later resolution can retire that touch -- it is now a
+    superseded, terminal fact (the zone is no longer a valid original-
+    direction FVG at all), never eligible for restoration by anyone,
+    regardless of whether it is currently active or suspended by some
+    unrelated challenger. See module docstring for the full suspend/
+    restore rules. Batch members share this exact ``known_at`` and never
+    suspend, resolve, or restore each other: resolution only ever uses a
+    strictly earlier zone's pending entry, and suspension targets are
+    the active pool as it stood before this batch's own suspensions.
+    """
+    restorations: list[SignalRestoration] = []
+
+    # 1. Resolve zones: an IFVG signal or a mitigation fact in this batch
+    #    both retire their own zone's own, strictly earlier PARTIAL_TOUCH
+    #    (if any) and restore whatever it suspended -- identical
+    #    mechanism either way (see _resolve_zone); only an IFVG is also,
+    #    separately, a brand new active confluence itself (step 3, since
+    #    it is a real signal in signal_batch).
+    for signal in signal_batch:
+        candidate: FVGEntryCandidate = signal.source
+        if candidate.source_type != FVGSourceType.IFVG:
+            continue
+        restorations.extend(_resolve_zone(candidate.zone_id, signal, active, suspended, suspended_by, pending_resolution, touch_by_zone))
+    for mitigation in mitigation_batch:
+        restorations.extend(_resolve_zone(mitigation.zone_id, mitigation, active, suspended, suspended_by, pending_resolution, touch_by_zone))
+
+    # 2. Challenges: a still-open PARTIAL_TOUCH ("remains a valid FVG")
     #    durably suspends the opposite-direction pool on its own
     #    timeframe -- an unresolved challenge, until some future event
-    #    resolves it (step 2, above, on a later batch). A
+    #    resolves it (step 1, above, on a later batch). A
     #    FULL_MITIGATION_NO_INVERSION touch is already resolved the
     #    instant it is known (its own zone is immediately, terminally
     #    MITIGATED without inverting, per tradelab.fvg) -- it still
@@ -482,16 +525,16 @@ def _apply_fvg_batch(
     #    ("the competing FVG became inactive without becoming iFVG ->
     #    restore"). IFVG candidates never challenge anything (see the
     #    module docstring); they only retire their own zone's touch and
-    #    restore whatever it suspended (steps 1-2) and become a new
-    #    active confluence (step 4). A durable PARTIAL_TOUCH also
-    #    records itself under ``touch_by_zone``, so its own zone's later
-    #    IFVG (if any) can find and retire it (step 1 above, on that
-    #    later batch).
+    #    restore whatever it suspended (step 1) and become a new active
+    #    confluence (step 3). A durable PARTIAL_TOUCH also records itself
+    #    (candidate_id and its own direction) under ``touch_by_zone``, so
+    #    its own zone's later resolution (if any) can find and retire it
+    #    (step 1 above, on that later batch).
     #    Targets are the pre-batch active pool (captured before any of
     #    this batch's own challenges are applied), so batch members
     #    never challenge each other.
     challenge_actions: list[tuple[EntrySignal, EntrySignal, bool]] = []  # (target, challenger, is_durable)
-    for signal in batch:
+    for signal in signal_batch:
         candidate = signal.source
         if candidate.source_type != FVGSourceType.FVG_TOUCH:
             continue
@@ -499,7 +542,7 @@ def _apply_fvg_batch(
             continue
         is_durable = candidate.contact_type == FVGContactType.PARTIAL_TOUCH
         if is_durable:
-            touch_by_zone[candidate.zone_id] = signal.candidate_id
+            touch_by_zone[candidate.zone_id] = (signal.candidate_id, signal.direction)
         opposite = _OPPOSITE_DIRECTION[signal.direction]
         for target in active.get(signal.timeframe, {}).get(opposite, {}).values():
             challenge_actions.append((target, signal, is_durable))
@@ -516,14 +559,33 @@ def _apply_fvg_batch(
         suspended_by[target.candidate_id] = SignalSuspension(signal=target, suspended_by=challenger)
         pending_resolution.setdefault(challenger.source.zone_id, []).append(target.candidate_id)
 
-    # 4. Every signal in this batch becomes (or remains) active, under
-    #    its own timeframe/direction, regardless of source_type/
+    # 3. Every real signal in this batch becomes (or remains) active,
+    #    under its own timeframe/direction, regardless of source_type/
     #    contact_type -- FVG-family "invalidation" is replaced by
     #    "suspension"; a newly-known signal itself is never suspended.
-    for signal in batch:
+    #    Mitigation facts are never added here: they are never
+    #    themselves a confluence.
+    for signal in signal_batch:
         active.setdefault(signal.timeframe, {}).setdefault(signal.direction, {})[signal.candidate_id] = signal
 
     return restorations
+
+
+def _merge_known_at_groups(
+    signals: list[EntrySignal], mitigations: list[FVGMitigationEvent]
+):
+    """Yields ``(signal_batch, mitigation_batch)`` pairs, one per
+    distinct ``known_at`` across both streams combined, in chronological
+    order -- each batch internally ordered exactly like a plain
+    ``sorted(signals, key=lambda s: (s.known_at, s.candidate_id))``
+    would already be, so merging in the mitigation stream never
+    perturbs pre-existing ordering among signals sharing a given
+    ``known_at``."""
+    tagged = [(s.known_at, s.candidate_id, 0, s) for s in signals] + [(m.known_at, m.zone_id, 1, m) for m in mitigations]
+    tagged.sort(key=lambda t: (t[0], t[1]))
+    for _known_at, group_iter in groupby(tagged, key=lambda t: t[0]):
+        group = list(group_iter)
+        yield [t[3] for t in group if t[2] == 0], [t[3] for t in group if t[2] == 1]
 
 
 def _resolve_liquidity(signals: list[EntrySignal]) -> tuple[list[EntrySignal], list[SignalInvalidation]]:
@@ -541,19 +603,24 @@ def _resolve_liquidity(signals: list[EntrySignal]) -> tuple[list[EntrySignal], l
 
 def _resolve_fvg_conflicts(
     signals: list[EntrySignal],
+    mitigations: list[FVGMitigationEvent],
 ) -> tuple[list[EntrySignal], list[SignalSuspension], list[SignalRestoration]]:
     """Fresh, self-contained replay of FVG-family suspend/restore over
     ``signals`` (already filtered to known-by-ts_utc and to the caller's
-    chosen selectors) -- used by ``query_active_signals``."""
-    ordered = sorted(signals, key=lambda s: (s.known_at, s.candidate_id))
+    chosen selectors) and ``mitigations`` (already filtered to known-by-
+    ts_utc; never selector-filtered -- a mitigation event only ever
+    resolves a zone whose own touch was itself already selector-
+    filtered in, via ``touch_by_zone``/``pending_resolution``, so an
+    unselected zone's mitigation is inherently a no-op) -- used by
+    ``query_active_signals``."""
     active: dict[str, dict[str, dict[str, EntrySignal]]] = {}
     suspended: dict[str, EntrySignal] = {}
     suspended_by: dict[str, SignalSuspension] = {}
     pending_resolution: dict[str, list[str]] = {}
-    touch_by_zone: dict[str, str] = {}
+    touch_by_zone: dict[str, tuple[str, str]] = {}
     restorations: list[SignalRestoration] = []
-    for _known_at, batch_iter in groupby(ordered, key=lambda s: s.known_at):
-        restorations.extend(_apply_fvg_batch(list(batch_iter), active, suspended, suspended_by, pending_resolution, touch_by_zone))
+    for signal_batch, mitigation_batch in _merge_known_at_groups(signals, mitigations):
+        restorations.extend(_apply_fvg_batch(signal_batch, mitigation_batch, active, suspended, suspended_by, pending_resolution, touch_by_zone))
     all_active = [s for tf_pools in active.values() for direction_pool in tf_pools.values() for s in direction_pool.values()]
     return all_active, list(suspended_by.values()), restorations
 
@@ -582,9 +649,13 @@ def query_active_signals(
     ]
     liquidity_signals = [s for s in candidate_signals if s.source_kind == SourceKind.LIQUIDITY]
     fvg_signals = [s for s in candidate_signals if s.source_kind == SourceKind.FVG]
+    # Never selector-filtered (see _resolve_fvg_conflicts's own docstring):
+    # a mitigation is inert unless the zone it resolves was itself already
+    # selector-filtered in via an actual touch signal above.
+    mitigations = [m for m in timeline.zone_mitigations if m.known_at <= ts_utc]
 
     liquidity_active, invalidations = _resolve_liquidity(liquidity_signals)
-    fvg_active, suspensions, restorations = _resolve_fvg_conflicts(fvg_signals)
+    fvg_active, suspensions, restorations = _resolve_fvg_conflicts(fvg_signals, mitigations)
 
     active = [s for s in liquidity_active + fvg_active if s.direction == direction]
     invalidations = [inv for inv in invalidations if inv.signal.direction == direction]
@@ -636,26 +707,30 @@ def iter_active_signal_snapshots(timeline: EntrySignalTimeline) -> Iterator[Sign
     each see *all* of the others in that same group as already known
     when their own snapshot is taken, and never invalidate, suspend, or
     restore each other (mirrors ``query_active_signals``'s own strict
-    ``>`` comparisons throughout).
+    ``>`` comparisons throughout). ``timeline.zone_mitigations`` are
+    merged into the same chronological batching as the FVG family (see
+    ``_merge_known_at_groups``) so a mitigation event still resolves
+    zones at exactly its own ``known_at``, relative to every real
+    signal -- it just never yields a ``SignalSnapshot`` of its own,
+    since it is never itself a confluence.
     """
     liquidity_active: dict[str, dict[str, EntrySignal]] = {}
     fvg_active: dict[str, dict[str, dict[str, EntrySignal]]] = {}
     fvg_suspended: dict[str, EntrySignal] = {}
     fvg_suspended_by: dict[str, SignalSuspension] = {}
     fvg_pending_resolution: dict[str, list[str]] = {}
-    fvg_touch_by_zone: dict[str, str] = {}
+    fvg_touch_by_zone: dict[str, tuple[str, str]] = {}
 
-    for _known_at, group_iter in groupby(timeline.signals, key=lambda s: s.known_at):
-        group = list(group_iter)
-        liquidity_batch = [s for s in group if s.source_kind == SourceKind.LIQUIDITY]
-        fvg_batch = [s for s in group if s.source_kind == SourceKind.FVG]
+    for real_signal_batch, mitigation_batch in _merge_known_at_groups(timeline.signals, timeline.zone_mitigations):
+        liquidity_batch = [s for s in real_signal_batch if s.source_kind == SourceKind.LIQUIDITY]
+        fvg_batch = [s for s in real_signal_batch if s.source_kind == SourceKind.FVG]
 
         if liquidity_batch:
             _apply_liquidity_batch(liquidity_batch, liquidity_active)
-        if fvg_batch:
-            _apply_fvg_batch(fvg_batch, fvg_active, fvg_suspended, fvg_suspended_by, fvg_pending_resolution, fvg_touch_by_zone)
+        if fvg_batch or mitigation_batch:
+            _apply_fvg_batch(fvg_batch, mitigation_batch, fvg_active, fvg_suspended, fvg_suspended_by, fvg_pending_resolution, fvg_touch_by_zone)
 
-        for signal in group:
+        for signal in real_signal_batch:
             active_by_selector: dict[str, list[EntrySignal]] = {}
             for pool in liquidity_active.values():
                 for other in pool.values():

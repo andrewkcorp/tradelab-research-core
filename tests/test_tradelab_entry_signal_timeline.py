@@ -26,7 +26,7 @@ from tradelab.entry_signal_timeline import (
     iter_active_signal_snapshots,
     query_active_signals,
 )
-from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, FVGEntryCandidateResult, SourceType
+from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, FVGEntryCandidateResult, FVGMitigationEvent, SourceType
 from tradelab.liquidity import HIGH, LOW, LiquidityType
 from tradelab.liquidity_entry import (
     CandidatePhase,
@@ -97,6 +97,27 @@ def fvg_touch_then_inversion(
     return touch, ifvg
 
 
+def fvg_touch_then_mitigation(
+    zone_id: str, timeframe: str, direction: str, touch_known_at: datetime, mitigation_known_at: datetime
+) -> tuple[FVGEntryCandidate, FVGMitigationEvent]:
+    """A realistic, semantically-linked pair for one zone: an initial
+    ``PARTIAL_TOUCH`` (the zone stays ``ACTIVE``), followed later, on a
+    separate candle, by that same zone becoming ``MITIGATED`` *without*
+    inverting -- carrying the zone's own, unchanged direction, per
+    ``tradelab.fvg``'s own contract. The scenario ``tradelab.fvg_touch``
+    itself can never surface on its own (it only ever records a zone's
+    first contact)."""
+    touch = fvg_candidate(
+        zone_id=zone_id, timeframe=timeframe, source_type=SourceType.FVG_TOUCH,
+        contact_type=FVGContactType.PARTIAL_TOUCH, direction=direction, known_at=touch_known_at,
+    )
+    mitigation = FVGMitigationEvent(
+        zone_id=zone_id, timeframe=timeframe, direction=direction, lower=100.0, upper=102.0,
+        timestamp=mitigation_known_at, known_at=mitigation_known_at,
+    )
+    return touch, mitigation
+
+
 def liquidity_candidate(
     level_id: str = "1m-swing_high-1",
     timeframe: str = "1m",
@@ -130,8 +151,8 @@ def liquidity_candidate(
     )
 
 
-def fvg_result(*candidates: FVGEntryCandidate) -> FVGEntryCandidateResult:
-    return FVGEntryCandidateResult(candidates=list(candidates))
+def fvg_result(*candidates: FVGEntryCandidate, mitigations: tuple[FVGMitigationEvent, ...] = ()) -> FVGEntryCandidateResult:
+    return FVGEntryCandidateResult(candidates=list(candidates), zone_mitigations=tuple(mitigations))
 
 
 def liquidity_result(*candidates: LiquidityEntryCandidate) -> LiquidityEntryCandidateResult:
@@ -521,6 +542,102 @@ class FVGSuspensionAndRestorationTests(unittest.TestCase):
         self.assertIn(unrelated_bullish.candidate_id, active_ids)
 
 
+class MitigationRestorationTests(unittest.TestCase):
+    """Regression coverage for the second reported bug: a challenger
+    that later becomes MITIGATED *without inverting* -- on a separate
+    candle, after its own earlier PARTIAL_TOUCH -- must still resolve
+    whatever it suspended, exactly as its own IFVG would, via
+    ``tradelab.fvg.FVGMitigationEvent`` (``tradelab.fvg_touch`` itself
+    can never surface this transition, since it only records a zone's
+    first contact)."""
+
+    def test_partial_touch_then_later_non_inverting_mitigation_restores_the_suspended_bullish_fvg(self):
+        bullish = fvg_candidate(zone_id="Z-A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        bearish_touch, bearish_mitigation = fvg_touch_then_mitigation("Z-B", "1m", SHORT, ny_dt(2026, 1, 5, 11, 0), ny_dt(2026, 1, 5, 13, 0))
+        timeline = build_entry_signal_timeline(fvg_result(bullish, bearish_touch, mitigations=(bearish_mitigation,)), EMPTY_LIQUIDITY)
+        selectors = {"fvg-1m-fvg_touch", "fvg-1m-ifvg"}
+
+        mid_result = query_active_signals(timeline, selectors, LONG, ny_dt(2026, 1, 5, 12, 0))
+        self.assertEqual(mid_result.active_signals, [])
+
+        result = query_active_signals(timeline, selectors, LONG, ny_dt(2026, 1, 5, 14, 0))
+        self.assertEqual([s.candidate_id for s in result.active_signals], [bullish.candidate_id])
+        self.assertEqual(len(result.restorations), 1)
+        self.assertEqual(result.restorations[0].signal.candidate_id, bullish.candidate_id)
+        self.assertIsInstance(result.restorations[0].restored_by, FVGMitigationEvent)
+        self.assertEqual(result.restorations[0].restored_by.zone_id, "Z-B")
+
+        # the mitigation is never itself a new active confluence -- the
+        # zone simply closes out, with no replacement.
+        short_result = query_active_signals(timeline, selectors, SHORT, ny_dt(2026, 1, 5, 14, 0))
+        self.assertEqual(short_result.active_signals, [])
+
+        # bearish_touch itself is permanently retired, never restorable.
+        self.assertNotIn(bearish_touch.candidate_id, {s.candidate_id for s in result.active_signals} | {s.candidate_id for s in short_result.active_signals})
+
+    def test_symmetric_bearish_original_restored_by_a_later_non_inverting_mitigation(self):
+        bearish = fvg_candidate(zone_id="Z-A2", direction=SHORT, known_at=ny_dt(2026, 1, 5, 10, 0))
+        bullish_touch, bullish_mitigation = fvg_touch_then_mitigation("Z-B2", "1m", LONG, ny_dt(2026, 1, 5, 11, 0), ny_dt(2026, 1, 5, 13, 0))
+        timeline = build_entry_signal_timeline(fvg_result(bearish, bullish_touch, mitigations=(bullish_mitigation,)), EMPTY_LIQUIDITY)
+        selectors = {"fvg-1m-fvg_touch", "fvg-1m-ifvg"}
+
+        result = query_active_signals(timeline, selectors, SHORT, ny_dt(2026, 1, 5, 14, 0))
+        self.assertEqual([s.candidate_id for s in result.active_signals], [bearish.candidate_id])
+        self.assertEqual(len(result.restorations), 1)
+        self.assertIsInstance(result.restorations[0].restored_by, FVGMitigationEvent)
+
+    def test_no_look_ahead_restoration_only_visible_from_the_mitigations_own_known_at(self):
+        bullish = fvg_candidate(zone_id="Z-A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        bearish_touch, bearish_mitigation = fvg_touch_then_mitigation("Z-B", "1m", SHORT, ny_dt(2026, 1, 5, 11, 0), ny_dt(2026, 1, 5, 13, 0))
+        timeline = build_entry_signal_timeline(fvg_result(bullish, bearish_touch, mitigations=(bearish_mitigation,)), EMPTY_LIQUIDITY)
+        selectors = {"fvg-1m-fvg_touch", "fvg-1m-ifvg"}
+
+        before = query_active_signals(timeline, selectors, LONG, ny_dt(2026, 1, 5, 12, 59))
+        self.assertEqual(before.active_signals, [])
+
+        at = query_active_signals(timeline, selectors, LONG, ny_dt(2026, 1, 5, 13, 0))
+        self.assertEqual([s.candidate_id for s in at.active_signals], [bullish.candidate_id])
+
+    def test_nested_conflict_a_mitigation_resolved_link_is_never_restored_by_an_outer_challengers_own_resolution(self):
+        # A suspended by B's touch; B suspended by C's touch; B resolves
+        # via a later, non-inverting mitigation (not an IFVG) -- restores
+        # A and permanently retires B's touch; C later inverts too, but
+        # B's touch is already gone for good, so C's own resolution has
+        # nothing left to restore.
+        a = fvg_candidate(zone_id="Z-A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        b_touch, b_mitigation = fvg_touch_then_mitigation("Z-B", "1m", SHORT, ny_dt(2026, 1, 5, 11, 0), ny_dt(2026, 1, 5, 13, 0))
+        c_touch, c_ifvg = fvg_touch_then_inversion("Z-C", "1m", LONG, ny_dt(2026, 1, 5, 12, 0), ny_dt(2026, 1, 5, 14, 0))
+        timeline = build_entry_signal_timeline(fvg_result(a, b_touch, c_touch, c_ifvg, mitigations=(b_mitigation,)), EMPTY_LIQUIDITY)
+        selectors = {"fvg-1m-fvg_touch", "fvg-1m-ifvg"}
+
+        # after B suspends A: A gone, B active SHORT
+        after_b_short = query_active_signals(timeline, selectors, SHORT, ny_dt(2026, 1, 5, 11, 30))
+        self.assertEqual([s.candidate_id for s in after_b_short.active_signals], [b_touch.candidate_id])
+
+        # after C suspends B: B gone too, C active LONG
+        after_c_short = query_active_signals(timeline, selectors, SHORT, ny_dt(2026, 1, 5, 12, 30))
+        self.assertEqual(after_c_short.active_signals, [])
+
+        # after B's own (non-inverting) mitigation: A restored, B retired for good, C still active
+        after_b_mitigation_long = query_active_signals(timeline, selectors, LONG, ny_dt(2026, 1, 5, 13, 30))
+        self.assertEqual(
+            sorted(s.candidate_id for s in after_b_mitigation_long.active_signals),
+            sorted([a.candidate_id, c_touch.candidate_id]),
+        )
+
+        # after C inverts too: nothing left for C's own resolution to
+        # restore (B's touch is already permanently gone) -- only the
+        # new iFVG(C) itself is added.
+        final_long = query_active_signals(timeline, selectors, LONG, ny_dt(2026, 1, 5, 15, 0))
+        self.assertEqual(
+            sorted(s.candidate_id for s in final_long.active_signals),
+            sorted([a.candidate_id]),
+        )
+        final_short = query_active_signals(timeline, selectors, SHORT, ny_dt(2026, 1, 5, 15, 0))
+        self.assertEqual([s.candidate_id for s in final_short.active_signals], [c_ifvg.candidate_id])
+        self.assertNotIn(b_touch.candidate_id, {s.candidate_id for s in final_long.active_signals} | {s.candidate_id for s in final_short.active_signals})
+
+
 class FVGTouchTerminalAfterOwnInversionTests(unittest.TestCase):
     """Regression coverage for the specific bug reported in review: a
     touch that itself later converts to its own iFVG is a terminally
@@ -749,37 +866,50 @@ def _random_fvg_signals(rng: random.Random, count: int, base_dt: datetime, id_pr
     return out
 
 
-def _random_fvg_zone_stories(rng: random.Random, zone_count: int, base_dt: datetime, id_prefix: str) -> list[FVGEntryCandidate]:
+def _random_fvg_zone_stories(
+    rng: random.Random, zone_count: int, base_dt: datetime, id_prefix: str
+) -> tuple[list[FVGEntryCandidate], list[FVGMitigationEvent]]:
     """Randomized but semantically-valid FVG zone lifecycles -- each zone
     gets a first touch (partial, full-mitigation, or immediate
     inversion) and, only if the first touch was partial, an optional
-    later inversion of that same zone -- mirroring
-    ``tradelab.fvg_touch``'s own "at most one touch event per zone,
-    ever" contract. Directly stresses suspend/restore/nesting."""
-    out: list[FVGEntryCandidate] = []
+    later resolution of that same zone: either a genuine inversion, or
+    a later, separate ``FVGMitigationEvent`` (the scenario
+    ``tradelab.fvg_touch`` itself can never surface, since it only ever
+    records a zone's first contact) -- mirroring ``tradelab.fvg_touch``'s
+    own "at most one touch event per zone, ever" contract. Directly
+    stresses suspend/restore/nesting/mitigation-driven-restoration."""
+    candidates: list[FVGEntryCandidate] = []
+    mitigations: list[FVGMitigationEvent] = []
     for i in range(zone_count):
         zone_id = f"{id_prefix}-{i}"
         timeframe = rng.choice(FVG_TIMEFRAME_POOL)
         direction = rng.choice([LONG, SHORT])
         touch_known_at = _avoid_maintenance_break(base_dt + timedelta(minutes=rng.randint(0, 400)))
-        kind = rng.choice(["partial_only", "partial_then_inverted", "full_mitigation", "immediate_inversion"])
+        kind = rng.choice(["partial_only", "partial_then_inverted", "partial_then_mitigated", "full_mitigation", "immediate_inversion"])
         if kind == "immediate_inversion":
             inverted = SHORT if direction == LONG else LONG
-            out.append(fvg_candidate(zone_id=zone_id, timeframe=timeframe, source_type=SourceType.IFVG, direction=inverted, known_at=touch_known_at))
+            candidates.append(
+                fvg_candidate(zone_id=zone_id, timeframe=timeframe, source_type=SourceType.IFVG, direction=inverted, known_at=touch_known_at)
+            )
         elif kind == "full_mitigation":
-            out.append(
+            candidates.append(
                 fvg_candidate(
                     zone_id=zone_id, timeframe=timeframe, source_type=SourceType.FVG_TOUCH,
                     contact_type=FVGContactType.FULL_MITIGATION_NO_INVERSION, direction=direction, known_at=touch_known_at,
                 )
             )
+        elif kind == "partial_then_mitigated":
+            mitigation_known_at = _avoid_maintenance_break(touch_known_at + timedelta(minutes=rng.randint(1, 200)))
+            touch, mitigation = fvg_touch_then_mitigation(zone_id, timeframe, direction, touch_known_at, mitigation_known_at)
+            candidates.append(touch)
+            mitigations.append(mitigation)
         else:
             inversion_known_at = _avoid_maintenance_break(touch_known_at + timedelta(minutes=rng.randint(1, 200)))
             touch, ifvg = fvg_touch_then_inversion(zone_id, timeframe, direction, touch_known_at, inversion_known_at)
-            out.append(touch)
+            candidates.append(touch)
             if kind == "partial_then_inverted":
-                out.append(ifvg)
-    return out
+                candidates.append(ifvg)
+    return candidates, mitigations
 
 
 def _random_liquidity_signals(rng: random.Random, count: int, base_dt: datetime, id_prefix: str) -> list[LiquidityEntryCandidate]:
@@ -861,19 +991,20 @@ class BulkSnapshotEquivalenceTests(unittest.TestCase):
         self._assert_snapshots_match_query(timeline)
 
     def test_matches_query_active_signals_on_randomized_realistic_fvg_zone_lifecycles(self):
-        # exercises suspend/restore/nesting directly: real touch-then-
-        # inversion pairs (same zone_id, opposite directions), immediate
-        # inversions, and full-mitigation-without-inversion, interleaved
+        # exercises suspend/restore/nesting/mitigation-driven-restoration
+        # directly: real touch-then-inversion pairs, touch-then-later-
+        # separate-mitigation pairs (same zone_id), immediate inversions,
+        # and first-contact full-mitigation-without-inversion, interleaved
         # across three timeframes.
         rng = random.Random(112233)
-        signals = _random_fvg_zone_stories(rng, 150, ny_dt(2026, 1, 5, 9, 0), "story")
-        timeline = build_entry_signal_timeline(fvg_result(*signals), EMPTY_LIQUIDITY)
+        candidates, mitigations = _random_fvg_zone_stories(rng, 150, ny_dt(2026, 1, 5, 9, 0), "story")
+        timeline = build_entry_signal_timeline(fvg_result(*candidates, mitigations=mitigations), EMPTY_LIQUIDITY)
         self._assert_snapshots_match_query(timeline)
 
     def test_matches_query_active_signals_on_randomized_realistic_fvg_zone_lifecycles_second_seed(self):
         rng = random.Random(998877)
-        signals = _random_fvg_zone_stories(rng, 200, ny_dt(2026, 3, 1, 9, 0), "story2")
-        timeline = build_entry_signal_timeline(fvg_result(*signals), EMPTY_LIQUIDITY)
+        candidates, mitigations = _random_fvg_zone_stories(rng, 200, ny_dt(2026, 3, 1, 9, 0), "story2")
+        timeline = build_entry_signal_timeline(fvg_result(*candidates, mitigations=mitigations), EMPTY_LIQUIDITY)
         self._assert_snapshots_match_query(timeline)
 
     def test_snapshot_includes_the_signal_itself_under_its_own_selector(self):

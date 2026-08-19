@@ -46,6 +46,20 @@ an ``FVG_TOUCH`` candidate for the earlier partial touch and a separate
 ``IFVG`` candidate for the later inversion -- two different facts at two
 different instants, not a duplicate of one.
 
+**``FVGEntryCandidateResult.zone_mitigations``**: a third, separate
+fact stream, never an entry candidate and never in ``candidates`` above
+-- every ``tradelab.fvg.FVGMitigationEvent`` (a zone became ``MITIGATED``
+*without* inverting), forwarded and re-validated exactly like the
+``IFVG`` events above, unconditionally regardless of whether that zone
+was ever touched, or when. This is not a new tradeable trigger (the
+zone's own, single entry trigger, if any, is already fully captured by
+``FVG_TOUCH``/``IFVG`` above) -- it exists purely so
+``tradelab.entry_signal_timeline``'s FVG suspend/restore mechanic can
+learn, with no look-ahead, exactly when a zone's ``ACTIVE`` life ends
+without inversion, even long after an earlier partial touch (a
+transition ``tradelab.fvg_touch`` itself never surfaces, since it only
+ever records a zone's first contact).
+
 No lookahead of its own: this module does not walk candles -- it only
 ever copies ``timestamp``/``known_at`` already computed upstream, so a
 candidate's ``known_at`` always equals its source event's ``known_at``
@@ -78,7 +92,7 @@ otherwise only be implicit:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
@@ -87,6 +101,7 @@ from tradelab.fvg import (  # noqa: F401  (re-exported)
     BULLISH,
     FVGDetectionResult,
     FVGEvent,
+    FVGMitigationEvent,
     FVGZone,
 )
 from tradelab.fvg_touch import FVGContactType, FVGTouchDetectionResult, FVGTouchEvent  # noqa: F401  (re-exported)
@@ -143,6 +158,16 @@ class FVGEntryCandidate:
 @dataclass(frozen=True)
 class FVGEntryCandidateResult:
     candidates: list[FVGEntryCandidate]
+    # Pure zone-resolution facts (spec 3.4) -- never an entry candidate,
+    # never selectable/tradeable, never appears in `candidates` above.
+    # A zone became MITIGATED without inverting, whether that was its
+    # very first contact or a later one after an earlier partial touch;
+    # `tradelab.entry_signal_timeline`'s FVG suspend/restore mechanic is
+    # the sole consumer, using it to resolve suspensions no later touch/
+    # iFVG event would otherwise ever surface. Defaults to `()` so every
+    # existing caller/test that builds this dataclass without it (there
+    # is nothing new to validate against for them) keeps working.
+    zone_mitigations: tuple[FVGMitigationEvent, ...] = field(default_factory=tuple)
 
 
 def detect_fvg_entry_candidates(
@@ -173,8 +198,10 @@ def detect_fvg_entry_candidates(
             )
 
     candidates: list[FVGEntryCandidate] = []
+    zone_mitigations: list[FVGMitigationEvent] = []
     for timeframe, fvg_result in fvg_results.items():
         candidates.extend(_candidates_for_timeframe(timeframe, fvg_result, touch_results.get(timeframe)))
+        zone_mitigations.extend(_mitigations_for_timeframe(timeframe, fvg_result))
 
     candidate_ids = [c.candidate_id for c in candidates]
     if len(candidate_ids) != len(set(candidate_ids)):
@@ -182,7 +209,50 @@ def detect_fvg_entry_candidates(
         raise ValueError(f"Duplicate candidate_id(s) produced: {dupes}")
 
     candidates.sort(key=lambda c: (c.known_at, c.candidate_id))
-    return FVGEntryCandidateResult(candidates=candidates)
+    zone_mitigations.sort(key=lambda m: (m.known_at, m.zone_id))
+    return FVGEntryCandidateResult(candidates=candidates, zone_mitigations=tuple(zone_mitigations))
+
+
+def _mitigations_for_timeframe(timeframe: str, fvg_result: FVGDetectionResult) -> list[FVGMitigationEvent]:
+    """Validate ``fvg_result.mitigations`` against its own zones -- the
+    same re-checking philosophy as ``_candidates_for_timeframe`` applies
+    here (this module never simply trusts that its input came from a
+    real ``detect_fvgs`` call)."""
+    zones_by_id = {zone.zone_id: zone for zone in fvg_result.zones}
+    seen_zone_ids: set[str] = set()
+    out: list[FVGMitigationEvent] = []
+    for mitigation in fvg_result.mitigations:
+        if mitigation.timeframe != timeframe:
+            raise ValueError(f"FVGMitigationEvent for zone {mitigation.zone_id!r} has timeframe {mitigation.timeframe!r}, expected {timeframe!r}")
+        zone = zones_by_id.get(mitigation.zone_id)
+        if zone is None:
+            raise ValueError(f"FVGMitigationEvent references unknown zone_id {mitigation.zone_id!r} on timeframe {timeframe!r}")
+        if mitigation.direction != zone.direction:
+            raise ValueError(
+                f"FVGMitigationEvent for zone {mitigation.zone_id!r} has direction {mitigation.direction!r}, "
+                f"expected the zone's own, unchanged direction {zone.direction!r}"
+            )
+        if mitigation.lower != zone.lower or mitigation.upper != zone.upper:
+            raise ValueError(
+                f"FVGMitigationEvent for zone {mitigation.zone_id!r} has bounds ({mitigation.lower!r}, {mitigation.upper!r}), "
+                f"expected ({zone.lower!r}, {zone.upper!r}) (from its FVGZone)"
+            )
+        if mitigation.timestamp != mitigation.known_at:
+            raise ValueError(
+                f"FVGMitigationEvent for zone {mitigation.zone_id!r} has timestamp {mitigation.timestamp!r} != known_at "
+                f"{mitigation.known_at!r} -- violates the mitigation event contract (the two are always equal)"
+            )
+        if mitigation.known_at <= zone.formed_at:
+            raise ValueError(
+                f"FVGMitigationEvent for zone {mitigation.zone_id!r} has known_at {mitigation.known_at!r} not strictly "
+                f"after its zone's formed_at {zone.formed_at!r} -- a mitigation cannot be known before or at its own "
+                "zone's formation"
+            )
+        if mitigation.zone_id in seen_zone_ids:
+            raise ValueError(f"Duplicate FVGMitigationEvent for zone_id {mitigation.zone_id!r} on timeframe {timeframe!r}")
+        seen_zone_ids.add(mitigation.zone_id)
+        out.append(mitigation)
+    return out
 
 
 def _candidates_for_timeframe(
