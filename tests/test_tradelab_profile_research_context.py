@@ -38,6 +38,7 @@ from tradelab.liquidity import LiquidityDetectionResult, LiquidityLevel, Liquidi
 from tradelab.liquidity_entry import LiquidityEntryCandidateResult
 from tradelab.profile_research_context import (
     PROFILE_WINDOWS,
+    _active_pool_stats,
     _bias_counts,
     _comparison_section,
     _compare_raw_signal_counts,
@@ -55,6 +56,7 @@ from tradelab.profile_research_context import (
     _provenance_section,
     _selector_direction_counts,
     _selector_direction_counts_in_window,
+    _stat_summary,
     profile_research_context,
 )
 
@@ -666,6 +668,135 @@ class EntrySignalTimelineStatsTests(unittest.TestCase):
         self.assertEqual(stats["still_suspended_at_end_count"], 0)
 
 
+class StatSummaryTests(unittest.TestCase):
+    def test_empty_values_report_zero_count_and_none_stats(self):
+        self.assertEqual(_stat_summary([]), {"count": 0, "min": None, "mean": None, "median": None, "p90": None, "max": None})
+
+    def test_known_values_produce_exact_deterministic_percentiles(self):
+        summary = _stat_summary([1, 2, 3, 4, 5])
+        self.assertEqual(summary["count"], 5)
+        self.assertEqual(summary["min"], 1)
+        self.assertEqual(summary["max"], 5)
+        self.assertEqual(summary["mean"], 3.0)
+        self.assertEqual(summary["median"], 3)
+        # rank = 0.9 * 4 = 3.6 -> interpolate between sorted[3]=4 and sorted[4]=5
+        self.assertAlmostEqual(summary["p90"], 4.6)
+
+    def test_input_order_never_affects_output(self):
+        self.assertEqual(_stat_summary([5, 1, 4, 2, 3]), _stat_summary([1, 2, 3, 4, 5]))
+
+
+class ActivePoolStatsTests(unittest.TestCase):
+    def test_empty_timeline_reports_zero_snapshots_everywhere(self):
+        stats = _active_pool_stats(build_fvg_only_timeline([]))
+        self.assertEqual(stats["global"]["snapshot_count"], 0)
+        self.assertEqual(stats["global"]["active_selector_count_including_primary"]["count"], 0)
+        self.assertEqual(stats["by_direction"], {})
+        self.assertEqual(stats["by_primary_selector_direction"], [])
+
+    def test_overlapping_same_selector_signals_dedupe_to_one_unique_selector(self):
+        """Two FVG_TOUCH candidates on the exact same timeframe/direction
+        (hence the exact same selector) that are both simultaneously
+        active at the second one's own snapshot must count as ONE
+        active selector, never two -- while active_signal_instance_count
+        still reflects both individual instances, so the two metrics can
+        never be confused."""
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        first = fvg_touch_candidate("z1", "1m", "long", FVGContactType.PARTIAL_TOUCH, t0)
+        second = fvg_touch_candidate("z2", "1m", "long", FVGContactType.PARTIAL_TOUCH, t0 + timedelta(minutes=1))
+        timeline = build_fvg_only_timeline([first, second])
+
+        stats = _active_pool_stats(timeline)
+        selector_entry = next(
+            row for row in stats["by_primary_selector_direction"] if row["selector"] == "fvg-1m-fvg_touch" and row["direction"] == "long"
+        )
+        self.assertEqual(selector_entry["snapshot_count"], 2)
+        # first's own snapshot: only itself active -> 1 selector, 1 instance.
+        # second's own snapshot: both first and second active, same selector -> still 1 selector, 2 instances.
+        self.assertEqual(selector_entry["active_selector_count_including_primary"], {"count": 2, "min": 1, "mean": 1.0, "median": 1.0, "p90": 1.0, "max": 1})
+        self.assertEqual(selector_entry["active_signal_instance_count"]["min"], 1)
+        self.assertEqual(selector_entry["active_signal_instance_count"]["max"], 2)
+        self.assertEqual(selector_entry["required_confluence_selector_count_excluding_primary"]["max"], 0)
+
+    def test_required_confluence_excludes_only_the_primarys_own_selector(self):
+        """A second, different selector active alongside the primary
+        must be counted as one required-confluence selector; the
+        primary's own selector must never count against itself."""
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        long_1m = fvg_touch_candidate("z1", "1m", "long", FVGContactType.PARTIAL_TOUCH, t0)
+        long_5m = fvg_touch_candidate("z2", "5m", "long", FVGContactType.PARTIAL_TOUCH, t0 + timedelta(minutes=1))
+        timeline = build_fvg_only_timeline([long_1m, long_5m])
+
+        stats = _active_pool_stats(timeline)
+        primary_entry = next(
+            row for row in stats["by_primary_selector_direction"] if row["selector"] == "fvg-5m-fvg_touch" and row["direction"] == "long"
+        )
+        # At long_5m's own snapshot: active selectors = {fvg-1m-fvg_touch, fvg-5m-fvg_touch} = 2,
+        # required confluence excludes fvg-5m-fvg_touch itself -> only fvg-1m-fvg_touch = 1.
+        self.assertEqual(primary_entry["active_selector_count_including_primary"]["max"], 2)
+        self.assertEqual(primary_entry["required_confluence_selector_count_excluding_primary"]["max"], 1)
+
+        first_entry = next(
+            row for row in stats["by_primary_selector_direction"] if row["selector"] == "fvg-1m-fvg_touch" and row["direction"] == "long"
+        )
+        # long_1m is the very first signal known -- nothing else active yet.
+        self.assertEqual(first_entry["active_selector_count_including_primary"]["max"], 1)
+        self.assertEqual(first_entry["required_confluence_selector_count_excluding_primary"]["max"], 0)
+
+    def test_directions_are_never_mixed_in_any_grouping(self):
+        """A short-direction primary's own snapshot must never include a
+        long-direction selector, even one active on a different
+        timeframe at an earlier known_at -- and by_direction/by_primary_
+        selector_direction must reflect that isolation, never a
+        cross-direction pool."""
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        long_1m = fvg_touch_candidate("z1", "1m", "long", FVGContactType.PARTIAL_TOUCH, t0)
+        long_5m = fvg_touch_candidate("z2", "5m", "long", FVGContactType.PARTIAL_TOUCH, t0 + timedelta(minutes=1))
+        short_15m = fvg_touch_candidate("z3", "15m", "short", FVGContactType.PARTIAL_TOUCH, t0 + timedelta(minutes=2))
+        timeline = build_fvg_only_timeline([long_1m, long_5m, short_15m])
+
+        stats = _active_pool_stats(timeline)
+        self.assertEqual(set(stats["by_direction"].keys()), {"long", "short"})
+        self.assertEqual(stats["by_direction"]["long"]["snapshot_count"], 2)
+        self.assertEqual(stats["by_direction"]["short"]["snapshot_count"], 1)
+        # The short primary sees only its own selector -- never the two long ones active before it.
+        short_entry = next(row for row in stats["by_primary_selector_direction"] if row["direction"] == "short")
+        self.assertEqual(short_entry["active_selector_count_including_primary"]["max"], 1)
+        self.assertEqual(short_entry["required_confluence_selector_count_excluding_primary"]["max"], 0)
+        self.assertEqual(short_entry["active_signal_instance_count"]["max"], 1)
+        # The long side, unaffected by the later short signal, still reaches 2 unique selectors.
+        self.assertEqual(stats["by_direction"]["long"]["active_selector_count_including_primary"]["max"], 2)
+
+    def test_deterministic_percentile_output_across_five_snapshots_of_the_same_selector(self):
+        """Five distinct selectors, each activated one at a time on the
+        same direction, so the Nth snapshot always sees exactly N unique
+        active selectors -- an exact, hand-computable global percentile
+        curve: [1, 2, 3, 4, 5]."""
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        timeframes = ["1m", "5m", "15m", "1H", "4H"]
+        candidates = [
+            fvg_touch_candidate(f"z{i}", tf, "long", FVGContactType.PARTIAL_TOUCH, t0 + timedelta(minutes=i))
+            for i, tf in enumerate(timeframes)
+        ]
+        timeline = build_fvg_only_timeline(candidates)
+
+        stats = _active_pool_stats(timeline)
+        summary = stats["global"]["active_selector_count_including_primary"]
+        self.assertEqual(summary["count"], 5)
+        self.assertEqual(summary["min"], 1)
+        self.assertEqual(summary["max"], 5)
+        self.assertEqual(summary["mean"], 3.0)
+        self.assertEqual(summary["median"], 3)
+        self.assertAlmostEqual(summary["p90"], 4.6)
+
+    def test_note_states_selector_count_not_instance_count_is_tractability_relevant(self):
+        stats = _active_pool_stats(build_fvg_only_timeline([]))
+        note = stats["note"]
+        self.assertIn("Selector count", note)
+        self.assertIn("not raw signal-instance count", note)
+        self.assertIn("tradelab.observed_strategy_universe", note)
+
+
 class IsImmediateResolutionRestorationTests(unittest.TestCase):
     def test_restored_by_fvg_touch_candidate_is_immediate_resolution(self):
         t0 = datetime(2024, 1, 1, tzinfo=UTC)
@@ -835,6 +966,13 @@ class ProfileSchemaVersionAndProvenanceEndToEndTests(unittest.TestCase):
             self.assertIn("suspension_count_total", profile["entry_signal_timeline"])
             self.assertIn("restoration_count_total", profile["entry_signal_timeline"])
             self.assertIn("active_fvg_confluence_duration_stats_minutes", profile["entry_signal_timeline"])
+            self.assertIn("active_pool_stats", profile)
+            self.assertIn("global", profile["active_pool_stats"])
+            self.assertIn("by_direction", profile["active_pool_stats"])
+            self.assertIn("by_primary_selector_direction", profile["active_pool_stats"])
+            self.assertIn("active_selector_count_including_primary", profile["active_pool_stats"]["global"])
+            self.assertIn("required_confluence_selector_count_excluding_primary", profile["active_pool_stats"]["global"])
+            self.assertIn("active_signal_instance_count", profile["active_pool_stats"]["global"])
             self.assertEqual(profile["provenance"]["command"], "python3 -m tradelab.profile_research_context --test")
             self.assertEqual(profile["provenance"]["market_artifact_sha256"], profile["market_artifact"]["sha256"])
             self.assertEqual(profile["provenance"]["news_csv_sha256"], profile["news"]["sha256"])

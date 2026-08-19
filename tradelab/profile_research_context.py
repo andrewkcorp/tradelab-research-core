@@ -114,6 +114,7 @@ from tradelab.entry_signal_timeline import (
     EntrySignal,
     EntrySignalTimeline,
     SignalSuspension,
+    iter_active_signal_snapshots,
     iter_fvg_lifecycle_transitions,
 )
 from tradelab.fvg import BEARISH, BULLISH, FVGDetectionResult, FVGMitigationEvent
@@ -136,11 +137,19 @@ from tradelab.research_runner import ResearchWindow
 # entry_signal_timeline suspension/restoration counts and active-FVG-
 # confluence duration statistics (all downstream of the confluence-
 # validity rework -- persist-until-invalidated, reversible FVG/iFVG
-# suspension/restoration, FVGMitigationEvent), a provenance section
-# (git commit, python version, exact command, checksums restated at the
-# top level), and an optional comparison against a prior profile JSON.
-# v1.0 profiles do not have any of these fields -- see `comparison`
-# below for exactly what a v1.0-vs-v2.0 comparison can and cannot show.
+# suspension/restoration, FVGMitigationEvent), active_pool_stats (current-
+# model-only active-confluence-pool size statistics -- unique selector
+# counts, both including and excluding each snapshot's own primary
+# selector, plus raw signal-instance counts, at every real primary
+# EntrySignal's own known_at, global/by-direction/by-primary-selector-
+# direction -- the same selector-level interpretation tradelab.observed_
+# strategy_universe.discover_observed_universe already consumes; never an
+# old-vs-new comparison, see `comparison.active_pool_comparison_possible`
+# which stays False unconditionally), a provenance section (git commit,
+# python version, exact command, checksums restated at the top level),
+# and an optional comparison against a prior profile JSON. v1.0 profiles
+# do not have any of these fields -- see `comparison` below for exactly
+# what a v1.0-vs-v2.0 comparison can and cannot show.
 PROFILE_SCHEMA_VERSION = "2.0"
 
 # MNQ, explicit -- never DEFAULT_TICK_SIZE relied upon implicitly (this
@@ -228,6 +237,7 @@ def profile_research_context(
     )
 
     timeline_stats = _entry_signal_timeline_stats(context.timeline)
+    active_pool_stats = _active_pool_stats(context.timeline)
     entry_signals_by_selector_direction = _selector_direction_counts(context.timeline)
 
     previous_profile = None
@@ -243,6 +253,7 @@ def profile_research_context(
         news_events=news_events,
         context=context,
         timeline_stats=timeline_stats,
+        active_pool_stats=active_pool_stats,
         entry_signals_by_selector_direction=entry_signals_by_selector_direction,
         previous_profile_json_path=previous_profile_json_path,
         previous_profile=previous_profile,
@@ -280,6 +291,7 @@ def _build_profile(
     news_events: list[NewsEvent],
     context: PreparedBacktestContext,
     timeline_stats: dict,
+    active_pool_stats: dict,
     entry_signals_by_selector_direction: list[dict],
     previous_profile_json_path: Path | None,
     previous_profile: dict | None,
@@ -333,6 +345,7 @@ def _build_profile(
             "raw_by_window": {window.window_id: _selector_direction_counts_in_window(context.timeline, window) for window in PROFILE_WINDOWS},
         },
         "entry_signal_timeline": timeline_stats,
+        "active_pool_stats": active_pool_stats,
         "provenance": _provenance_section(
             market_artifact_sha256=artifact.sha256, news_csv_sha256=news_sha256, command=command
         ),
@@ -552,6 +565,25 @@ def _percentile(sorted_values: list[float], fraction: float) -> float:
     return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * (rank - lower)
 
 
+def _stat_summary(values: list[float]) -> dict[str, float | int | None]:
+    """min/mean/median/p90/max over ``values``, plus its own count --
+    ``None`` for every stat (and ``0`` for the count) when ``values`` is
+    empty, never a fabricated default. Shared by every percentile-style
+    section this module writes (``active_fvg_confluence_duration_stats_
+    minutes``, ``active_pool_stats``)."""
+    if not values:
+        return {"count": 0, "min": None, "mean": None, "median": None, "p90": None, "max": None}
+    sorted_values = sorted(values)
+    return {
+        "count": len(sorted_values),
+        "min": sorted_values[0],
+        "mean": sum(sorted_values) / len(sorted_values),
+        "median": _percentile(sorted_values, 0.5),
+        "p90": _percentile(sorted_values, 0.9),
+        "max": sorted_values[-1],
+    }
+
+
 def _is_immediate_resolution_restoration(restoration) -> bool:
     """True for the one ``SignalRestoration`` shape that does NOT undo a
     prior ``SignalSuspension``: ``tradelab.entry_signal_timeline._apply_
@@ -653,6 +685,95 @@ def _entry_signal_timeline_stats(timeline: EntrySignalTimeline) -> dict:
     }
 
 
+_ACTIVE_POOL_STATS_NOTE = (
+    "Current-model-only (persist-until-invalidated), derived solely from "
+    "tradelab.entry_signal_timeline.iter_active_signal_snapshots -- never "
+    "the obsolete end-of-NY-day model, and never compared against it (see "
+    "comparison.active_pool_comparison_possible, always false). One row "
+    "per real primary EntrySignal's own snapshot; three metrics per row: "
+    "active_selector_count_including_primary (every unique selector "
+    "active in that signal's own direction at that instant, including "
+    "the primary's own selector), required_confluence_selector_count_"
+    "excluding_primary (the same set with the primary's own selector "
+    "removed -- exactly frozenset(active_by_selector.keys()) - {primary}, "
+    "the identical selector-level interpretation tradelab.observed_"
+    "strategy_universe.discover_observed_universe already consumes for "
+    "its own confluence pool), and active_signal_instance_count (the raw "
+    "count of individual EntrySignal instances active, summed across "
+    "every selector -- NOT deduplicated by selector). "
+    "active_signal_instance_count can meaningfully exceed the selector "
+    "counts (a selector can have more than one concurrently active "
+    "variant/timeframe instance); it is reported purely as a separate "
+    "audit metric. Selector count -- not raw signal-instance count -- is "
+    "the input that actually governs confluence-combination "
+    "tractability: a required-confluence subset search is bounded by "
+    "2**(number of unique selectors) in the active pool, never by the "
+    "number of individual signal instances (see tradelab.observed_"
+    "strategy_universe's own module docstring on why subset enumeration "
+    "is infeasible at real-MNQ pool sizes and why frequent-itemset "
+    "mining is used instead). This section never enumerates subsets and "
+    "never runs mining or a backtest -- it only summarizes the sizes of "
+    "the real active pools the current model actually produced."
+)
+
+
+def _active_pool_stats(timeline: EntrySignalTimeline) -> dict:
+    """Deterministic active-confluence-pool size statistics at every
+    real primary ``EntrySignal``'s own ``known_at`` -- global, by
+    direction, and by (primary selector, direction). One linear forward
+    sweep over ``iter_active_signal_snapshots`` (``O(N log N)``, never
+    re-implements suspend/restore/invalidate). See
+    ``_ACTIVE_POOL_STATS_NOTE`` for exactly what each metric measures
+    and why selector count, not signal-instance count, is what matters
+    for confluence-combination tractability."""
+    global_active: list[int] = []
+    global_confluence: list[int] = []
+    global_instances: list[int] = []
+    by_direction: dict[str, tuple[list[int], list[int], list[int]]] = {}
+    by_selector_direction: dict[tuple[str, str], tuple[list[int], list[int], list[int]]] = {}
+
+    for snapshot in iter_active_signal_snapshots(timeline):
+        signal = snapshot.signal
+        active_by_selector = snapshot.active_by_selector
+        active_selector_count = len(active_by_selector)
+        required_confluence_count = len(frozenset(active_by_selector.keys()) - {signal.selector})
+        instance_count = sum(len(signals) for signals in active_by_selector.values())
+
+        global_active.append(active_selector_count)
+        global_confluence.append(required_confluence_count)
+        global_instances.append(instance_count)
+
+        direction_bucket = by_direction.setdefault(signal.direction, ([], [], []))
+        direction_bucket[0].append(active_selector_count)
+        direction_bucket[1].append(required_confluence_count)
+        direction_bucket[2].append(instance_count)
+
+        selector_bucket = by_selector_direction.setdefault((signal.selector, signal.direction), ([], [], []))
+        selector_bucket[0].append(active_selector_count)
+        selector_bucket[1].append(required_confluence_count)
+        selector_bucket[2].append(instance_count)
+
+    def _group_summary(active: list[int], confluence: list[int], instances: list[int]) -> dict:
+        return {
+            "snapshot_count": len(active),
+            "active_selector_count_including_primary": _stat_summary(active),
+            "required_confluence_selector_count_excluding_primary": _stat_summary(confluence),
+            "active_signal_instance_count": _stat_summary(instances),
+        }
+
+    return {
+        "note": _ACTIVE_POOL_STATS_NOTE,
+        "global": _group_summary(global_active, global_confluence, global_instances),
+        "by_direction": {
+            direction: _group_summary(*buckets) for direction, buckets in sorted(by_direction.items())
+        },
+        "by_primary_selector_direction": [
+            {"selector": selector, "direction": direction, **_group_summary(*buckets)}
+            for (selector, direction), buckets in sorted(by_selector_direction.items())
+        ],
+    }
+
+
 def _git_provenance() -> dict[str, str | bool | None]:
     """Best-effort git commit/dirty-state of the checkout this module
     itself is running from -- ``None``/``None`` (never fabricated) if
@@ -737,8 +858,8 @@ _ACTIVE_POOL_COMPARISON_NOTE = (
     "merely deprecated, and reconstructing it solely for this comparison "
     "is out of scope here. This profile instead reports the current "
     "model's own active-pool/duration statistics in full (see "
-    "entry_signal_timeline), establishing a clean baseline for any "
-    "future comparison."
+    "entry_signal_timeline and active_pool_stats), establishing a clean "
+    "baseline for any future comparison."
 )
 
 
