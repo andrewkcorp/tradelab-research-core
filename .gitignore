@@ -35,3 +35,12 @@ context_profile.json
 *.sqlite3-shm
 *.db
 research_journal.sqlite3
+
+# Local research run artifacts (tradelab.research_run / tradelab.
+# research_demo / tradelab.research_dashboard) -- live-status/checkpoint/
+# leaderboard JSON and progress event logs for a research run (demo or
+# real), never committed. --runs-dir is always caller-supplied at
+# runtime; this pattern only guards against the conventional ./runs
+# default landing inside the repo by accident (e.g. for local testing).
+/runs/
+**/runs/
