@@ -10,99 +10,118 @@ anything and does not change either upstream module's semantics. Data
 wicks are not an input and never appear here (spec 4.3: a future TP/SL
 level source only).
 
-**Validity: persist until invalidated, never a time-based expiry**
-(spec, this task):
+**Validity: persist until invalidated, never a time-based expiry**:
 
 - A signal becomes available exactly at its own ``known_at`` -- never
   earlier -- and then remains active **indefinitely**, across trading
-  days without limit, until it is explicitly invalidated (see below).
-  There is no daily, session, or calendar cutoff of any kind on an
-  otherwise-still-valid confluence -- a signal known on one trading day
-  is exactly as active a month later as it was the instant it became
-  known, unless something invalidated it in between.
-- ``EntrySignal.trading_day_id`` still exists and is still computed
-  exactly the same way (the ISO date of the NY trading day -- ``[18:00
-  NY, 17:00 NY next day)`` -- that owns a signal's own ``known_at``),
-  but it is now pure audit metadata: which trading day a confluence was
-  actually born in. It plays no role whatsoever in whether that signal
-  is active -- removing it would lose useful provenance for no benefit,
-  so it stays, doing strictly less than it used to.
+  days without limit, until it is explicitly invalidated or suspended
+  (see below). There is no daily, session, or calendar cutoff of any
+  kind on an otherwise-still-valid confluence.
+- ``EntrySignal.trading_day_id`` still exists (the ISO date of the NY
+  trading day -- ``[18:00 NY, 17:00 NY next day)`` -- that owns a
+  signal's own ``known_at``), but it is pure audit metadata: it plays no
+  role whatsoever in whether that signal is active.
 - A signal whose own ``known_at`` falls strictly *between* 17:00 and
-  18:00 NY (the daily maintenance break, open interval: excludes both
-  boundaries) still belongs to no trading day at all and is still
-  rejected outright (``ValueError``) -- real candles never close in
-  there, so this can only happen from malformed input; this is a market/
-  session **data-integrity** check, not a validity-duration rule, and
-  this task does not touch it. ``known_at`` exactly *at* 17:00 NY is
-  still attributed to the trading day that is *ending* at that instant
-  (the regular session's own close, and therefore the ``known_at`` of
-  every trading day's genuinely last 1-minute candle) rather than
-  rejected -- unchanged from before, since it was never actually about
-  expiry, only about which ``trading_day_id`` a legitimate close belongs
-  to.
-- All boundary math for ``trading_day_id`` and the maintenance-break
-  check uses ``zoneinfo.ZoneInfo("America/New_York")``, never a fixed
-  UTC offset, so DST transitions are handled correctly for free.
+  18:00 NY (the daily maintenance break) still belongs to no trading day
+  at all and is rejected outright (``ValueError``) -- a market/session
+  data-integrity check, not a validity-duration rule. ``known_at``
+  exactly *at* 17:00 NY is attributed to the trading day that is
+  *ending* at that instant, not rejected.
+- All boundary math uses ``zoneinfo.ZoneInfo("America/New_York")``,
+  never a fixed UTC offset, so DST is handled correctly for free.
 
-**Invalidation: scoped by timeframe, across confluence families, never
-by selector and never across timeframes** (spec, this task -- a
-semantic correction from an earlier version of this module, which
-scoped invalidation to the exact same *selector* and, as a side effect
-of the old time-based expiry, implicitly never let signals from
-different trading days interact at all):
+**Two separate, non-interacting conflict mechanisms, by family** (this
+task -- a semantic correction from an earlier version of this module,
+which used one unified, same-timeframe, cross-family, *permanent*
+invalidation rule for everything): FVG/iFVG conflict on one timeframe
+never affects liquidity, and liquidity invalidation never affects
+FVG/iFVG, in either direction.
 
-- A **newly known** confluence invalidates every still-active, earlier
-  confluence of the **opposite direction** on the exact **same
-  timeframe** -- regardless of which family (FVG, iFVG, or liquidity)
-  or which exact selector either one belongs to. A bearish ``1m``
-  confluence -- whether it is an FVG touch, an iFVG, or any liquidity
-  take/reclaim variant -- invalidates every still-active bullish ``1m``
-  confluence of any family/selector; it never touches ``5m``/``15m``/
-  ``1H``/``4H``/``1D`` confluence of either direction. Only the exact
-  same timeframe is ever affected, in either direction.
-- Only signals whose own ``selector`` is in the caller's chosen
-  ``selectors`` set ever participate as an invalidator -- a signal from
-  a selector the caller never selected still cannot invalidate anything
-  (spec: "Sygnały z niewybranych selectorów nigdy nie unieważniają
-  setupu"), exactly as before; what changed is only the *scope* of which
-  *other* selectors on that timeframe are searched for an invalidator,
-  not this "unselected selectors are inert" guarantee itself.
-- A later signal of the **same** direction (on any timeframe, any
-  family) never invalidates an earlier one -- both simply remain active
-  side by side (spec: "może odświeżyć/uzupełnić stan, ale nie tworzy
-  duplikatu").
-- **A plain FVG touch is not itself a new opposite-direction event and
-  therefore never invalidates anything by virtue of merely touching.**
-  This is not a special case this module implements -- it falls
-  straight out of ``tradelab.fvg_entry``'s own, unchanged contract: an
-  ``FVG_TOUCH`` candidate always carries its *own* zone's original
-  direction (a bullish zone's touch is a bullish/long confluence), never
-  the opposite, so it can never be an "opposite-direction" invalidator
-  relative to that same zone's own earlier state. A zone's touch (a
-  partial touch, or even a full mitigation that does *not* close beyond
-  the far boundary) leaves the zone's own FVG classification exactly as
-  ``tradelab.fvg`` already computed it -- this module never overrides
-  that lifecycle. Only a genuine inversion -- a full traversal *and* a
-  close beyond the opposite boundary, already computed by ``tradelab.
-  fvg`` as an ``FVGEvent`` and surfaced here as an ``IFVG``-family
-  candidate -- carries the *opposite* direction of its own originating
-  zone (``tradelab.fvg_entry``'s own, unchanged contract again), and is
-  therefore a genuinely new, opposite-direction confluence on its own
-  timeframe, subject to the same invalidation rule as anything else.
-- **Once invalidated, a signal never becomes active again.** Invalidation
-  is a permanent, one-way state transition for that specific signal
-  instance (keyed by its own ``candidate_id``): a still-later signal of
-  the direction that had been invalidated is a brand new confluence
-  fact with its own ``candidate_id`` and its own ``known_at`` -- never a
-  resurrection of the earlier, already-invalidated one. There is no
-  mechanism anywhere in this module that ever re-adds a previously
-  removed signal back into an active set.
+**Liquidity: same-selector, permanent invalidation** (reverted to this
+module's original model) -- a later, opposite-direction liquidity signal
+on the **exact same** ``selector`` (never a different selector, even on
+the same timeframe) invalidates an earlier one, permanently: once
+invalidated, a signal never becomes active again, and a later signal of
+the same direction never invalidates an earlier one (refreshes/adds to
+the active state instead). Only signals whose own ``selector`` is in the
+caller's chosen ``selectors`` ever participate (spec: "Sygnaly z
+niewybranych selectorow nigdy nie uniewazniaja setupu"). Reported via
+``SignalInvalidation``.
+
+**FVG family (``FVG_TOUCH`` + ``IFVG``): same-timeframe, cross-selector,
+*reversible* suspension** -- a later, opposite-direction FVG-family
+candidate never permanently deletes an earlier one; it *suspends* it
+(retaining full identity/provenance), and that suspension can later be
+lifted, restoring the earlier signal to active. Modeled directly on
+``tradelab.fvg``'s own zone lifecycle (``ACTIVE`` / ``MITIGATED``,
+5.2) rather than reimplementing it:
+
+- Only an ``FVG_TOUCH`` candidate with ``contact_type=PARTIAL_TOUCH`` --
+  a zone that ``tradelab.fvg`` still classifies ``ACTIVE``, i.e. is
+  genuinely still an ongoing, "currently valid FVG" -- ever *durably*
+  suspends the opposite-direction pool on its own timeframe (every
+  still-active opposite-direction FVG-family signal there, any
+  selector). Reported via ``SignalSuspension``; a suspended signal is
+  not in ``active_signals`` until it is restored (see below).
+- ``FVG_TOUCH`` with ``contact_type=FULL_MITIGATION_NO_INVERSION`` is
+  already a *resolved*, terminal fact the instant it is known
+  (``tradelab.fvg``: ``MITIGATED`` without inversion is terminal, this
+  exact same candle) -- it still challenges the opposite-direction pool
+  (any new FVG-family confluence does), but that challenge is resolved
+  in the very same instant it is raised: the earlier signal is never
+  actually removed from ``active_signals`` (so it is never observably
+  missing at any queryable instant), yet a ``SignalRestoration`` is
+  still recorded for full audit transparency (spec: "the competing FVG
+  becomes inactive without becoming iFVG -> restore"). ``IFVG``
+  candidates never challenge anything -- they only restore an earlier
+  suspension caused by their own zone's prior touch (see below) and
+  become a new active confluence. All three kinds still become a new
+  active confluence of their own direction, same as any other
+  FVG-family signal.
+- **Restoration**: a zone can produce at most one ``FVG_TOUCH`` event,
+  ever (``tradelab.fvg_touch``'s own contract), so the *only* possible
+  further event for a zone whose touch was ``PARTIAL_TOUCH`` is that
+  same zone's own, later ``IFVG`` event -- and an inversion always
+  carries the *opposite* direction of its own originating zone
+  (``tradelab.fvg_entry``'s own contract), i.e. the same direction as
+  whatever that zone's earlier touch had suspended. When that ``IFVG``
+  arrives, every signal that zone's touch suspended is restored to
+  active, and the ``IFVG`` itself is also a new active confluence in its
+  own (matching) direction. If a zone that caused a suspension is never
+  later inverted, that suspension simply persists -- absent evidence of
+  resolution, the suspending FVG is treated as still valid, exactly as
+  persist-until-invalidated already treats any other unresolved fact.
+  Reported via ``SignalRestoration``.
+- **Nesting** is handled deterministically: each suspension records
+  *which* signal it was caused by, keyed by that signal's own zone; a
+  chain of suspensions (A suspended by B, B suspended by C, ...) unwinds
+  one link at a time, each only when *that* link's own suspending zone
+  resolves -- independent of whether the signal in between is itself
+  currently active or suspended.
+- **Known scope limitation**: ``tradelab.fvg_touch`` only ever records a
+  zone's *first* touch, whatever kind it is -- a zone whose first touch
+  was ``PARTIAL_TOUCH`` and which only *later*, on a different candle,
+  becomes ``MITIGATED`` without inverting produces **no further event at
+  all** (this module does not re-detect anything, and that transition is
+  not surfaced anywhere in ``FVGEntryCandidateResult``). A suspension
+  such a zone caused therefore cannot be observed to resolve this way;
+  it persists until/unless something else resolves it. The archetypal
+  case the spec calls out -- a zone's *first* touch already being a full
+  traversal without a close beyond the far boundary
+  (``FULL_MITIGATION_NO_INVERSION``) -- is fully handled (see above);
+  only the narrower "partial touch, then a later, separate, non-
+  inverting full traversal" case is not observable at this module's
+  input granularity.
+- Same-direction FVG-family signals never suspend or invalidate each
+  other, on any timeframe -- they simply coexist.
+- Never crosses timeframes, exactly like the base same-timeframe scoping
+  this module has always used for FVG-family conflict.
 
 ``query_active_signals`` answers, for a caller-chosen set of selectors
 (the strategy's own choice of which categories participate), a
 direction, and an as-of instant: every signal in ``selectors`` of that
-``direction``, already known by ``ts_utc``, and not invalidated as of
-``ts_utc`` per the rule above.
+``direction``, already known by ``ts_utc``, not invalidated (liquidity)
+and not currently suspended (FVG family) as of ``ts_utc``.
 
 Not built here, on purpose (later steps): which selectors combine into a
 concrete strategy, full combination enumeration, opening positions, the
@@ -112,20 +131,18 @@ news filter, TP/SL, or bias as a filter.
 signals`` is a fresh, self-contained query -- fine for a handful of
 caller-chosen instants, but a caller that needs the active state at
 *every* real signal's own instant (e.g. ``tradelab.observed_strategy_
-universe``, discovering which confluence selectors were ever really
-co-active) would otherwise have to call it once per signal, each call
-itself scanning the whole timeline -- ``O(N)`` queries times ``O(N))``
-work each, ``O(N^2)`` overall for ``N`` signals, which does not scale to
-a real multi-year dataset's signal count. ``iter_active_signal_
-snapshots`` computes the exact same per-instant active state for every
-signal in one linear forward sweep instead: chronological order and
-immediate (same-instant) invalidation removal -- ``O(N log N)`` total
-(no expiry bookkeeping at all now, since there is no more time-based
-expiry to schedule). It never changes ``query_active_signals`` itself
-or any of its semantics; it is a second, equivalent way to obtain the
+universe``) would otherwise have to call it once per signal, each call
+itself scanning the whole timeline -- ``O(N^2)`` overall. ``iter_active_
+signal_snapshots`` computes the exact same per-instant active state for
+every signal in one linear forward sweep instead -- ``O(N log N)``
+total. It never changes ``query_active_signals`` itself or any of its
+semantics; it is a second, independently implemented way to obtain the
 same answer at every real instant instead of a handful of caller-chosen
-ones, and its own test suite verifies the two agree exactly, including
-on randomized fixtures.
+ones (both share only the small, pure per-batch state-transition
+helpers, never any incrementally-carried state), and its own test suite
+verifies the two agree exactly, including on randomized fixtures
+exercising liquidity invalidation, FVG suspension/restoration, and
+nested FVG conflicts together.
 """
 from __future__ import annotations
 
@@ -136,7 +153,8 @@ from itertools import groupby
 from typing import Iterator
 from zoneinfo import ZoneInfo
 
-from tradelab.fvg_entry import FVGEntryCandidate, FVGEntryCandidateResult
+from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, FVGEntryCandidateResult
+from tradelab.fvg_entry import SourceType as FVGSourceType
 from tradelab.liquidity_entry import LiquidityEntryCandidate, LiquidityEntryCandidateResult
 
 NY = ZoneInfo("America/New_York")
@@ -145,6 +163,7 @@ UTC = timezone.utc
 LONG = "long"
 SHORT = "short"
 _DIRECTIONS = frozenset({LONG, SHORT})
+_OPPOSITE_DIRECTION = {LONG: SHORT, SHORT: LONG}
 
 # The daily NY maintenance break: a signal known_at falling strictly
 # inside here belongs to no trading day and is rejected outright -- a
@@ -174,11 +193,12 @@ class EntrySignal:
     ``source`` is the original candidate object, kept in full for later
     TP/SL and audit -- this module never flattens or discards any of its
     fields. ``selector`` groups signals into stable, serializable
-    categories (see module docstring); ``timeframe`` is what invalidation
-    is actually scoped by. ``trading_day_id`` is pure audit metadata
-    (which NY trading day this confluence was born in) -- it plays no
-    role in validity, which is now unbounded except for invalidation
-    (see module docstring)."""
+    categories (see module docstring); ``timeframe`` is what FVG-family
+    suspension is scoped by (liquidity invalidation is scoped by
+    ``selector`` instead -- see module docstring). ``trading_day_id`` is
+    pure audit metadata (which NY trading day this confluence was born
+    in) -- it plays no role in validity, which is unbounded except for
+    invalidation/suspension (see module docstring)."""
 
     candidate_id: str
     selector: str
@@ -199,24 +219,57 @@ class EntrySignalTimeline:
 
 @dataclass(frozen=True)
 class SignalInvalidation:
-    """Audit record: ``signal`` was invalidated by ``invalidated_by``, a
-    later, opposite-direction signal on the same timeframe (any
-    confluence family/selector on that timeframe -- see module
-    docstring)."""
+    """Permanent, one-way invalidation -- **liquidity only** (this
+    task): ``signal`` was invalidated by ``invalidated_by``, a later,
+    opposite-direction signal on the exact same liquidity ``selector``
+    (never a different selector, never cross-family with FVG/iFVG -- see
+    module docstring). The FVG family never produces this record; see
+    ``SignalSuspension``/``SignalRestoration`` instead."""
 
     signal: EntrySignal
     invalidated_by: EntrySignal
 
 
 @dataclass(frozen=True)
+class SignalSuspension:
+    """**FVG family only** (this task): ``signal`` is currently
+    suspended by ``suspended_by`` -- a later, opposite-direction
+    ``FVG_TOUCH`` candidate with ``contact_type=PARTIAL_TOUCH`` (i.e.
+    still a genuinely ongoing, "currently valid" FVG) on the exact same
+    timeframe. Reversible, never permanent: ``signal`` is simply absent
+    from ``active_signals`` while suspended, and reappears the moment
+    ``suspended_by``'s own zone resolves (see ``SignalRestoration``)."""
+
+    signal: EntrySignal
+    suspended_by: EntrySignal
+
+
+@dataclass(frozen=True)
+class SignalRestoration:
+    """**FVG family only** (this task): ``signal`` had been suspended
+    (see ``SignalSuspension``) and has since been restored, because the
+    zone that suspended it has itself now resolved via ``restored_by`` --
+    always an ``IFVG`` candidate for that same zone, carrying the same
+    direction as ``signal`` (a zone's inversion always flips its own
+    direction, so the thing that suspended ``signal`` is, by resolving
+    this way, no longer opposite to it). ``signal`` is active again and
+    included in ``active_signals``."""
+
+    signal: EntrySignal
+    restored_by: EntrySignal
+
+
+@dataclass(frozen=True)
 class EntrySignalQueryResult:
     active_signals: list[EntrySignal]
     invalidations: list[SignalInvalidation]
+    suspensions: list[SignalSuspension]
+    restorations: list[SignalRestoration]
 
 
 def _trading_day_for(known_at: datetime) -> str:
     """The ``trading_day_id`` for a signal known at ``known_at`` -- pure
-    audit metadata, no longer tied to any validity window (see module
+    audit metadata, not tied to any validity window (see module
     docstring). Raises if ``known_at`` falls strictly between 17:00 and
     18:00 NY, which no trading day owns (market/session data-integrity
     check, unrelated to validity duration). ``known_at`` exactly at
@@ -296,19 +349,172 @@ def build_entry_signal_timeline(
     return EntrySignalTimeline(signals=signals, signals_by_selector=signals_by_selector)
 
 
+def _apply_liquidity_batch(
+    batch: list[EntrySignal],
+    active: dict[str, dict[str, EntrySignal]],
+) -> list[SignalInvalidation]:
+    """Mutates ``active`` (``selector -> {candidate_id: signal}``) in
+    place for one ``known_at`` batch of liquidity signals, and returns
+    the invalidations this batch caused. Liquidity invalidation is
+    scoped to the exact same ``selector``, permanent (removed signals
+    are never re-added). Batch members share this exact ``known_at`` and
+    never invalidate each other (mirrors ``query_active_signals``'s own
+    strict ``>`` comparison): targets are the pre-batch active pool.
+    """
+    invalidations: list[SignalInvalidation] = []
+    for signal in batch:
+        selector_pool = active.get(signal.selector)
+        if not selector_pool:
+            continue
+        invalidated_ids = [cid for cid, other in selector_pool.items() if other.direction != signal.direction]
+        for candidate_id in invalidated_ids:
+            invalidated_signal = selector_pool.pop(candidate_id)
+            invalidations.append(SignalInvalidation(signal=invalidated_signal, invalidated_by=signal))
+        if not selector_pool:
+            active.pop(signal.selector, None)
+
+    for signal in batch:
+        active.setdefault(signal.selector, {})[signal.candidate_id] = signal
+
+    return invalidations
+
+
+def _apply_fvg_batch(
+    batch: list[EntrySignal],
+    active: dict[str, dict[str, dict[str, EntrySignal]]],
+    suspended: dict[str, EntrySignal],
+    suspended_by: dict[str, SignalSuspension],
+    pending_resolution: dict[str, list[str]],
+) -> list[SignalRestoration]:
+    """Mutates ``active`` (``timeframe -> direction -> {candidate_id:
+    signal}``), ``suspended`` (``candidate_id -> signal``, everything
+    currently suspended) and ``suspended_by`` (``candidate_id -> its
+    current SignalSuspension``) in place for one ``known_at`` batch of
+    FVG-family signals, and returns the restorations this batch caused.
+    ``pending_resolution`` maps a zone_id to the candidate_ids its own
+    ``PARTIAL_TOUCH`` suspended, so that zone's own later ``IFVG`` (if
+    any) can restore exactly those. See module docstring for the full
+    suspend/restore rules. Batch members share this exact ``known_at``
+    and never suspend or restore each other: restoration only ever uses
+    a strictly earlier zone's pending entry, and suspension targets are
+    the active pool as it stood before this batch's own suspensions.
+    """
+    restorations: list[SignalRestoration] = []
+
+    # 1. Restorations: an IFVG candidate in this batch resolves its own
+    #    zone's own, strictly earlier PARTIAL_TOUCH (if any) -- a zone
+    #    produces at most one touch event ever, so this can only ever be
+    #    that same zone's own prior suspension, never someone else's.
+    for signal in batch:
+        candidate: FVGEntryCandidate = signal.source
+        if candidate.source_type != FVGSourceType.IFVG:
+            continue
+        pending = pending_resolution.pop(candidate.zone_id, None)
+        if not pending:
+            continue
+        for candidate_id in pending:
+            restored_signal = suspended.pop(candidate_id)
+            suspended_by.pop(candidate_id, None)
+            active.setdefault(restored_signal.timeframe, {}).setdefault(restored_signal.direction, {})[candidate_id] = restored_signal
+            restorations.append(SignalRestoration(signal=restored_signal, restored_by=signal))
+
+    # 2. Challenges: a still-open PARTIAL_TOUCH ("remains a valid FVG")
+    #    durably suspends the opposite-direction pool on its own
+    #    timeframe -- an unresolved challenge, until some future event
+    #    resolves it (step 1, above, on a later batch). A
+    #    FULL_MITIGATION_NO_INVERSION touch is already resolved the
+    #    instant it is known (its own zone is immediately, terminally
+    #    MITIGATED without inverting, per tradelab.fvg) -- it still
+    #    challenges the opposite-direction pool (rule: "an opposite-
+    #    direction FVG touch/entry confluence appears"), but that
+    #    challenge is resolved in this exact same step: the target is
+    #    never actually removed from ``active`` (so it is never
+    #    observably missing at any queryable instant), yet a
+    #    SignalRestoration is still recorded for full audit transparency
+    #    ("the competing FVG became inactive without becoming iFVG ->
+    #    restore"). IFVG candidates never challenge anything (see the
+    #    module docstring); they only restore (step 1) and become a new
+    #    active confluence (step 3).
+    #    Targets are the pre-batch active pool (captured before any of
+    #    this batch's own challenges are applied), so batch members
+    #    never challenge each other.
+    challenge_actions: list[tuple[EntrySignal, EntrySignal, bool]] = []  # (target, challenger, is_durable)
+    for signal in batch:
+        candidate = signal.source
+        if candidate.source_type != FVGSourceType.FVG_TOUCH:
+            continue
+        if candidate.contact_type not in (FVGContactType.PARTIAL_TOUCH, FVGContactType.FULL_MITIGATION_NO_INVERSION):
+            continue
+        is_durable = candidate.contact_type == FVGContactType.PARTIAL_TOUCH
+        opposite = _OPPOSITE_DIRECTION[signal.direction]
+        for target in active.get(signal.timeframe, {}).get(opposite, {}).values():
+            challenge_actions.append((target, signal, is_durable))
+
+    for target, challenger, is_durable in challenge_actions:
+        tf_pool = active.get(target.timeframe, {}).get(target.direction, {})
+        if target.candidate_id not in tf_pool:
+            continue  # already suspended earlier in this same batch
+        if not is_durable:
+            restorations.append(SignalRestoration(signal=target, restored_by=challenger))
+            continue
+        del tf_pool[target.candidate_id]
+        suspended[target.candidate_id] = target
+        suspended_by[target.candidate_id] = SignalSuspension(signal=target, suspended_by=challenger)
+        pending_resolution.setdefault(challenger.source.zone_id, []).append(target.candidate_id)
+
+    # 3. Every signal in this batch becomes (or remains) active, under
+    #    its own timeframe/direction, regardless of source_type/
+    #    contact_type -- FVG-family "invalidation" is replaced by
+    #    "suspension"; a newly-known signal itself is never suspended.
+    for signal in batch:
+        active.setdefault(signal.timeframe, {}).setdefault(signal.direction, {})[signal.candidate_id] = signal
+
+    return restorations
+
+
+def _resolve_liquidity(signals: list[EntrySignal]) -> tuple[list[EntrySignal], list[SignalInvalidation]]:
+    """Fresh, self-contained replay of liquidity invalidation over
+    ``signals`` (already filtered to known-by-ts_utc and to the caller's
+    chosen selectors) -- used by ``query_active_signals``."""
+    ordered = sorted(signals, key=lambda s: (s.known_at, s.candidate_id))
+    active: dict[str, dict[str, EntrySignal]] = {}
+    invalidations: list[SignalInvalidation] = []
+    for _known_at, batch_iter in groupby(ordered, key=lambda s: s.known_at):
+        invalidations.extend(_apply_liquidity_batch(list(batch_iter), active))
+    all_active = [s for pool in active.values() for s in pool.values()]
+    return all_active, invalidations
+
+
+def _resolve_fvg_conflicts(
+    signals: list[EntrySignal],
+) -> tuple[list[EntrySignal], list[SignalSuspension], list[SignalRestoration]]:
+    """Fresh, self-contained replay of FVG-family suspend/restore over
+    ``signals`` (already filtered to known-by-ts_utc and to the caller's
+    chosen selectors) -- used by ``query_active_signals``."""
+    ordered = sorted(signals, key=lambda s: (s.known_at, s.candidate_id))
+    active: dict[str, dict[str, dict[str, EntrySignal]]] = {}
+    suspended: dict[str, EntrySignal] = {}
+    suspended_by: dict[str, SignalSuspension] = {}
+    pending_resolution: dict[str, list[str]] = {}
+    restorations: list[SignalRestoration] = []
+    for _known_at, batch_iter in groupby(ordered, key=lambda s: s.known_at):
+        restorations.extend(_apply_fvg_batch(list(batch_iter), active, suspended, suspended_by, pending_resolution))
+    all_active = [s for tf_pools in active.values() for direction_pool in tf_pools.values() for s in direction_pool.values()]
+    return all_active, list(suspended_by.values()), restorations
+
+
 def query_active_signals(
     timeline: EntrySignalTimeline,
     selectors: set[str],
     direction: str,
     ts_utc: datetime,
 ) -> EntrySignalQueryResult:
-    """Every signal that is known and not invalidated as of ``ts_utc``,
-    restricted to ``selectors`` and ``direction`` -- exactly the query
-    contract a future strategy enumerator needs (see module docstring
-    for the persist-until-invalidated validity model and the same-
-    timeframe, cross-family invalidation rule). There is no expiry of
-    any kind here any more: a known, not-yet-invalidated signal is
-    active no matter how long ago it became known.
+    """Every signal that is known, restricted to ``selectors`` and
+    ``direction``, and neither invalidated (liquidity) nor currently
+    suspended (FVG family) as of ``ts_utc`` -- exactly the query
+    contract a future strategy enumerator needs (see module docstring).
+    Liquidity and the FVG family are resolved completely independently
+    and never interact.
     """
     if direction not in _DIRECTIONS:
         raise ValueError(f"direction must be one of {sorted(_DIRECTIONS)}, got {direction!r}")
@@ -316,59 +522,39 @@ def query_active_signals(
         raise ValueError(f"ts_utc must be timezone-aware: {ts_utc!r}")
     ts_utc = ts_utc.astimezone(UTC)
 
-    # The invalidator search pool: every signal belonging to a caller-
-    # chosen selector (selectors outside this set can never invalidate
-    # anything, unchanged from before) -- scoped further, per candidate
-    # signal, to the exact same timeframe (never the same selector,
-    # never a different timeframe; see module docstring).
-    candidate_signals = [signal for selector in selectors for signal in timeline.signals_by_selector.get(selector, [])]
+    candidate_signals = [
+        signal for selector in selectors for signal in timeline.signals_by_selector.get(selector, []) if signal.known_at <= ts_utc
+    ]
+    liquidity_signals = [s for s in candidate_signals if s.source_kind == SourceKind.LIQUIDITY]
+    fvg_signals = [s for s in candidate_signals if s.source_kind == SourceKind.FVG]
 
-    active: list[EntrySignal] = []
-    invalidations: list[SignalInvalidation] = []
+    liquidity_active, invalidations = _resolve_liquidity(liquidity_signals)
+    fvg_active, suspensions, restorations = _resolve_fvg_conflicts(fvg_signals)
 
-    for selector in selectors:
-        selector_signals = timeline.signals_by_selector.get(selector, [])
-        for signal in selector_signals:
-            if signal.direction != direction:
-                continue
-            if signal.known_at > ts_utc:
-                continue  # not yet known
-
-            invalidator = next(
-                (
-                    other
-                    for other in candidate_signals
-                    if other.timeframe == signal.timeframe
-                    and other.direction != direction
-                    and other.known_at > signal.known_at
-                    and other.known_at <= ts_utc
-                ),
-                None,
-            )
-            if invalidator is not None:
-                invalidations.append(SignalInvalidation(signal=signal, invalidated_by=invalidator))
-                continue
-
-            active.append(signal)
+    active = [s for s in liquidity_active + fvg_active if s.direction == direction]
+    invalidations = [inv for inv in invalidations if inv.signal.direction == direction]
+    suspensions = [sus for sus in suspensions if sus.signal.direction == direction]
+    restorations = [res for res in restorations if res.signal.direction == direction]
 
     active.sort(key=lambda s: (s.known_at, s.candidate_id))
     invalidations.sort(key=lambda inv: (inv.signal.known_at, inv.signal.candidate_id))
-    return EntrySignalQueryResult(active_signals=active, invalidations=invalidations)
+    suspensions.sort(key=lambda sus: (sus.signal.known_at, sus.signal.candidate_id))
+    restorations.sort(key=lambda res: (res.signal.known_at, res.signal.candidate_id))
+    return EntrySignalQueryResult(active_signals=active, invalidations=invalidations, suspensions=suspensions, restorations=restorations)
 
 
 @dataclass(frozen=True)
 class SignalSnapshot:
     """One real ``EntrySignal``'s own ``known_at`` instant, paired with
     the full, per-selector snapshot of every signal of that *same*
-    ``signal.direction`` simultaneously active (known, not invalidated)
-    at that exact instant -- semantically identical to grouping
-    ``query_active_signals(timeline, set(timeline.signals_by_selector),
-    signal.direction, signal.known_at).active_signals`` by ``.selector``,
-    but produced by ``iter_active_signal_snapshots`` in one linear
-    forward sweep instead of a fresh query. ``active_by_selector`` always
-    includes ``signal`` itself under its own ``signal.selector`` key --
-    it is trivially known at its own ``known_at``, exactly as ``query_
-    active_signals`` would also report."""
+    ``signal.direction`` simultaneously active (known, not invalidated,
+    not currently suspended) at that exact instant -- semantically
+    identical to grouping ``query_active_signals(timeline,
+    set(timeline.signals_by_selector), signal.direction,
+    signal.known_at).active_signals`` by ``.selector``, but produced by
+    ``iter_active_signal_snapshots`` in one linear forward sweep instead
+    of a fresh query. ``active_by_selector`` always includes ``signal``
+    itself under its own ``signal.selector`` key."""
 
     signal: EntrySignal
     active_by_selector: dict[str, tuple[EntrySignal, ...]]
@@ -380,83 +566,46 @@ def iter_active_signal_snapshots(timeline: EntrySignalTimeline) -> Iterator[Sign
     ``query_active_signals`` call at that signal's own ``known_at`` for
     its own ``direction`` (with ``selectors`` = every selector in the
     timeline), grouped by selector -- computed incrementally in
-    ``O(N log N)`` total over ``N`` signals via a forward sweep (no
-    expiry bookkeeping at all: validity is unbounded except for
-    invalidation), instead of ``O(N)`` fresh queries each themselves
-    scanning the whole timeline. Never changes ``query_active_signals``
-    itself; see the module docstring's "Bulk snapshotting" section.
+    ``O(N log N)`` total over ``N`` signals via a forward sweep, instead
+    of ``O(N)`` fresh queries each themselves scanning the whole
+    timeline. Never changes ``query_active_signals`` itself; see the
+    module docstring's "Bulk snapshotting" section.
 
-    Mirrors every one of ``query_active_signals``'s rules exactly:
-    direction filtering, no time-based expiry, invalidation by a
-    strictly *later* opposite-direction signal on the *same timeframe*
-    (any confluence family/selector -- never the same selector only,
-    never a different timeframe; two signals sharing the exact same
-    ``known_at`` never invalidate each other -- this function's
-    invalidation step only ever removes a *strictly earlier* opposite-
-    direction signal, mirroring that function's own strict ``>``
-    comparison), permanent invalidation (an invalidated signal is never
-    reintroduced), and multiple simultaneously active same-selector
-    signals never collapsing into one.
+    Liquidity and the FVG family are tracked as two entirely separate,
+    incrementally-carried states (mirroring ``query_active_signals``'s
+    own independent resolution of each), combined only when flattening
+    the outward ``active_by_selector`` snapshot.
 
     Signals are processed in ``known_at``-grouped batches, not one at a
     time: two (or more) signals sharing the exact same ``known_at`` must
     each see *all* of the others in that same group as already known
-    when their own snapshot is taken (``query_active_signals`` only ever
-    checks ``known_at <= ts``, so equal ``known_at`` values are always
-    mutually visible) -- processing them strictly one-by-one in
-    ``timeline.signals``'s own tie-broken order would otherwise let an
-    earlier-processed signal's snapshot miss a same-instant sibling that
-    happens to sort after it.
-
-    Internally, the active set is tracked **by timeframe**, not by
-    selector (unlike the outward-facing ``active_by_selector`` snapshot)
-    -- invalidation is a same-timeframe, cross-family concept, so a
-    single per-timeframe pool (holding every still-active signal of any
-    selector on that timeframe) is exactly the scope one new signal's
-    invalidation check needs to search. The public snapshot is built by
-    flattening those (at most six, one per native timeframe) per-
-    timeframe pools back out by selector at yield time.
+    when their own snapshot is taken, and never invalidate, suspend, or
+    restore each other (mirrors ``query_active_signals``'s own strict
+    ``>`` comparisons throughout).
     """
-    active_by_timeframe: dict[str, dict[str, EntrySignal]] = {}
+    liquidity_active: dict[str, dict[str, EntrySignal]] = {}
+    fvg_active: dict[str, dict[str, dict[str, EntrySignal]]] = {}
+    fvg_suspended: dict[str, EntrySignal] = {}
+    fvg_suspended_by: dict[str, SignalSuspension] = {}
+    fvg_pending_resolution: dict[str, list[str]] = {}
 
-    for known_at, group_iter in groupby(timeline.signals, key=lambda s: s.known_at):
+    for _known_at, group_iter in groupby(timeline.signals, key=lambda s: s.known_at):
         group = list(group_iter)
+        liquidity_batch = [s for s in group if s.source_kind == SourceKind.LIQUIDITY]
+        fvg_batch = [s for s in group if s.source_kind == SourceKind.FVG]
 
-        # 1. Invalidate, for every signal in this group, against the
-        #    pre-group active state: a still-active, *strictly earlier*
-        #    (known_at <, never ==), opposite-direction signal on the
-        #    SAME TIMEFRAME (any selector/family) is permanently
-        #    removed. Checked per group member (not merged) so a group
-        #    mixing both directions on one timeframe still invalidates
-        #    correctly on each side; group members never invalidate each
-        #    other (their own known_at values are all equal, so the
-        #    strict "<" never matches).
-        for signal in group:
-            tf_group = active_by_timeframe.get(signal.timeframe)
-            if not tf_group:
-                continue
-            invalidated_ids = [
-                candidate_id for candidate_id, other in tf_group.items() if other.direction != signal.direction and other.known_at < known_at
-            ]
-            for candidate_id in invalidated_ids:
-                del tf_group[candidate_id]
-            if not tf_group:
-                del active_by_timeframe[signal.timeframe]
+        if liquidity_batch:
+            _apply_liquidity_batch(liquidity_batch, liquidity_active)
+        if fvg_batch:
+            _apply_fvg_batch(fvg_batch, fvg_active, fvg_suspended, fvg_suspended_by, fvg_pending_resolution)
 
-        # 2. Add every signal in this group.
-        for signal in group:
-            active_by_timeframe.setdefault(signal.timeframe, {})[signal.candidate_id] = signal
-
-        # 3. Snapshot each group member now that the whole group (and
-        #    only the whole group, nothing from the future) is active.
-        #    The active state is tracked by timeframe (for invalidation);
-        #    the outward snapshot is grouped by selector (matching what
-        #    query_active_signals itself returns), so every per-
-        #    timeframe pool is flattened back out here.
         for signal in group:
             active_by_selector: dict[str, list[EntrySignal]] = {}
-            for tf_group in active_by_timeframe.values():
-                for other in tf_group.values():
+            for pool in liquidity_active.values():
+                for other in pool.values():
                     if other.direction == signal.direction:
                         active_by_selector.setdefault(other.selector, []).append(other)
+            for tf_pools in fvg_active.values():
+                for other in tf_pools.get(signal.direction, {}).values():
+                    active_by_selector.setdefault(other.selector, []).append(other)
             yield SignalSnapshot(signal=signal, active_by_selector={selector: tuple(sigs) for selector, sigs in active_by_selector.items()})

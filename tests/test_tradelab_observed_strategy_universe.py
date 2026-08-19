@@ -40,7 +40,7 @@ from tradelab.bias import HTFBiasResult
 from tradelab.backtest import PreparedBacktestContext
 from tradelab.data_wicks import DataWickDetectionResult
 from tradelab.entry_signal_timeline import EntrySignal, EntrySignalTimeline, SourceKind
-from tradelab.fvg_entry import FVGEntryCandidate, FVGEntryCandidateResult
+from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, FVGEntryCandidateResult
 from tradelab.fvg_entry import SourceType as FVGSourceType
 from tradelab.liquidity_entry import LiquidityEntryCandidateResult
 from tradelab.observed_strategy_universe import (
@@ -82,28 +82,71 @@ def sig(
     *,
     candidate_suffix: str = "",
 ) -> EntrySignal:
+    """FVG-family selectors get a real ``FVGEntryCandidate`` as their
+    ``.source`` (``contact_type=PARTIAL_TOUCH`` -- a durable, "still a
+    valid FVG" touch, i.e. one that can actually suspend an opposite-
+    direction signal on its timeframe) -- required now that FVG-family
+    suspension/restoration (unlike the old, now-replaced invalidation
+    rule) actually inspects ``source_type``/``contact_type``/``zone_id``.
+    Liquidity selectors keep ``source=None`` -- liquidity invalidation
+    never looks at ``.source`` at all."""
     timeframe = selector.split("-")[1]
+    candidate_id = f"{selector}-{direction}-{known_at.isoformat()}{candidate_suffix}"
+    source_kind = SourceKind.FVG if selector.startswith("fvg-") else SourceKind.LIQUIDITY
+    source = None
+    if source_kind == SourceKind.FVG:
+        source_type_str = selector.split("-", 2)[2]
+        source_type = FVGSourceType.FVG_TOUCH if source_type_str == "fvg_touch" else FVGSourceType.IFVG
+        source = FVGEntryCandidate(
+            candidate_id=candidate_id,
+            source_type=source_type,
+            direction=direction,
+            timeframe=timeframe,
+            zone_id=candidate_id,
+            lower=90.0,
+            upper=95.0,
+            contact_type=FVGContactType.PARTIAL_TOUCH if source_type == FVGSourceType.FVG_TOUCH else None,
+            timestamp=known_at - timedelta(minutes=1),
+            known_at=known_at,
+        )
     return EntrySignal(
-        candidate_id=f"{selector}-{direction}-{known_at.isoformat()}{candidate_suffix}",
+        candidate_id=candidate_id,
         selector=selector,
-        source_kind=SourceKind.FVG if selector.startswith("fvg-") else SourceKind.LIQUIDITY,
+        source_kind=source_kind,
         timeframe=timeframe,
         direction=direction,
         timestamp=known_at,
         known_at=known_at,
         trading_day_id="2024-06-01",
-        source=None,
+        source=source,
     )
 
 
 def invalidator(selector: str, opposite_of: str, known_at: datetime) -> EntrySignal:
-    """A signal built purely to invalidate an earlier ``opposite_of``-
-    direction signal on ``selector``'s timeframe (persist-until-
+    """A signal built purely to end an earlier ``opposite_of``-direction
+    signal's activity on ``selector``'s timeframe (persist-until-
     invalidated model: there is no more time-based expiry, so tests that
     need a confluence to stop being active at some later instant must
-    invalidate it explicitly with an opposite-direction, same-timeframe
-    signal instead)."""
+    end it explicitly with an opposite-direction, same-timeframe signal
+    instead).
+
+    For an FVG selector this *suspends* the target: FVG-family
+    suspension is same-timeframe but cross-selector, and only a still-
+    open ``FVG_TOUCH`` (``contact_type=PARTIAL_TOUCH``) durably
+    suspends anything -- an ``IFVG``-typed selector (e.g. ``fvg-15m-
+    ifvg``) can never itself be reused as the suspending signal (an
+    IFVG candidate never suspends, it only restores/adds itself), so
+    this always builds a ``fvg-{timeframe}-fvg_touch`` signal on the
+    target's own timeframe regardless of the target's own selector.
+    Nothing in these fixtures ever restores it, so it behaves as
+    permanently gone for the timeline in question.
+
+    For a liquidity selector, on the exact same selector, this
+    permanently invalidates it."""
     other_direction = LONG if opposite_of == SHORT else SHORT
+    if selector.startswith("fvg-"):
+        timeframe = selector.split("-")[1]
+        return sig(f"fvg-{timeframe}-fvg_touch", other_direction, known_at, candidate_suffix="-inv")
     return sig(selector, other_direction, known_at)
 
 
