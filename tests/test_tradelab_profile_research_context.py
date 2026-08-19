@@ -25,16 +25,34 @@ from tradelab.bias import BEARISH as BIAS_BEARISH
 from tradelab.bias import BULLISH as BIAS_BULLISH
 from tradelab.bias import ConfluenceSource, ConfluenceType, HTFBiasResult, TimeframeBiasChange
 from tradelab.data_wicks import DataWickDetectionResult, DataWickDirection, DataWickEvent
-from tradelab.entry_signal_timeline import EntrySignal, EntrySignalTimeline, SourceKind
-from tradelab.fvg import BEARISH, BULLISH, FVGDetectionResult, FVGEvent, FVGZone, FVGStatus
+from tradelab.entry_signal_timeline import (
+    EntrySignal,
+    EntrySignalTimeline,
+    SourceKind,
+    build_entry_signal_timeline,
+)
+from tradelab.fvg import BEARISH, BULLISH, FVGDetectionResult, FVGEvent, FVGMitigationEvent, FVGZone, FVGStatus
+from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, FVGEntryCandidateResult
+from tradelab.fvg_entry import SourceType as FVGCandidateSourceType
 from tradelab.liquidity import LiquidityDetectionResult, LiquidityLevel, LiquidityStatus, LiquidityType
+from tradelab.liquidity_entry import LiquidityEntryCandidateResult
 from tradelab.profile_research_context import (
     PROFILE_WINDOWS,
     _bias_counts,
+    _comparison_section,
+    _compare_raw_signal_counts,
     _data_wick_counts,
+    _entry_signal_timeline_stats,
     _fvg_event_counts,
+    _fvg_ifvg_candidate_counts,
+    _fvg_mitigation_counts,
+    _fvg_touch_candidate_counts,
     _fvg_zone_counts,
+    _git_provenance,
+    _is_immediate_resolution_restoration,
     _liquidity_level_counts,
+    _percentile,
+    _provenance_section,
     _selector_direction_counts,
     _selector_direction_counts_in_window,
     profile_research_context,
@@ -419,6 +437,451 @@ class BiasCountingHelperTests(unittest.TestCase):
         self.assertEqual(counts["1H"]["change_count"], 3)
         self.assertEqual(counts["1H"]["state_distribution"], {"bullish": 1, "bearish": 1, "neutral": 1})
         self.assertEqual(counts["4H"], {"change_count": 0, "state_distribution": {"bullish": 0, "bearish": 0, "neutral": 0}})
+
+
+def fvg_touch_candidate(
+    zone_id: str, timeframe: str, direction: str, contact_type: FVGContactType, known_at: datetime
+) -> FVGEntryCandidate:
+    return FVGEntryCandidate(
+        candidate_id=f"{timeframe}-{FVGCandidateSourceType.FVG_TOUCH.value}-{zone_id}",
+        source_type=FVGCandidateSourceType.FVG_TOUCH,
+        direction=direction,
+        timeframe=timeframe,
+        zone_id=zone_id,
+        lower=100.0,
+        upper=101.5,
+        contact_type=contact_type,
+        timestamp=known_at,
+        known_at=known_at,
+    )
+
+
+def fvg_ifvg_candidate(zone_id: str, timeframe: str, direction: str, known_at: datetime) -> FVGEntryCandidate:
+    return FVGEntryCandidate(
+        candidate_id=f"{timeframe}-{FVGCandidateSourceType.IFVG.value}-{zone_id}",
+        source_type=FVGCandidateSourceType.IFVG,
+        direction=direction,
+        timeframe=timeframe,
+        zone_id=zone_id,
+        lower=100.0,
+        upper=101.5,
+        contact_type=None,
+        timestamp=known_at,
+        known_at=known_at,
+    )
+
+
+def fvg_mitigation(zone_id: str, timeframe: str, direction: str, known_at: datetime) -> FVGMitigationEvent:
+    return FVGMitigationEvent(
+        zone_id=zone_id, timeframe=timeframe, direction=direction, lower=100.0, upper=101.5, timestamp=known_at, known_at=known_at
+    )
+
+
+class FVGEntryCandidateCountingHelperTests(unittest.TestCase):
+    def test_touch_counts_split_by_timeframe_direction_and_contact_type(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        result = FVGEntryCandidateResult(
+            candidates=[
+                fvg_touch_candidate("z1", "1m", "long", FVGContactType.PARTIAL_TOUCH, t0),
+                fvg_touch_candidate("z2", "1m", "long", FVGContactType.PARTIAL_TOUCH, t0),
+                fvg_touch_candidate("z3", "1m", "short", FVGContactType.FULL_MITIGATION_NO_INVERSION, t0),
+                fvg_ifvg_candidate("z4", "1m", "long", t0),
+            ],
+        )
+        counts = _fvg_touch_candidate_counts(result)
+        self.assertEqual(counts["1m"]["long"], {"partial_touch": 2})
+        self.assertEqual(counts["1m"]["short"], {"full_mitigation_no_inversion": 1})
+
+    def test_ifvg_counts_split_by_timeframe_and_direction(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        result = FVGEntryCandidateResult(
+            candidates=[
+                fvg_ifvg_candidate("z1", "1m", "long", t0),
+                fvg_ifvg_candidate("z2", "1m", "long", t0),
+                fvg_ifvg_candidate("z3", "5m", "short", t0),
+                fvg_touch_candidate("z4", "1m", "short", FVGContactType.PARTIAL_TOUCH, t0),
+            ],
+        )
+        counts = _fvg_ifvg_candidate_counts(result)
+        self.assertEqual(counts["1m"], {"long": 2})
+        self.assertEqual(counts["5m"], {"short": 1})
+
+    def test_mitigation_counts_split_by_timeframe_and_direction(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        result = FVGEntryCandidateResult(
+            candidates=[],
+            zone_mitigations=(
+                fvg_mitigation("z1", "1m", "long", t0),
+                fvg_mitigation("z2", "1m", "long", t0),
+                fvg_mitigation("z3", "1m", "short", t0),
+            ),
+        )
+        counts = _fvg_mitigation_counts(result)
+        self.assertEqual(counts["1m"], {"long": 2, "short": 1})
+
+
+class PercentileHelperTests(unittest.TestCase):
+    def test_single_value_returns_itself_for_any_fraction(self):
+        self.assertEqual(_percentile([42.0], 0.5), 42.0)
+        self.assertEqual(_percentile([42.0], 0.9), 42.0)
+
+    def test_median_of_odd_count_is_the_middle_value(self):
+        self.assertEqual(_percentile([1.0, 2.0, 3.0], 0.5), 2.0)
+
+    def test_interpolates_linearly_between_closest_ranks(self):
+        self.assertEqual(_percentile([0.0, 10.0], 0.5), 5.0)
+        self.assertEqual(_percentile([0.0, 10.0], 0.9), 9.0)
+
+    def test_endpoints_return_min_and_max(self):
+        values = [1.0, 5.0, 9.0, 20.0]
+        self.assertEqual(_percentile(values, 0.0), 1.0)
+        self.assertEqual(_percentile(values, 1.0), 20.0)
+
+
+def build_fvg_only_timeline(candidates: list[FVGEntryCandidate], mitigations: tuple[FVGMitigationEvent, ...] = ()) -> EntrySignalTimeline:
+    fvg_result = FVGEntryCandidateResult(candidates=candidates, zone_mitigations=mitigations)
+    liquidity_result = LiquidityEntryCandidateResult(candidates=[])
+    return build_entry_signal_timeline(fvg_result, liquidity_result)
+
+
+class EntrySignalTimelineStatsTests(unittest.TestCase):
+    def test_no_fvg_signals_reports_all_zero_and_no_duration_stats(self):
+        timeline = build_fvg_only_timeline([])
+        stats = _entry_signal_timeline_stats(timeline)
+        self.assertEqual(stats["suspension_count_total"], 0)
+        self.assertEqual(stats["restoration_count_total"], 0)
+        self.assertEqual(stats["still_suspended_at_end_count"], 0)
+        duration_stats = stats["active_fvg_confluence_duration_stats_minutes"]
+        self.assertEqual(duration_stats["completed_count"], 0)
+        self.assertEqual(duration_stats["never_suspended_count"], 0)
+        self.assertIsNone(duration_stats["min"])
+        self.assertIsNone(duration_stats["max"])
+        self.assertIsNone(duration_stats["mean"])
+
+    def test_never_suspended_touch_counts_as_never_suspended_not_completed(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        timeline = build_fvg_only_timeline([fvg_touch_candidate("z1", "1m", "long", FVGContactType.PARTIAL_TOUCH, t0)])
+        stats = _entry_signal_timeline_stats(timeline)
+        self.assertEqual(stats["suspension_count_total"], 0)
+        duration_stats = stats["active_fvg_confluence_duration_stats_minutes"]
+        self.assertEqual(duration_stats["completed_count"], 0)
+        self.assertEqual(duration_stats["never_suspended_count"], 1)
+
+    def test_suspension_and_restoration_are_counted_and_duration_measures_time_to_first_suspension(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        bull_touch = fvg_touch_candidate("bull-1", "1m", "long", FVGContactType.PARTIAL_TOUCH, t0)
+        bear_touch = fvg_touch_candidate("bear-1", "1m", "short", FVGContactType.PARTIAL_TOUCH, t0 + timedelta(minutes=10))
+        bear_ifvg = fvg_ifvg_candidate("bear-1", "1m", "long", t0 + timedelta(minutes=25))
+        timeline = build_fvg_only_timeline([bull_touch, bear_touch, bear_ifvg])
+
+        stats = _entry_signal_timeline_stats(timeline)
+        self.assertEqual(stats["suspension_count_total"], 1)
+        self.assertEqual(stats["restoration_count_total"], 1)
+        self.assertEqual(stats["still_suspended_at_end_count"], 0)
+
+        duration_stats = stats["active_fvg_confluence_duration_stats_minutes"]
+        self.assertEqual(duration_stats["completed_count"], 1)
+        self.assertEqual(duration_stats["never_suspended_count"], 2)  # bear_touch and bear_ifvg were never themselves suspended
+        self.assertEqual(duration_stats["min"], 10.0)
+        self.assertEqual(duration_stats["max"], 10.0)
+        self.assertEqual(duration_stats["median"], 10.0)
+
+    def test_still_suspended_at_end_is_never_restored_and_has_no_duration(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        bull_touch = fvg_touch_candidate("bull-1", "1m", "long", FVGContactType.PARTIAL_TOUCH, t0)
+        bear_touch = fvg_touch_candidate("bear-1", "1m", "short", FVGContactType.PARTIAL_TOUCH, t0 + timedelta(minutes=5))
+        timeline = build_fvg_only_timeline([bull_touch, bear_touch])
+
+        stats = _entry_signal_timeline_stats(timeline)
+        self.assertEqual(stats["suspension_count_total"], 1)
+        self.assertEqual(stats["restoration_count_total"], 0)
+        self.assertEqual(stats["still_suspended_at_end_count"], 1)
+        duration_stats = stats["active_fvg_confluence_duration_stats_minutes"]
+        self.assertEqual(duration_stats["completed_count"], 1)
+        self.assertEqual(duration_stats["min"], 5.0)
+
+    def test_mitigation_event_also_restores_and_is_reflected_in_counts(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        bull_touch = fvg_touch_candidate("bull-1", "1m", "long", FVGContactType.PARTIAL_TOUCH, t0)
+        bear_touch = fvg_touch_candidate("bear-1", "1m", "short", FVGContactType.PARTIAL_TOUCH, t0 + timedelta(minutes=1))
+        bear_mitigation = fvg_mitigation("bear-1", "1m", "short", t0 + timedelta(minutes=8))
+        timeline = build_fvg_only_timeline([bull_touch, bear_touch], mitigations=(bear_mitigation,))
+
+        stats = _entry_signal_timeline_stats(timeline)
+        self.assertEqual(stats["suspension_count_total"], 1)
+        self.assertEqual(stats["restoration_count_total"], 1)
+        self.assertEqual(stats["still_suspended_at_end_count"], 0)
+
+    def test_immediate_full_mitigation_challenge_never_suspends_and_is_excluded_from_still_suspended_math(self):
+        """A FULL_MITIGATION_NO_INVERSION-typed touch challenges the
+        opposite pool but, per tradelab.entry_signal_timeline._apply_
+        fvg_batch step 2, its own zone is already resolved the instant
+        it is known -- the target is never actually removed from
+        active, yet a SignalRestoration is still recorded for audit
+        transparency. suspension_count_total must stay 0 here (nothing
+        was ever suspended), restoration_count_total must be 1 (the
+        audit-only record), and still_suspended_at_end_count must use
+        only the non-immediate-resolution subset -- never go negative
+        or otherwise misrepresent a real suspend/restore pairing that
+        never happened."""
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        bull_touch = fvg_touch_candidate("bull-1", "1m", "long", FVGContactType.PARTIAL_TOUCH, t0)
+        bear_full_mitigation_touch = fvg_touch_candidate(
+            "bear-1", "1m", "short", FVGContactType.FULL_MITIGATION_NO_INVERSION, t0 + timedelta(minutes=5)
+        )
+        timeline = build_fvg_only_timeline([bull_touch, bear_full_mitigation_touch])
+
+        stats = _entry_signal_timeline_stats(timeline)
+        self.assertEqual(stats["suspension_count_total"], 0)
+        self.assertEqual(stats["restoration_count_total"], 1)
+        self.assertEqual(stats["restoration_of_suspended_signal_count_total"], 0)
+        self.assertEqual(stats["immediate_resolution_restoration_count_total"], 1)
+        self.assertEqual(stats["still_suspended_at_end_count"], 0)
+        duration_stats = stats["active_fvg_confluence_duration_stats_minutes"]
+        self.assertEqual(duration_stats["completed_count"], 0)
+        self.assertEqual(duration_stats["never_suspended_count"], 2)
+
+    def test_real_suspension_and_immediate_resolution_restoration_do_not_cross_contaminate_counts(self):
+        """A genuine suspend/restore pair (via a later IFVG) coexists
+        with an unrelated immediate-resolution restoration on a second,
+        independent zone -- the still_suspended_at_end_count math must
+        only ever consult the first pair, never be thrown off by the
+        second, audit-only restoration."""
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        bull_touch = fvg_touch_candidate("bull-1", "1m", "long", FVGContactType.PARTIAL_TOUCH, t0)
+        bear_touch = fvg_touch_candidate("bear-1", "1m", "short", FVGContactType.PARTIAL_TOUCH, t0 + timedelta(minutes=1))
+        bear_ifvg = fvg_ifvg_candidate("bear-1", "1m", "long", t0 + timedelta(minutes=2))
+        # Independent zone on a different timeframe -- never interacts with the pair above.
+        long5m_touch = fvg_touch_candidate("bull5-1", "5m", "long", FVGContactType.PARTIAL_TOUCH, t0)
+        short5m_full_mitigation = fvg_touch_candidate(
+            "bear5-1", "5m", "short", FVGContactType.FULL_MITIGATION_NO_INVERSION, t0 + timedelta(minutes=3)
+        )
+        timeline = build_fvg_only_timeline([bull_touch, bear_touch, bear_ifvg, long5m_touch, short5m_full_mitigation])
+
+        stats = _entry_signal_timeline_stats(timeline)
+        self.assertEqual(stats["suspension_count_total"], 1)
+        self.assertEqual(stats["restoration_count_total"], 2)
+        self.assertEqual(stats["restoration_of_suspended_signal_count_total"], 1)
+        self.assertEqual(stats["immediate_resolution_restoration_count_total"], 1)
+        self.assertEqual(stats["still_suspended_at_end_count"], 0)
+
+
+class IsImmediateResolutionRestorationTests(unittest.TestCase):
+    def test_restored_by_fvg_touch_candidate_is_immediate_resolution(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        signal = EntrySignal(
+            candidate_id="c1",
+            selector="fvg-1m-fvg_touch",
+            source_kind=SourceKind.FVG,
+            timeframe="1m",
+            direction="short",
+            timestamp=t0,
+            known_at=t0,
+            trading_day_id="2024-01-01",
+            source=fvg_touch_candidate("z1", "1m", "short", FVGContactType.FULL_MITIGATION_NO_INVERSION, t0),
+        )
+        restoration = mock.Mock(restored_by=signal)
+        self.assertTrue(_is_immediate_resolution_restoration(restoration))
+
+    def test_restored_by_ifvg_candidate_is_not_immediate_resolution(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        signal = EntrySignal(
+            candidate_id="c1",
+            selector="fvg-1m-ifvg",
+            source_kind=SourceKind.FVG,
+            timeframe="1m",
+            direction="long",
+            timestamp=t0,
+            known_at=t0,
+            trading_day_id="2024-01-01",
+            source=fvg_ifvg_candidate("z1", "1m", "long", t0),
+        )
+        restoration = mock.Mock(restored_by=signal)
+        self.assertFalse(_is_immediate_resolution_restoration(restoration))
+
+    def test_restored_by_mitigation_event_is_not_immediate_resolution(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        restoration = mock.Mock(restored_by=fvg_mitigation("z1", "1m", "short", t0))
+        self.assertFalse(_is_immediate_resolution_restoration(restoration))
+
+
+class ProvenanceSectionTests(unittest.TestCase):
+    def test_git_provenance_returns_none_pair_when_subprocess_fails(self):
+        with mock.patch("tradelab.profile_research_context.subprocess.run", side_effect=OSError("git not found")):
+            info = _git_provenance()
+        self.assertEqual(info, {"git_commit": None, "git_commit_dirty": None})
+
+    def test_git_provenance_reports_commit_and_dirty_flag_from_subprocess(self):
+        def fake_run(args, **kwargs):
+            result = mock.Mock()
+            if args[1] == "rev-parse":
+                result.stdout = "deadbeef\n"
+            else:
+                result.stdout = " M some_file.py\n"
+            return result
+
+        with mock.patch("tradelab.profile_research_context.subprocess.run", side_effect=fake_run):
+            info = _git_provenance()
+        self.assertEqual(info, {"git_commit": "deadbeef", "git_commit_dirty": True})
+
+    def test_git_provenance_reports_clean_when_status_is_empty(self):
+        def fake_run(args, **kwargs):
+            result = mock.Mock()
+            result.stdout = "deadbeef\n" if args[1] == "rev-parse" else ""
+            return result
+
+        with mock.patch("tradelab.profile_research_context.subprocess.run", side_effect=fake_run):
+            info = _git_provenance()
+        self.assertEqual(info, {"git_commit": "deadbeef", "git_commit_dirty": False})
+
+    def test_provenance_section_carries_checksums_and_command_verbatim(self):
+        with mock.patch(
+            "tradelab.profile_research_context._git_provenance",
+            return_value={"git_commit": "abc123", "git_commit_dirty": False},
+        ):
+            section = _provenance_section(market_artifact_sha256="a" * 64, news_csv_sha256="b" * 64, command="python3 -m tradelab.profile_research_context --market-artifact x")
+        self.assertEqual(section["market_artifact_sha256"], "a" * 64)
+        self.assertEqual(section["news_csv_sha256"], "b" * 64)
+        self.assertEqual(section["command"], "python3 -m tradelab.profile_research_context --market-artifact x")
+        self.assertEqual(section["git_commit"], "abc123")
+        self.assertFalse(section["git_commit_dirty"])
+        self.assertIn("python_version", section)
+
+    def test_provenance_section_command_is_none_when_not_supplied(self):
+        with mock.patch(
+            "tradelab.profile_research_context._git_provenance",
+            return_value={"git_commit": None, "git_commit_dirty": None},
+        ):
+            section = _provenance_section(market_artifact_sha256="a" * 64, news_csv_sha256="b" * 64, command=None)
+        self.assertIsNone(section["command"])
+
+
+class CompareRawSignalCountsTests(unittest.TestCase):
+    def test_identical_lists_report_identical_true_and_no_diffs(self):
+        counts = [{"selector": "fvg-1m-fvg_touch", "direction": "long", "count": 3}]
+        diff = _compare_raw_signal_counts(counts, counts)
+        self.assertEqual(diff, {"identical": True, "only_in_previous": [], "only_in_current": [], "changed": []})
+
+    def test_added_removed_and_changed_counts_are_all_reported(self):
+        previous = [
+            {"selector": "fvg-1m-fvg_touch", "direction": "long", "count": 3},
+            {"selector": "fvg-1m-fvg_touch", "direction": "short", "count": 5},
+        ]
+        current = [
+            {"selector": "fvg-1m-fvg_touch", "direction": "long", "count": 4},
+            {"selector": "fvg-5m-fvg_touch", "direction": "long", "count": 1},
+        ]
+        diff = _compare_raw_signal_counts(previous, current)
+        self.assertFalse(diff["identical"])
+        self.assertEqual(diff["only_in_previous"], ["fvg-1m-fvg_touch/short"])
+        self.assertEqual(diff["only_in_current"], ["fvg-5m-fvg_touch/long"])
+        self.assertEqual(diff["changed"], ["fvg-1m-fvg_touch/long: 3 -> 4"])
+
+
+class ComparisonSectionTests(unittest.TestCase):
+    def test_no_previous_profile_reports_all_none(self):
+        section = _comparison_section(
+            previous_profile_json_path=None,
+            previous_profile=None,
+            current_entry_signals_by_selector_direction=[{"selector": "fvg-1m-fvg_touch", "direction": "long", "count": 1}],
+        )
+        self.assertEqual(
+            section,
+            {
+                "previous_profile_path": None,
+                "previous_profile_schema_version": None,
+                "previous_profile_obsolete_validity_model_warning": None,
+                "raw_signal_count_comparison": None,
+                "active_pool_comparison_possible": None,
+                "active_pool_comparison_note": None,
+            },
+        )
+
+    def test_previous_profile_given_reports_warning_and_comparison_but_never_active_pool(self):
+        previous_profile = {
+            "profile_schema_version": "1.0",
+            "entry_signals": {"by_selector_direction": [{"selector": "fvg-1m-fvg_touch", "direction": "long", "count": 1}]},
+        }
+        section = _comparison_section(
+            previous_profile_json_path=Path("/tmp/old_profile.json"),
+            previous_profile=previous_profile,
+            current_entry_signals_by_selector_direction=[{"selector": "fvg-1m-fvg_touch", "direction": "long", "count": 1}],
+        )
+        self.assertEqual(section["previous_profile_path"], "/tmp/old_profile.json")
+        self.assertEqual(section["previous_profile_schema_version"], "1.0")
+        self.assertIn("OBSOLETE", section["previous_profile_obsolete_validity_model_warning"])
+        self.assertIn("end-of-NY-trading-day", section["previous_profile_obsolete_validity_model_warning"])
+        self.assertEqual(section["raw_signal_count_comparison"], {"identical": True, "only_in_previous": [], "only_in_current": [], "changed": []})
+        self.assertFalse(section["active_pool_comparison_possible"])
+        self.assertIn("NOT possible", section["active_pool_comparison_note"])
+
+
+class ProfileSchemaVersionAndProvenanceEndToEndTests(unittest.TestCase):
+    def test_written_profile_has_v2_schema_new_sections_and_recorded_command(self):
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            manifest_path, news_path = write_valid_fixture(tmp)
+            output_json = tmp / "context_profile.json"
+
+            profile_research_context(manifest_path, news_path, output_json, command="python3 -m tradelab.profile_research_context --test")
+            profile = json.loads(output_json.read_text(encoding="utf-8"))
+
+            self.assertEqual(profile["profile_schema_version"], "2.0")
+            self.assertIn("fvg_entry_candidates", profile)
+            self.assertIn("touch_counts_by_timeframe_direction_contact_type", profile["fvg_entry_candidates"])
+            self.assertIn("ifvg_counts_by_timeframe_direction", profile["fvg_entry_candidates"])
+            self.assertIn("mitigation_counts_by_timeframe_direction", profile["fvg_entry_candidates"])
+            self.assertIn("entry_signal_timeline", profile)
+            self.assertIn("suspension_count_total", profile["entry_signal_timeline"])
+            self.assertIn("restoration_count_total", profile["entry_signal_timeline"])
+            self.assertIn("active_fvg_confluence_duration_stats_minutes", profile["entry_signal_timeline"])
+            self.assertEqual(profile["provenance"]["command"], "python3 -m tradelab.profile_research_context --test")
+            self.assertEqual(profile["provenance"]["market_artifact_sha256"], profile["market_artifact"]["sha256"])
+            self.assertEqual(profile["provenance"]["news_csv_sha256"], profile["news"]["sha256"])
+            self.assertEqual(
+                profile["comparison"],
+                {
+                    "previous_profile_path": None,
+                    "previous_profile_schema_version": None,
+                    "previous_profile_obsolete_validity_model_warning": None,
+                    "raw_signal_count_comparison": None,
+                    "active_pool_comparison_possible": None,
+                    "active_pool_comparison_note": None,
+                },
+            )
+
+    def test_previous_profile_json_path_populates_comparison_section(self):
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            manifest_path, news_path = write_valid_fixture(tmp)
+            previous_output = tmp / "previous_profile.json"
+            profile_research_context(manifest_path, news_path, previous_output)
+
+            current_output = tmp / "current_profile.json"
+            profile_research_context(manifest_path, news_path, current_output, previous_profile_json_path=previous_output)
+            profile = json.loads(current_output.read_text(encoding="utf-8"))
+
+            self.assertEqual(profile["comparison"]["previous_profile_path"], str(previous_output))
+            self.assertEqual(profile["comparison"]["previous_profile_schema_version"], "2.0")
+            self.assertFalse(profile["comparison"]["active_pool_comparison_possible"])
+            self.assertTrue(profile["comparison"]["raw_signal_count_comparison"]["identical"])
+
+    def test_two_runs_with_same_command_and_no_previous_profile_stay_byte_identical(self):
+        """Guards the pre-existing determinism contract (see
+        ``DeterminismTests``) against a regression from any of the new
+        v2.0 fields -- ``provenance`` carries no wall-clock timestamp,
+        and ``_git_provenance`` reads the checkout's actual state, which
+        cannot change between these two calls."""
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            manifest_path, news_path = write_valid_fixture(tmp)
+            output_a = tmp / "profile_a.json"
+            output_b = tmp / "profile_b.json"
+
+            profile_research_context(manifest_path, news_path, output_a, command="fixed-command")
+            profile_research_context(manifest_path, news_path, output_b, command="fixed-command")
+
+            self.assertEqual(output_a.read_bytes(), output_b.read_bytes())
 
 
 class NoRealDataInRepoTests(unittest.TestCase):

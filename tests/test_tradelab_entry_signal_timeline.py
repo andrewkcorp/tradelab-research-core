@@ -21,9 +21,12 @@ from zoneinfo import ZoneInfo
 from tradelab.entry_signal_timeline import (
     LONG,
     SHORT,
+    SignalRestoration,
+    SignalSuspension,
     SourceKind,
     build_entry_signal_timeline,
     iter_active_signal_snapshots,
+    iter_fvg_lifecycle_transitions,
     query_active_signals,
 )
 from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, FVGEntryCandidateResult, FVGMitigationEvent, SourceType
@@ -932,6 +935,82 @@ def _random_liquidity_signals(rng: random.Random, count: int, base_dt: datetime,
             )
         )
     return out
+
+
+class FVGLifecycleTransitionsTests(unittest.TestCase):
+    """``iter_fvg_lifecycle_transitions``: unlike ``EntrySignalQueryResult``'s
+    audit lists (state as of one caller-chosen ``ts_utc``), this exposes
+    the complete suspend/restore transition history across the whole
+    timeline, in true chronological order -- used by
+    ``tradelab.profile_research_context`` to compute active-duration
+    statistics."""
+
+    def test_yields_a_suspension_then_a_restoration_for_a_simple_suspend_restore_cycle(self):
+        bullish = fvg_candidate(zone_id="Z-A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        bearish_touch, bearish_ifvg = fvg_touch_then_inversion("Z-B", "1m", SHORT, ny_dt(2026, 1, 5, 11, 0), ny_dt(2026, 1, 5, 13, 0))
+        timeline = build_entry_signal_timeline(fvg_result(bullish, bearish_touch, bearish_ifvg), EMPTY_LIQUIDITY)
+
+        transitions = list(iter_fvg_lifecycle_transitions(timeline))
+        self.assertEqual(len(transitions), 2)
+        self.assertIsInstance(transitions[0], SignalSuspension)
+        self.assertEqual(transitions[0].signal.candidate_id, bullish.candidate_id)
+        self.assertEqual(transitions[0].suspended_by.candidate_id, bearish_touch.candidate_id)
+        self.assertIsInstance(transitions[1], SignalRestoration)
+        self.assertEqual(transitions[1].signal.candidate_id, bullish.candidate_id)
+        self.assertEqual(transitions[1].restored_by.candidate_id, bearish_ifvg.candidate_id)
+
+    def test_a_suspension_that_is_never_resolved_yields_no_restoration(self):
+        bullish = fvg_candidate(zone_id="Z-A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        bearish_touch = fvg_candidate(zone_id="Z-B", direction=SHORT, known_at=ny_dt(2026, 1, 5, 11, 0))
+        timeline = build_entry_signal_timeline(fvg_result(bullish, bearish_touch), EMPTY_LIQUIDITY)
+
+        transitions = list(iter_fvg_lifecycle_transitions(timeline))
+        self.assertEqual(len(transitions), 1)
+        self.assertIsInstance(transitions[0], SignalSuspension)
+
+    def test_restoration_via_a_later_non_inverting_mitigation_carries_the_mitigation_event(self):
+        bullish = fvg_candidate(zone_id="Z-A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        bearish_touch, bearish_mitigation = fvg_touch_then_mitigation("Z-B", "1m", SHORT, ny_dt(2026, 1, 5, 11, 0), ny_dt(2026, 1, 5, 13, 0))
+        timeline = build_entry_signal_timeline(fvg_result(bullish, bearish_touch, mitigations=(bearish_mitigation,)), EMPTY_LIQUIDITY)
+
+        transitions = list(iter_fvg_lifecycle_transitions(timeline))
+        self.assertEqual(len(transitions), 2)
+        restoration = next(t for t in transitions if isinstance(t, SignalRestoration))
+        self.assertIsInstance(restoration.restored_by, FVGMitigationEvent)
+        self.assertEqual(restoration.restored_by.zone_id, "Z-B")
+
+    def test_transitions_are_in_true_chronological_order_across_a_nested_conflict(self):
+        a = fvg_candidate(zone_id="Z-A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        b_touch, b_ifvg = fvg_touch_then_inversion("Z-B", "1m", SHORT, ny_dt(2026, 1, 5, 11, 0), ny_dt(2026, 1, 5, 13, 0))
+        c_touch, c_ifvg = fvg_touch_then_inversion("Z-C", "1m", LONG, ny_dt(2026, 1, 5, 12, 0), ny_dt(2026, 1, 5, 14, 0))
+        timeline = build_entry_signal_timeline(fvg_result(a, b_touch, c_touch, b_ifvg, c_ifvg), EMPTY_LIQUIDITY)
+
+        transitions = list(iter_fvg_lifecycle_transitions(timeline))
+        known_ats = [t.signal.known_at if isinstance(t, SignalSuspension) else t.restored_by.known_at for t in transitions]
+        # not strictly meaningful ordering criteria across mixed types, so
+        # instead assert against the causing event's own known_at, which
+        # must be non-decreasing throughout.
+        causing_known_ats = [(t.suspended_by if isinstance(t, SignalSuspension) else t.restored_by).known_at for t in transitions]
+        self.assertEqual(causing_known_ats, sorted(causing_known_ats))
+        # A suspended (by B), B suspended (by C), A restored (by B's own
+        # inversion) -- C's own later inversion produces no restoration:
+        # B's touch was already permanently retired at B's own inversion,
+        # so nothing is left pending for C to restore.
+        self.assertEqual(len(transitions), 3)
+
+    def test_liquidity_signals_never_appear(self):
+        bullish = fvg_candidate(zone_id="Z-A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
+        bearish_touch = fvg_candidate(zone_id="Z-B", direction=SHORT, known_at=ny_dt(2026, 1, 5, 11, 0))
+        liq = liquidity_candidate(known_at=ny_dt(2026, 1, 5, 12, 0))
+        timeline = build_entry_signal_timeline(fvg_result(bullish, bearish_touch), liquidity_result(liq))
+
+        transitions = list(iter_fvg_lifecycle_transitions(timeline))
+        for t in transitions:
+            self.assertEqual(t.signal.source_kind, SourceKind.FVG)
+
+    def test_empty_timeline_yields_nothing(self):
+        timeline = build_entry_signal_timeline(EMPTY_FVG, EMPTY_LIQUIDITY)
+        self.assertEqual(list(iter_fvg_lifecycle_transitions(timeline)), [])
 
 
 class BulkSnapshotEquivalenceTests(unittest.TestCase):

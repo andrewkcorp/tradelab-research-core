@@ -470,7 +470,7 @@ def _apply_fvg_batch(
     suspended_by: dict[str, SignalSuspension],
     pending_resolution: dict[str, list[str]],
     touch_by_zone: dict[str, tuple[str, str]],
-) -> list[SignalRestoration]:
+) -> tuple[list[SignalSuspension], list[SignalRestoration]]:
     """Mutates ``active`` (``timeframe -> direction -> {candidate_id:
     signal}``), ``suspended`` (``candidate_id -> signal``, everything
     currently suspended) and ``suspended_by`` (``candidate_id -> its
@@ -478,7 +478,10 @@ def _apply_fvg_batch(
     ``signal_batch`` (real FVG-family confluence signals: touches and
     IFVGs) and ``mitigation_batch`` (pure zone-resolution facts, never
     confluence signals) sharing that exact ``known_at`` -- and returns
-    the restorations this batch caused. ``pending_resolution`` maps a
+    ``(suspensions, restorations)``, the transitions this batch caused
+    (used by ``iter_fvg_lifecycle_transitions`` for diagnostics; the
+    other two callers only need the final, mutated state and discard
+    these return values). ``pending_resolution`` maps a
     zone_id to the candidate_ids its own ``PARTIAL_TOUCH`` suspended, so
     that zone's own later resolution (``IFVG`` or ``FVGMitigationEvent``)
     can restore exactly those. ``touch_by_zone`` maps a zone_id to
@@ -547,6 +550,7 @@ def _apply_fvg_batch(
         for target in active.get(signal.timeframe, {}).get(opposite, {}).values():
             challenge_actions.append((target, signal, is_durable))
 
+    suspensions: list[SignalSuspension] = []
     for target, challenger, is_durable in challenge_actions:
         tf_pool = active.get(target.timeframe, {}).get(target.direction, {})
         if target.candidate_id not in tf_pool:
@@ -556,7 +560,9 @@ def _apply_fvg_batch(
             continue
         del tf_pool[target.candidate_id]
         suspended[target.candidate_id] = target
-        suspended_by[target.candidate_id] = SignalSuspension(signal=target, suspended_by=challenger)
+        suspension = SignalSuspension(signal=target, suspended_by=challenger)
+        suspended_by[target.candidate_id] = suspension
+        suspensions.append(suspension)
         pending_resolution.setdefault(challenger.source.zone_id, []).append(target.candidate_id)
 
     # 3. Every real signal in this batch becomes (or remains) active,
@@ -568,7 +574,7 @@ def _apply_fvg_batch(
     for signal in signal_batch:
         active.setdefault(signal.timeframe, {}).setdefault(signal.direction, {})[signal.candidate_id] = signal
 
-    return restorations
+    return suspensions, restorations
 
 
 def _merge_known_at_groups(
@@ -620,7 +626,10 @@ def _resolve_fvg_conflicts(
     touch_by_zone: dict[str, tuple[str, str]] = {}
     restorations: list[SignalRestoration] = []
     for signal_batch, mitigation_batch in _merge_known_at_groups(signals, mitigations):
-        restorations.extend(_apply_fvg_batch(signal_batch, mitigation_batch, active, suspended, suspended_by, pending_resolution, touch_by_zone))
+        _batch_suspensions, batch_restorations = _apply_fvg_batch(
+            signal_batch, mitigation_batch, active, suspended, suspended_by, pending_resolution, touch_by_zone
+        )
+        restorations.extend(batch_restorations)
     all_active = [s for tf_pools in active.values() for direction_pool in tf_pools.values() for s in direction_pool.values()]
     return all_active, list(suspended_by.values()), restorations
 
@@ -740,3 +749,39 @@ def iter_active_signal_snapshots(timeline: EntrySignalTimeline) -> Iterator[Sign
                 for other in tf_pools.get(signal.direction, {}).values():
                     active_by_selector.setdefault(other.selector, []).append(other)
             yield SignalSnapshot(signal=signal, active_by_selector={selector: tuple(sigs) for selector, sigs in active_by_selector.items()})
+
+
+def iter_fvg_lifecycle_transitions(timeline: EntrySignalTimeline) -> Iterator[SignalSuspension | SignalRestoration]:
+    """Every FVG-family suspension and restoration across the whole
+    timeline, in the exact chronological order they actually happened --
+    diagnostic/reporting only (e.g. ``tradelab.profile_research_context``'s
+    active-duration statistics). Unlike ``EntrySignalQueryResult``'s audit
+    lists, which only ever reflect state as of one caller-chosen
+    ``ts_utc`` (so a signal that was suspended and later restored no
+    longer appears in ``suspensions`` at all, and its original
+    suspension time is lost), this surfaces the complete transition
+    history: every suspension exactly when it happened, and every
+    restoration exactly when it happened, so a consumer can pair them up
+    by ``signal.candidate_id`` to compute how long each confluence was
+    actually active.
+
+    Reuses the exact same incremental ``_apply_fvg_batch`` sweep as
+    ``iter_active_signal_snapshots`` -- ``O(N log N)`` total, one linear
+    forward pass, never re-implements the suspend/restore rules. Never
+    changes ``query_active_signals`` or ``iter_active_signal_snapshots``
+    themselves; liquidity is untouched (it has no suspension/restoration
+    concept, only permanent invalidation -- see module docstring).
+    """
+    active: dict[str, dict[str, dict[str, EntrySignal]]] = {}
+    suspended: dict[str, EntrySignal] = {}
+    suspended_by: dict[str, SignalSuspension] = {}
+    pending_resolution: dict[str, list[str]] = {}
+    touch_by_zone: dict[str, tuple[str, str]] = {}
+
+    fvg_signals = [s for s in timeline.signals if s.source_kind == SourceKind.FVG]
+    for signal_batch, mitigation_batch in _merge_known_at_groups(fvg_signals, timeline.zone_mitigations):
+        batch_suspensions, batch_restorations = _apply_fvg_batch(
+            signal_batch, mitigation_batch, active, suspended, suspended_by, pending_resolution, touch_by_zone
+        )
+        yield from batch_suspensions
+        yield from batch_restorations

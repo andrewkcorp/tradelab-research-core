@@ -99,6 +99,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -109,9 +110,16 @@ from tradelab.aggregate import aggregate_bars
 from tradelab.backtest import PreparedBacktestContext, prepare_backtest_context
 from tradelab.bar import Bar1m
 from tradelab.data_wicks import DataWickDetectionResult, DataWickDirection
-from tradelab.entry_signal_timeline import EntrySignalTimeline
-from tradelab.fvg import BEARISH, BULLISH, FVGDetectionResult
+from tradelab.entry_signal_timeline import (
+    EntrySignal,
+    EntrySignalTimeline,
+    SignalSuspension,
+    iter_fvg_lifecycle_transitions,
+)
+from tradelab.fvg import BEARISH, BULLISH, FVGDetectionResult, FVGMitigationEvent
 from tradelab.bias import HTFBiasResult
+from tradelab.fvg_entry import FVGEntryCandidateResult
+from tradelab.fvg_entry import SourceType as FVGCandidateSourceType
 from tradelab.liquidity import LiquidityDetectionResult
 from tradelab.liquidity_entry import LiquidityEntryCandidateResult
 from tradelab.market_data_artifact import (
@@ -124,7 +132,16 @@ from tradelab.news import NewsEvent
 from tradelab.news_loaders import read_news_events_csv
 from tradelab.research_runner import ResearchWindow
 
-PROFILE_SCHEMA_VERSION = "1.0"
+# v2.0 (this task): adds FVG-entry-candidate touch/iFVG/mitigation counts,
+# entry_signal_timeline suspension/restoration counts and active-FVG-
+# confluence duration statistics (all downstream of the confluence-
+# validity rework -- persist-until-invalidated, reversible FVG/iFVG
+# suspension/restoration, FVGMitigationEvent), a provenance section
+# (git commit, python version, exact command, checksums restated at the
+# top level), and an optional comparison against a prior profile JSON.
+# v1.0 profiles do not have any of these fields -- see `comparison`
+# below for exactly what a v1.0-vs-v2.0 comparison can and cannot show.
+PROFILE_SCHEMA_VERSION = "2.0"
 
 # MNQ, explicit -- never DEFAULT_TICK_SIZE relied upon implicitly (this
 # task's own instruction: pivot_strength/reclaim_window_bars/tick_size
@@ -161,9 +178,19 @@ class ContextProfileResult:
     data_wick_count_total: int
     bias_event_count_total: int
     entry_signal_count_total: int
+    fvg_mitigation_count_total: int
+    suspension_count_total: int
+    restoration_count_total: int
 
 
-def profile_research_context(market_artifact_path: Path | str, news_csv_path: Path | str, output_json_path: Path | str) -> ContextProfileResult:
+def profile_research_context(
+    market_artifact_path: Path | str,
+    news_csv_path: Path | str,
+    output_json_path: Path | str,
+    *,
+    previous_profile_json_path: Path | str | None = None,
+    command: str | None = None,
+) -> ContextProfileResult:
     """Load and audit ``market_artifact_path``, load and validate
     ``news_csv_path``, call ``prepare_backtest_context`` with this
     module's explicit parameters, and atomically write a deterministic
@@ -172,10 +199,22 @@ def profile_research_context(market_artifact_path: Path | str, news_csv_path: Pa
     critical finding, or if the news CSV is invalid. Never runs strategy
     enumeration or research; never serializes the resulting context
     itself, only counts derived from it.
+
+    ``previous_profile_json_path``, if given, is read (no validation
+    beyond JSON parsing -- it is never trusted as a source of truth
+    about the *current* run) and reported under ``comparison`` -- see
+    ``_comparison_section`` for exactly what is and is not comparable.
+    ``command``, if given, is recorded verbatim under
+    ``provenance.command`` -- this function never reconstructs it from
+    ``sys.argv`` itself (only ``main()`` does that), so calling this
+    function directly (e.g. from a test, or another script) never
+    silently records that *caller's own* argv as if it were this
+    profile's invocation.
     """
     market_artifact_path = Path(market_artifact_path)
     news_csv_path = Path(news_csv_path)
     output_json_path = Path(output_json_path)
+    previous_profile_json_path = Path(previous_profile_json_path) if previous_profile_json_path is not None else None
 
     artifact = load_market_data_artifact(market_artifact_path)
     series_result = load_market_data_series(artifact, base_dir=market_artifact_path.parent)
@@ -188,6 +227,13 @@ def profile_research_context(market_artifact_path: Path | str, news_csv_path: Pa
         bars, news_events, tick_size=TICK_SIZE_MNQ, pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS
     )
 
+    timeline_stats = _entry_signal_timeline_stats(context.timeline)
+    entry_signals_by_selector_direction = _selector_direction_counts(context.timeline)
+
+    previous_profile = None
+    if previous_profile_json_path is not None:
+        previous_profile = json.loads(previous_profile_json_path.read_text(encoding="utf-8"))
+
     profile = _build_profile(
         market_artifact_path=market_artifact_path,
         artifact=artifact,
@@ -196,6 +242,11 @@ def profile_research_context(market_artifact_path: Path | str, news_csv_path: Pa
         news_sha256=news_sha256,
         news_events=news_events,
         context=context,
+        timeline_stats=timeline_stats,
+        entry_signals_by_selector_direction=entry_signals_by_selector_direction,
+        previous_profile_json_path=previous_profile_json_path,
+        previous_profile=previous_profile,
+        command=command,
     )
     _write_atomic_json(output_json_path, profile)
 
@@ -211,6 +262,9 @@ def profile_research_context(market_artifact_path: Path | str, news_csv_path: Pa
         ),
         liquidity_entry_candidate_count_total=len(context.liquidity_entry_result.candidates),
         data_wick_count_total=len(context.data_wick_result.events),
+        fvg_mitigation_count_total=len(context.fvg_entry_result.zone_mitigations),
+        suspension_count_total=timeline_stats["suspension_count_total"],
+        restoration_count_total=timeline_stats["restoration_count_total"],
         bias_event_count_total=sum(len(changes) for changes in context.htf_bias_result.timeframe_changes.values()),
         entry_signal_count_total=len(context.timeline.signals),
     )
@@ -225,6 +279,11 @@ def _build_profile(
     news_sha256: str,
     news_events: list[NewsEvent],
     context: PreparedBacktestContext,
+    timeline_stats: dict,
+    entry_signals_by_selector_direction: list[dict],
+    previous_profile_json_path: Path | None,
+    previous_profile: dict | None,
+    command: str | None,
 ) -> dict:
     market_artifact_section = artifact.to_dict()
     market_artifact_section["manifest_path"] = str(market_artifact_path)
@@ -250,6 +309,19 @@ def _build_profile(
             "zone_counts_by_timeframe_direction": _fvg_zone_counts(context.fvg_results),
             "ifvg_event_counts_by_timeframe_direction": _fvg_event_counts(context.fvg_results),
         },
+        "fvg_entry_candidates": {
+            "note": (
+                "Derived from PreparedBacktestContext.fvg_entry_result (the "
+                "same candidates/mitigations tradelab.entry_signal_timeline "
+                "consumes), not from the raw fvg_results zones/events above -- "
+                "ifvg_counts_by_timeframe_direction is expected to exactly "
+                "match fvg.ifvg_event_counts_by_timeframe_direction (same "
+                "underlying facts, two different source objects)."
+            ),
+            "touch_counts_by_timeframe_direction_contact_type": _fvg_touch_candidate_counts(context.fvg_entry_result),
+            "ifvg_counts_by_timeframe_direction": _fvg_ifvg_candidate_counts(context.fvg_entry_result),
+            "mitigation_counts_by_timeframe_direction": _fvg_mitigation_counts(context.fvg_entry_result),
+        },
         "liquidity": {
             "level_counts": _liquidity_level_counts(context.swing_equal_liquidity_results, context.session_liquidity_results),
             "entry_candidate_counts": _liquidity_entry_candidate_counts(context.liquidity_entry_result),
@@ -257,9 +329,18 @@ def _build_profile(
         "data_wicks": _data_wick_counts(context.data_wick_result),
         "bias": _bias_counts(context.htf_bias_result),
         "entry_signals": {
-            "by_selector_direction": _selector_direction_counts(context.timeline),
+            "by_selector_direction": entry_signals_by_selector_direction,
             "raw_by_window": {window.window_id: _selector_direction_counts_in_window(context.timeline, window) for window in PROFILE_WINDOWS},
         },
+        "entry_signal_timeline": timeline_stats,
+        "provenance": _provenance_section(
+            market_artifact_sha256=artifact.sha256, news_csv_sha256=news_sha256, command=command
+        ),
+        "comparison": _comparison_section(
+            previous_profile_json_path=previous_profile_json_path,
+            previous_profile=previous_profile,
+            current_entry_signals_by_selector_direction=entry_signals_by_selector_direction,
+        ),
     }
 
 
@@ -415,6 +496,278 @@ def _selector_direction_counts_in_window(timeline: EntrySignalTimeline, window: 
     return [{"selector": selector, "direction": direction, "count": count} for (selector, direction), count in sorted(tally.items())]
 
 
+def _fvg_touch_candidate_counts(fvg_entry_result: FVGEntryCandidateResult) -> dict[str, dict[str, dict[str, int]]]:
+    """FVG_TOUCH entry candidates by timeframe/direction/contact_type --
+    ``partial_touch`` and ``full_mitigation_no_inversion`` only
+    (``inversion_ifvg`` never produces an FVG_TOUCH candidate, see
+    ``tradelab.fvg_entry``)."""
+    out: dict[str, dict[str, dict[str, int]]] = {}
+    for candidate in fvg_entry_result.candidates:
+        if candidate.source_type != FVGCandidateSourceType.FVG_TOUCH:
+            continue
+        direction_bucket = out.setdefault(candidate.timeframe, {}).setdefault(candidate.direction, {})
+        contact_type = candidate.contact_type.value
+        direction_bucket[contact_type] = direction_bucket.get(contact_type, 0) + 1
+    return out
+
+
+def _fvg_ifvg_candidate_counts(fvg_entry_result: FVGEntryCandidateResult) -> dict[str, dict[str, int]]:
+    """IFVG entry candidates by timeframe/direction -- expected to
+    exactly match ``_fvg_event_counts`` (same underlying facts, derived
+    from ``fvg_entry_result.candidates`` instead of the raw ``fvg_
+    results`` events)."""
+    out: dict[str, dict[str, int]] = {}
+    for candidate in fvg_entry_result.candidates:
+        if candidate.source_type != FVGCandidateSourceType.IFVG:
+            continue
+        bucket = out.setdefault(candidate.timeframe, {})
+        bucket[candidate.direction] = bucket.get(candidate.direction, 0) + 1
+    return out
+
+
+def _fvg_mitigation_counts(fvg_entry_result: FVGEntryCandidateResult) -> dict[str, dict[str, int]]:
+    """``tradelab.fvg.FVGMitigationEvent`` counts by timeframe/direction
+    -- a zone becoming ``MITIGATED`` without inverting, whether that was
+    its first contact or a later, separate one after an earlier partial
+    touch. Never a new entry candidate itself (see ``fvg_entry_
+    candidates.note`` in the profile)."""
+    out: dict[str, dict[str, int]] = {}
+    for mitigation in fvg_entry_result.zone_mitigations:
+        bucket = out.setdefault(mitigation.timeframe, {})
+        bucket[mitigation.direction] = bucket.get(mitigation.direction, 0) + 1
+    return out
+
+
+def _percentile(sorted_values: list[float], fraction: float) -> float:
+    """Linear interpolation between closest ranks -- deterministic,
+    dependency-free (never relies on ``statistics.quantiles``' own
+    interpolation choice or its >=2-points requirement)."""
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    rank = fraction * (len(sorted_values) - 1)
+    lower = int(rank)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    if lower == upper:
+        return sorted_values[lower]
+    return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * (rank - lower)
+
+
+def _is_immediate_resolution_restoration(restoration) -> bool:
+    """True for the one ``SignalRestoration`` shape that does NOT undo a
+    prior ``SignalSuspension``: ``tradelab.entry_signal_timeline._apply_
+    fvg_batch`` step 2 emits a ``SignalRestoration`` (never a
+    ``SignalSuspension``) when a ``FULL_MITIGATION_NO_INVERSION``-typed
+    touch "challenges" the opposite-direction pool -- since that
+    challenger's own zone is already, immediately resolved the instant
+    it is known, the target is never actually removed from ``active``
+    (see that function's own step-2 docstring); the restoration exists
+    purely for audit transparency ("the competing FVG became inactive
+    without becoming iFVG"). Every *other* ``SignalRestoration`` shape
+    (``restored_by`` is either an ``IFVG``-typed signal or a
+    ``tradelab.fvg.FVGMitigationEvent``) does undo a real, prior
+    suspension -- ``suspension_count_total`` and this excluded subset
+    are therefore not directly comparable, which is exactly why
+    ``still_suspended_at_end_count`` below is computed from the non-
+    immediate-resolution subset only, never from the raw restoration
+    total."""
+    restored_by = restoration.restored_by
+    return (
+        isinstance(restored_by, EntrySignal)
+        and restored_by.source.source_type == FVGCandidateSourceType.FVG_TOUCH
+    )
+
+
+def _entry_signal_timeline_stats(timeline: EntrySignalTimeline) -> dict:
+    """Suspension/restoration totals and active-FVG-confluence duration
+    statistics -- entirely downstream of the confluence-validity rework
+    (persist-until-invalidated, reversible FVG/iFVG suspension/
+    restoration). Liquidity has no suspension/restoration concept (only
+    permanent, same-selector invalidation), so it is not represented
+    here at all. One linear pass over ``iter_fvg_lifecycle_transitions``
+    (``O(N log N)``, never re-implements the suspend/restore rules).
+
+    ``restoration_count_total`` counts every ``SignalRestoration``
+    ``iter_fvg_lifecycle_transitions`` yields, including a documented,
+    intentional shape that does not undo any suspension at all -- see
+    ``_is_immediate_resolution_restoration``. It is therefore NOT
+    directly comparable to ``suspension_count_total`` 1:1;
+    ``still_suspended_at_end_count`` uses only the subset of
+    restorations that actually did undo a suspension."""
+    known_at_by_candidate_id = {s.candidate_id: s.known_at for s in timeline.signals if s.source_kind.value == "fvg"}
+    first_suspension_known_at: dict[str, datetime] = {}
+    suspension_count = 0
+    restoration_count = 0
+    immediate_resolution_restoration_count = 0
+    for transition in iter_fvg_lifecycle_transitions(timeline):
+        if isinstance(transition, SignalSuspension):
+            suspension_count += 1
+            first_suspension_known_at.setdefault(transition.signal.candidate_id, transition.suspended_by.known_at)
+        else:
+            restoration_count += 1
+            if _is_immediate_resolution_restoration(transition):
+                immediate_resolution_restoration_count += 1
+    restoration_of_suspended_signal_count = restoration_count - immediate_resolution_restoration_count
+
+    durations_minutes = sorted(
+        (first_suspension_known_at[candidate_id] - known_at).total_seconds() / 60.0
+        for candidate_id, known_at in known_at_by_candidate_id.items()
+        if candidate_id in first_suspension_known_at
+    )
+    never_suspended_count = len(known_at_by_candidate_id) - len(durations_minutes)
+
+    return {
+        "suspension_count_total": suspension_count,
+        "restoration_count_total": restoration_count,
+        "restoration_note": (
+            "Includes a documented, intentional SignalRestoration shape "
+            "that does not undo any prior suspension (a FULL_MITIGATION_"
+            "NO_INVERSION-typed touch challenges the opposite pool but "
+            "its own zone is already resolved the instant it is known, "
+            "so the target was never actually removed from the active "
+            "pool -- see tradelab.entry_signal_timeline._apply_fvg_batch "
+            "step 2). restoration_count_total is therefore NOT directly "
+            "comparable to suspension_count_total 1:1; see "
+            "restoration_of_suspended_signal_count_total and "
+            "immediate_resolution_restoration_count_total for the split."
+        ),
+        "restoration_of_suspended_signal_count_total": restoration_of_suspended_signal_count,
+        "immediate_resolution_restoration_count_total": immediate_resolution_restoration_count,
+        "still_suspended_at_end_count": suspension_count - restoration_of_suspended_signal_count,
+        "active_fvg_confluence_duration_stats_minutes": {
+            "note": (
+                "Measures time from each FVG-family confluence's own known_at "
+                "to its FIRST suspension only. A confluence that is later "
+                "restored and then suspended again by a different, later "
+                "challenger is not reflected as a second, separate interval "
+                "here -- this is a deliberate simplification, not a full "
+                "multi-interval active-time accounting."
+            ),
+            "completed_count": len(durations_minutes),
+            "never_suspended_count": never_suspended_count,
+            "min": durations_minutes[0] if durations_minutes else None,
+            "max": durations_minutes[-1] if durations_minutes else None,
+            "mean": sum(durations_minutes) / len(durations_minutes) if durations_minutes else None,
+            "median": _percentile(durations_minutes, 0.5) if durations_minutes else None,
+            "p90": _percentile(durations_minutes, 0.9) if durations_minutes else None,
+        },
+    }
+
+
+def _git_provenance() -> dict[str, str | bool | None]:
+    """Best-effort git commit/dirty-state of the checkout this module
+    itself is running from -- ``None``/``None`` (never fabricated) if
+    this is not a git checkout or ``git`` is unavailable."""
+    repo_root = Path(__file__).resolve().parents[1]
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True, text=True, check=True, timeout=10
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=repo_root, capture_output=True, text=True, check=True, timeout=10
+        ).stdout
+        return {"git_commit": commit, "git_commit_dirty": bool(status.strip())}
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return {"git_commit": None, "git_commit_dirty": None}
+
+
+def _provenance_section(*, market_artifact_sha256: str, news_csv_sha256: str, command: str | None) -> dict:
+    git_info = _git_provenance()
+    return {
+        "python_version": sys.version,
+        "command": command,
+        "market_artifact_sha256": market_artifact_sha256,
+        "news_csv_sha256": news_csv_sha256,
+        **git_info,
+    }
+
+
+def _compare_raw_signal_counts(previous_counts: list[dict], current_counts: list[dict]) -> dict:
+    """Compares two ``entry_signals.by_selector_direction`` lists --
+    these are raw signal *generation* counts, unaffected by the
+    confluence-validity model (FVG/liquidity detection and candidate
+    generation did not change; only which signals are *active* at a
+    given instant did). A mismatch here would indicate the underlying
+    data or code changed too (e.g. more bars collected since the prior
+    profile), not a validity-model regression."""
+    previous_map = {(row["selector"], row["direction"]): row["count"] for row in previous_counts}
+    current_map = {(row["selector"], row["direction"]): row["count"] for row in current_counts}
+    only_in_previous = sorted(f"{selector}/{direction}" for selector, direction in previous_map if (selector, direction) not in current_map)
+    only_in_current = sorted(f"{selector}/{direction}" for selector, direction in current_map if (selector, direction) not in previous_map)
+    changed = sorted(
+        f"{selector}/{direction}: {previous_map[(selector, direction)]} -> {current_map[(selector, direction)]}"
+        for selector, direction in set(previous_map) & set(current_map)
+        if previous_map[(selector, direction)] != current_map[(selector, direction)]
+    )
+    return {
+        "identical": not only_in_previous and not only_in_current and not changed,
+        "only_in_previous": only_in_previous,
+        "only_in_current": only_in_current,
+        "changed": changed,
+    }
+
+
+_OBSOLETE_VALIDITY_MODEL_WARNING = (
+    "The referenced previous profile was generated under the OBSOLETE "
+    "end-of-NY-trading-day entry confluence validity model (a confluence "
+    "expired at 17:00 NY on its own trading day, and never combined "
+    "across trading days). That model has been fully replaced -- persist-"
+    "until-invalidated validity, liquidity invalidation scoped to the "
+    "identical selector, and reversible FVG/iFVG same-timeframe "
+    "suspension/restoration (including resolution via a later, non-"
+    "inverting FVGMitigationEvent). This previous profile's own counts "
+    "must NOT be used for strategy-universe estimation, combo mining, or "
+    "any other purpose that depends on which confluences were active at "
+    "a given instant -- only this current profile reflects that."
+)
+
+_ACTIVE_POOL_COMPARISON_NOTE = (
+    "An old-vs-new comparison of active-pool composition at real primary-"
+    "signal timestamps is NOT possible from the referenced previous "
+    "profile: its schema (see previous_profile_schema_version) stores "
+    "only aggregate signal counts by selector/direction, never per-"
+    "instant active-pool snapshots or suspension/restoration events. "
+    "Raw signal *generation* counts are comparable (see "
+    "raw_signal_count_comparison) and are expected to match, since "
+    "generation is unaffected by the validity-model change -- but "
+    "active-pool membership over time is not recoverable from a stored "
+    "aggregate profile. A true comparison would require re-running the "
+    "now-removed historical (end-of-day-expiry) entry_signal_timeline "
+    "implementation side-by-side against the current one on identical "
+    "input; that historical implementation was fully replaced, not "
+    "merely deprecated, and reconstructing it solely for this comparison "
+    "is out of scope here. This profile instead reports the current "
+    "model's own active-pool/duration statistics in full (see "
+    "entry_signal_timeline), establishing a clean baseline for any "
+    "future comparison."
+)
+
+
+def _comparison_section(
+    *,
+    previous_profile_json_path: Path | None,
+    previous_profile: dict | None,
+    current_entry_signals_by_selector_direction: list[dict],
+) -> dict:
+    if previous_profile_json_path is None or previous_profile is None:
+        return {
+            "previous_profile_path": None,
+            "previous_profile_schema_version": None,
+            "previous_profile_obsolete_validity_model_warning": None,
+            "raw_signal_count_comparison": None,
+            "active_pool_comparison_possible": None,
+            "active_pool_comparison_note": None,
+        }
+    previous_entry_signals = previous_profile.get("entry_signals", {}).get("by_selector_direction", [])
+    return {
+        "previous_profile_path": str(previous_profile_json_path),
+        "previous_profile_schema_version": previous_profile.get("profile_schema_version"),
+        "previous_profile_obsolete_validity_model_warning": _OBSOLETE_VALIDITY_MODEL_WARNING,
+        "raw_signal_count_comparison": _compare_raw_signal_counts(previous_entry_signals, current_entry_signals_by_selector_direction),
+        "active_pool_comparison_possible": False,
+        "active_pool_comparison_note": _ACTIVE_POOL_COMPARISON_NOTE,
+    }
+
+
 def _write_atomic_json(path: Path, payload: dict) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -439,13 +792,42 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--market-artifact", required=True, type=Path, help="Path to a continuous market artifact manifest JSON.")
     parser.add_argument("--news-csv", required=True, type=Path, help="Path to a validated high-impact USD news CSV.")
     parser.add_argument("--output-json", required=True, type=Path, help="Path to atomically write the diagnostic context_profile.json to.")
+    parser.add_argument(
+        "--previous-profile-json",
+        required=False,
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to a prior context_profile.json to report a comparison against under `comparison` -- "
+            "see that section's own note for exactly what is and is not comparable. Never required."
+        ),
+    )
     return parser
+
+
+def _reconstruct_command(args: argparse.Namespace) -> str:
+    parts = [
+        "python3 -m tradelab.profile_research_context",
+        f"--market-artifact {args.market_artifact}",
+        f"--news-csv {args.news_csv}",
+        f"--output-json {args.output_json}",
+    ]
+    if args.previous_profile_json is not None:
+        parts.append(f"--previous-profile-json {args.previous_profile_json}")
+    return " ".join(parts)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
+    command = _reconstruct_command(args)
     try:
-        result = profile_research_context(args.market_artifact, args.news_csv, args.output_json)
+        result = profile_research_context(
+            args.market_artifact,
+            args.news_csv,
+            args.output_json,
+            previous_profile_json_path=args.previous_profile_json,
+            command=command,
+        )
     except (ValueError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
@@ -455,11 +837,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  news events:                {result.news_event_count}")
     print(f"  FVG zones:                  {result.fvg_zone_count_total}")
     print(f"  iFVG events:                {result.fvg_event_count_total}")
+    print(f"  FVG mitigation events:      {result.fvg_mitigation_count_total}")
     print(f"  liquidity levels:           {result.liquidity_level_count_total}")
     print(f"  liquidity entry candidates: {result.liquidity_entry_candidate_count_total}")
     print(f"  data wicks:                 {result.data_wick_count_total}")
     print(f"  bias events:                {result.bias_event_count_total}")
     print(f"  entry signals:              {result.entry_signal_count_total}")
+    print(f"  FVG suspensions (total):    {result.suspension_count_total}")
+    print(f"  FVG restorations (total):   {result.restoration_count_total}")
     return 0
 
 
