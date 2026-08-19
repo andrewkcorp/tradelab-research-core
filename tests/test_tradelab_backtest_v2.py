@@ -1040,19 +1040,25 @@ class ProductionRunnerResumeIntegrationTests(unittest.TestCase):
             manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
             runs_dir = tmp / "runs"
 
-            reporter1 = run_production_backtest_v2(
-                market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
-                pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
-                run_id="prod-resume-run", command="test",
-            )
-            created_at_1 = reporter1.manifest.created_at
-            self.assertEqual(read_live_status(reporter1.run_dir).phase, "completed")
+            # Pinned clean/stable so this test is immune to the *actual*
+            # ambient repo's own working-tree state (e.g. mid-development,
+            # with genuinely uncommitted changes) -- see
+            # DirtyWorkingTreeRejectionTests for the dedicated dirty-tree
+            # coverage.
+            with patch("tradelab.backtest_v2._current_git_provenance", return_value=("test-commit", False)):
+                reporter1 = run_production_backtest_v2(
+                    market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                    pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                    run_id="prod-resume-run", command="test",
+                )
+                created_at_1 = reporter1.manifest.created_at
+                self.assertEqual(read_live_status(reporter1.run_dir).phase, "completed")
 
-            reporter2 = run_production_backtest_v2(
-                market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
-                pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
-                run_id="prod-resume-run", command="test",
-            )
+                reporter2 = run_production_backtest_v2(
+                    market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                    pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                    run_id="prod-resume-run", command="test",
+                )
             self.assertEqual(reporter2.run_dir, reporter1.run_dir)
             self.assertEqual(reporter2.manifest.created_at, created_at_1)  # re-attached, never re-created
             self.assertEqual(read_live_status(reporter2.run_dir).phase, "completed")
@@ -1063,18 +1069,111 @@ class ProductionRunnerResumeIntegrationTests(unittest.TestCase):
             manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
             runs_dir = tmp / "runs"
 
-            run_production_backtest_v2(
-                market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
-                pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
-                run_id="prod-mismatch-run", command="test",
-            )
-            with self.assertRaises(ValueError) as ctx:
+            with patch("tradelab.backtest_v2._current_git_provenance", return_value=("test-commit", False)):
                 run_production_backtest_v2(
                     market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
-                    pivot_strength=3, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                    pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
                     run_id="prod-mismatch-run", command="test",
                 )
+                with self.assertRaises(ValueError) as ctx:
+                    run_production_backtest_v2(
+                        market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                        pivot_strength=3, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                        run_id="prod-mismatch-run", command="test",
+                    )
             self.assertIn("parameters_json", str(ctx.exception))
+
+
+class DirtyWorkingTreeRejectionTests(unittest.TestCase):
+    """Task 043's final research-integrity guard: ``run_production_
+    backtest_v2`` must refuse to start OR resume when the working tree
+    is dirty, even though the commit hash itself may be unchanged --
+    a matching commit alone doesn't guarantee the code that actually ran
+    was reproducible if uncommitted local edits sat on top of it. Every
+    test here pins ``tradelab.backtest_v2._current_git_provenance``
+    directly (never relying on this *actual* repo's own ambient
+    working-tree state, which is dirty as a matter of course during
+    active development)."""
+
+    def _artifact(self, tmp: Path) -> tuple[Path, Path, Path]:
+        manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
+        return manifest_path, news_csv_path, tmp / "runs"
+
+    def test_clean_tree_succeeds_on_a_fresh_run(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            manifest_path, news_csv_path, runs_dir = self._artifact(Path(tmp_str))
+            with patch("tradelab.backtest_v2._current_git_provenance", return_value=("test-commit", False)):
+                reporter = run_production_backtest_v2(
+                    market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                    pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                    run_id="clean-fresh-run", command="test",
+                )
+            self.assertEqual(read_live_status(reporter.run_dir).phase, "completed")
+
+    def test_dirty_tree_is_rejected_on_a_fresh_run(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path, runs_dir = self._artifact(tmp)
+            with patch("tradelab.backtest_v2._current_git_provenance", return_value=("test-commit", True)):
+                with self.assertRaises(ValueError) as ctx:
+                    run_production_backtest_v2(
+                        market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                        pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                        run_id="dirty-fresh-run", command="test",
+                    )
+            message = str(ctx.exception)
+            self.assertIn("uncommitted", message)
+            self.assertIn("commit", message.lower())
+
+    def test_dirty_tree_is_rejected_on_resume(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path, runs_dir = self._artifact(tmp)
+
+            with patch("tradelab.backtest_v2._current_git_provenance", return_value=("test-commit", False)):
+                reporter1 = run_production_backtest_v2(
+                    market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                    pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                    run_id="dirty-resume-run", command="test",
+                )
+            manifest_before = (reporter1.run_dir / "run_manifest.json").read_text(encoding="utf-8")
+            status_before = (reporter1.run_dir / "live_status.json").read_text(encoding="utf-8")
+
+            # the tree becomes dirty (e.g. uncommitted local edits) before
+            # the second, resuming invocation -- even though the commit
+            # hash reported here is deliberately left identical.
+            with patch("tradelab.backtest_v2._current_git_provenance", return_value=("test-commit", True)):
+                with self.assertRaises(ValueError) as ctx:
+                    run_production_backtest_v2(
+                        market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                        pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                        run_id="dirty-resume-run", command="test",
+                    )
+            self.assertIn("uncommitted", str(ctx.exception))
+
+            # nothing about the already-durable run was touched by the
+            # refused resume attempt.
+            self.assertEqual((reporter1.run_dir / "run_manifest.json").read_text(encoding="utf-8"), manifest_before)
+            self.assertEqual((reporter1.run_dir / "live_status.json").read_text(encoding="utf-8"), status_before)
+
+    def test_rejection_happens_before_any_data_preparation_or_simulation_work(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path, runs_dir = self._artifact(tmp)
+
+            with patch("tradelab.backtest_v2._current_git_provenance", return_value=("test-commit", True)):
+                with self.assertRaises(ValueError):
+                    run_production_backtest_v2(
+                        market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                        pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                        run_id="dirty-before-anything-run", command="test",
+                    )
+
+            # not even a run directory was created -- the guard fires
+            # before create_run()/RunReporter re-attach, before the
+            # journal is opened, before prepare_backtest_context, before
+            # discover_entry_strategy_universe, and before any simulation.
+            self.assertFalse((runs_dir / "dirty-before-anything-run").exists())
 
 
 class PreflightTests(unittest.TestCase):

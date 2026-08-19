@@ -918,6 +918,37 @@ def _open_journal(
     )
 
 
+def _require_clean_working_tree() -> None:
+    """Refuses to proceed with a dirty (uncommitted-changes) working tree.
+
+    A matching git commit hash alone is not sufficient for research/
+    production reproducibility: two runs against the identical commit can
+    still have executed genuinely different code if one of them carried
+    uncommitted local edits. ``_open_journal``'s own commit check (see its
+    docstring) only ever compares the commit hash, so this is a separate,
+    additional guard -- called once, up front, by ``run_production_
+    backtest_v2`` itself, before that function does anything else (no data
+    preparation, no entry discovery, no simulation, not even attaching to
+    or creating a run directory).
+
+    Never fabricates: if git is unavailable or this isn't a checkout at
+    all, ``tradelab.research_run._git_provenance`` returns ``dirty=None``
+    -- "unknown", not "known clean" -- and this deliberately does not
+    block on that (mirrors that function's own best-effort, never-
+    fabricate contract); only a definite ``dirty=True`` is refused.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    _commit, dirty = _current_git_provenance(repo_root)
+    if dirty:
+        raise ValueError(
+            "tradelab.backtest_v2: refusing to start or resume a production backtest run -- the TradeLab "
+            "working tree has uncommitted changes. A production/research run's results must be reproducible "
+            "from an exact, committed code commit, so this is refused before any data preparation, entry "
+            "discovery, or simulation work begins. Commit, stash, or revert your changes, or start again from "
+            "a clean checkout, then re-run."
+        )
+
+
 def run_production_backtest_v2(
     *,
     market_artifact_path: Path | str,
@@ -968,7 +999,19 @@ def run_production_backtest_v2(
     ``docs/backtest-v2-execution-spec.md``); intended for a caller-
     chosen, typically much smaller, dataset -- including this module's
     own tiny synthetic smoke test (see ``main(["smoke-test", ...])``).
+
+    **Refuses a dirty working tree (task 043).** Before anything else --
+    no data preparation, no entry discovery, no simulation, not even
+    attaching to or creating a run directory -- this function requires a
+    clean, committed working tree (``_require_clean_working_tree()``),
+    on both a fresh start *and* a resume: a matching commit hash alone
+    does not guarantee the code that actually ran was reproducible if
+    the tree carried uncommitted changes. ``run_preflight_v2`` has no
+    such restriction -- it remains usable on a dirty tree, and simply
+    records the dirty flag it already captures via its own
+    ``run_manifest.json`` (``RunManifest.git_commit_dirty``).
     """
+    _require_clean_working_tree()
     runs_dir = Path(runs_dir)
     resuming = run_id is not None and (runs_dir / run_id / "backtest_v2_journal.sqlite3").is_file()
 
