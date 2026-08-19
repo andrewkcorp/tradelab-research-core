@@ -10,6 +10,7 @@ artifacts + leaderboard schema, and a randomized comparison against a
 small, independent reference exit-resolution scan."""
 from __future__ import annotations
 
+import dataclasses
 import random
 import tempfile
 import unittest
@@ -20,11 +21,18 @@ from tradelab.backtest import BacktestResult, TradeExitReason, prepare_backtest_
 from tradelab.backtest_v2 import (
     ALL_EXIT_VARIANTS,
     DEFAULT_EQUITY_CONFIG,
+    DEFAULT_INSTRUMENTS,
+    DEFAULT_RISK_CONFIG,
     ExecutionSkipReason,
     ExitVariantSpec,
     SLVariantKind,
     TPVariantKind,
+    VariantSummaryRow,
+    _expand_and_simulate,
+    _leaderboard_sort_key,
     _linked_fvg_candidate,
+    _resolve_sl_candidate,
+    _TopNTracker,
     _yearly_monthly_breakdown,
     build_synthetic_smoke_context,
     enumerate_exit_variants,
@@ -37,6 +45,7 @@ from tradelab.entry_signal_timeline import LONG, SHORT, EntryEvent, EntryEventKi
 from tradelab.entry_strategy_universe import ObservedEntry, discover_entry_strategy_universe
 from tradelab.equity import build_equity_curve
 from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, SourceType
+from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityLevel, LiquidityStatus, LiquidityType
 from tradelab.news import NewsEvent
 from tradelab.research_run import read_leaderboard, read_live_status, read_progress_events, read_run_manifest
 from tradelab.sweep_fvg_setup import SweepFVGSetupEvent
@@ -203,6 +212,102 @@ class NextBarOpenEntryTests(unittest.TestCase):
         self.assertEqual(trades, [])
         self.assertEqual(len(skipped), 1)
         self.assertEqual(skipped[0].reason, ExecutionSkipReason.NO_BAR_AVAILABLE)
+
+
+def _liquidity_level(level_id: str, side: str, price: float, formed_at: datetime) -> LiquidityLevel:
+    return LiquidityLevel(
+        level_id=level_id, timeframe="1m", liquidity_type=(LiquidityType.SWING_HIGH if side == HIGH else LiquidityType.SWING_LOW),
+        side=side, lower=price, upper=price, member_count=1, member_timestamps=(formed_at,), formed_at=formed_at,
+        status=LiquidityStatus.ACTIVE, taken_at=None, absorbed_by_level_id=None,
+    )
+
+
+class SourceEligibilityAtActualFillInstantTests(unittest.TestCase):
+    """A data-gap scenario where the signal's own known_at precedes the
+    first available fill bar by several minutes, and a target source
+    becomes known strictly *between* the two: it must be eligible at
+    the actual fill (this is the fix -- MarketEntryContext.entry_known_
+    at must be fill_bar.timestamp, not entry.known_at), and a second
+    source that only becomes known *after* the fill must never be
+    eligible, regardless of how close its price is to entry."""
+
+    def test_target_known_between_signal_and_gap_delayed_fill_is_eligible_at_fill_not_at_signal(self):
+        t0 = datetime(2024, 1, 1, 10, 0, tzinfo=UTC)
+        signal_known_at = t0 + timedelta(minutes=2)  # no bar exists at this exact instant (see gap below)
+        during_gap_known_at = t0 + timedelta(minutes=5)  # strictly between signal_known_at and the fill bar
+        after_fill_known_at = t0 + timedelta(minutes=11)  # strictly after the fill bar
+
+        # A genuine data gap: bars at t0, t0+1min, then a jump straight to
+        # t0+10min (tradelab.validation.validate_bars permits gaps).
+        bars = [bar(t0, 100, 101, 99, 100), bar(t0 + timedelta(minutes=1), 100, 101, 99, 100), bar(t0 + timedelta(minutes=10), 100, 101, 99, 100)]
+        context = build_minimal_context(bars)
+        fill_bar_timestamp = bars[2].timestamp  # the first bar at/after signal_known_at
+        self.assertGreater(fill_bar_timestamp, signal_known_at)  # confirms this scenario actually exercises the gap
+
+        # TP: trivially satisfiable, favorable (HIGH) side, formed well before the signal.
+        tp_level = _liquidity_level("tp1", HIGH, 110.0, t0 - timedelta(minutes=30))
+        # SL candidate A: becomes known DURING the gap (after the signal,
+        # at-or-before the actual fill) -- must be eligible, and, being
+        # farther from entry than B, must win rank 1 once B is correctly excluded.
+        sl_during_gap = _liquidity_level("sl-during-gap", LOW, 90.0, during_gap_known_at)
+        # SL candidate B: becomes known only AFTER the fill, and is
+        # deliberately NEARER to entry (95 vs 90) than A -- if it were
+        # wrongly included, it would win rank 1 instead of A.
+        sl_after_fill = _liquidity_level("sl-after-fill", LOW, 95.0, after_fill_known_at)
+
+        rigged_liquidity_results = {"1m": LiquidityDetectionResult(levels=[tp_level, sl_during_gap, sl_after_fill], takes=[], reclaims=[])}
+        rigged_context = dataclasses.replace(context, swing_equal_liquidity_results=rigged_liquidity_results)
+
+        entry_event = EntryEvent(
+            event_id="sig-1", kind=EntryEventKind.FVG_TOUCH, selector="fvg-1m-fvg_touch", timeframe="1m", direction=LONG,
+            timestamp=signal_known_at, known_at=signal_known_at, zone_id="zGap", level_id=None,
+            source=fvg_touch_candidate("zGap", "1m", LONG, signal_known_at),
+        )
+        entry = observed(entry_event)
+        variant = next(v for v in ALL_EXIT_VARIANTS if v.variant_id == "tp=liquidity_rank_1|sl=liquidity_rank_1")
+
+        trades, skipped = simulate_market_execution((entry,), LONG, variant, rigged_context, "gap-test-variant")
+
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(trades), 1)
+        trade = trades[0]
+        self.assertEqual(trade.entry_timestamp, fill_bar_timestamp)  # next-bar-open fill, still correct
+        self.assertEqual(trade.signal_known_at, signal_known_at)  # original signal instant preserved for audit
+        # The decisive assertion: SL resolved to the during-the-gap level
+        # (90), never the nearer but after-fill level (95) -- proving
+        # both halves of the fix at once.
+        self.assertEqual(trade.sl_price, 90.0)
+
+    def test_counterfactual_using_the_raw_signal_known_at_would_have_missed_the_target(self):
+        """Directly demonstrates the bug this fix removes: resolving
+        against the raw signal known_at (the pre-fix behavior) excludes
+        a target that has since become known by the actual fill."""
+        from tradelab.tp_targets import MarketEntryContext
+
+        t0 = datetime(2024, 1, 1, 10, 0, tzinfo=UTC)
+        signal_known_at = t0 + timedelta(minutes=2)
+        during_gap_known_at = t0 + timedelta(minutes=5)
+        fill_bar_timestamp = t0 + timedelta(minutes=10)
+
+        sl_during_gap = _liquidity_level("sl-during-gap", LOW, 90.0, during_gap_known_at)
+        liquidity_results = {"1m": LiquidityDetectionResult(levels=[sl_during_gap], takes=[], reclaims=[])}
+        empty_results: dict = {}
+
+        entry_event = EntryEvent(
+            event_id="sig-2", kind=EntryEventKind.FVG_TOUCH, selector="fvg-1m-fvg_touch", timeframe="1m", direction=LONG,
+            timestamp=signal_known_at, known_at=signal_known_at, zone_id="zGap2", level_id=None,
+            source=fvg_touch_candidate("zGap2", "1m", LONG, signal_known_at),
+        )
+        entry = observed(entry_event)
+        variant = next(v for v in ALL_EXIT_VARIANTS if v.variant_id == "tp=liquidity_rank_1|sl=liquidity_rank_1")
+
+        pre_fix_market_entry = MarketEntryContext(entry_id="x", direction=LONG, entry_price=100.0, entry_known_at=signal_known_at)
+        self.assertIsNone(_resolve_sl_candidate(variant, entry, pre_fix_market_entry, liquidity_results, empty_results))
+
+        post_fix_market_entry = MarketEntryContext(entry_id="x", direction=LONG, entry_price=100.0, entry_known_at=fill_bar_timestamp)
+        resolved = _resolve_sl_candidate(variant, entry, post_fix_market_entry, liquidity_results, empty_results)
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved.price, 90.0)
 
 
 def _short_fvg_touch_observed_entries(context) -> list[ObservedEntry]:
@@ -448,6 +553,131 @@ class TelemetryIntegrationTests(unittest.TestCase):
                 self.assertIsInstance(entry.pnl, float)
                 self.assertIsInstance(entry.trade_count, int)
                 self.assertTrue(0.0 <= entry.win_rate <= 1.0)
+
+
+class TopNTrackerTests(unittest.TestCase):
+    """Direct proof that the bounded top-N structure never grows past
+    its own cap, and that it produces the exact same ordering as an
+    independent brute-force sort over everything ever offered to it."""
+
+    def _make_result(self, strategy_variant_id: str, net_pnl_usd: float, max_drawdown_usd: float = 100.0):
+        from tradelab.backtest_v2 import ExitVariantSpec as _EV
+        from tradelab.entry_strategy_universe import EntryStrategyEquivalenceClass as _Cls
+
+        variant = ALL_EXIT_VARIANTS[0]
+        equity_result = build_equity_curve(
+            apply_accounting(BacktestResult(strategy_id="s", trades=[], skipped_signals=[], trade_count=0, tp_hit_count=0, sl_hit_count=0, open_unresolved_count=0, gross_pnl_points_total=0.0), Instrument.MNQ, RiskConfig()),
+            DEFAULT_EQUITY_CONFIG,
+        )
+        from tradelab.backtest_v2 import StrategyVariantResult
+
+        return StrategyVariantResult(
+            strategy_variant_id=strategy_variant_id, equivalence_class_id="cls", exit_variant=variant, instrument=Instrument.MNQ,
+            direction=LONG, trades=(), account_result=apply_accounting(BacktestResult(strategy_id="s", trades=[], skipped_signals=[], trade_count=0, tp_hit_count=0, sl_hit_count=0, open_unresolved_count=0, gross_pnl_points_total=0.0), Instrument.MNQ, RiskConfig()),
+            equity_result=equity_result, net_pnl_usd=net_pnl_usd, roi=net_pnl_usd / 50000.0, win_rate=0.5, trade_count=0,
+            max_drawdown_usd=max_drawdown_usd, drawdowns_over_2000_count=0, skipped_entries_by_reason={}, yearly={}, monthly={},
+        )
+
+    def test_never_grows_past_its_own_cap(self):
+        tracker = _TopNTracker(3)
+        for i in range(50):
+            tracker.offer(self._make_result(f"s{i}", net_pnl_usd=float(i)))
+            self.assertLessEqual(len(tracker), 3)
+        self.assertEqual(len(tracker), 3)
+
+    def test_matches_brute_force_sort_over_everything_ever_offered(self):
+        rng = random.Random(4242)
+        results = [self._make_result(f"s{i}", net_pnl_usd=rng.uniform(-1000, 1000), max_drawdown_usd=rng.uniform(0, 500)) for i in range(80)]
+        tracker = _TopNTracker(5)
+        for r in results:
+            tracker.offer(r)
+        actual = [r.strategy_variant_id for r in tracker.top_results()]
+        expected = [r.strategy_variant_id for r in sorted(results, key=_leaderboard_sort_key, reverse=True)[:5]]
+        self.assertEqual(actual, expected)
+
+    def test_deterministic_tie_break_by_drawdown_then_id(self):
+        tracker = _TopNTracker(2)
+        # identical net_pnl_usd -- lower max_drawdown wins; a further tie
+        # (same pnl AND same drawdown) breaks by strategy_variant_id.
+        tracker.offer(self._make_result("s-high-dd", net_pnl_usd=100.0, max_drawdown_usd=500.0))
+        tracker.offer(self._make_result("s-low-dd", net_pnl_usd=100.0, max_drawdown_usd=100.0))
+        tracker.offer(self._make_result("s-tied-b", net_pnl_usd=100.0, max_drawdown_usd=100.0))
+        tracker.offer(self._make_result("s-tied-a", net_pnl_usd=100.0, max_drawdown_usd=100.0))
+        top = tracker.top_results()
+        self.assertEqual(len(top), 2)
+        self.assertEqual(top[0].strategy_variant_id, "s-tied-b")  # "s-tied-b" > "s-tied-a" lexicographically
+        self.assertEqual(top[1].strategy_variant_id, "s-tied-a")
+
+    def test_rejects_non_positive_size(self):
+        with self.assertRaises(ValueError):
+            _TopNTracker(0)
+
+
+class VariantSummaryRowTests(unittest.TestCase):
+    def test_round_trips_to_a_json_serializable_dict(self):
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=1)
+        result = run_strategy_variant_backtest(universe.equivalence_classes[0], ALL_EXIT_VARIANTS[0], Instrument.MNQ, context)
+        row = VariantSummaryRow.from_result(result)
+        d = row.to_dict()
+        import json
+
+        json.dumps(d)  # must not raise -- every value is JSON-serializable
+        self.assertEqual(d["strategy_variant_id"], result.strategy_variant_id)
+        self.assertEqual(d["net_pnl_usd"], result.net_pnl_usd)
+        self.assertEqual(d["exit_variant_id"], result.exit_variant.variant_id)
+        self.assertNotIn("trades", d)  # deliberately lean -- no trade-level detail
+        self.assertNotIn("equity_curve", d)
+
+
+class MemoryBoundedProductionOrchestrationTests(unittest.TestCase):
+    """Proves _expand_and_simulate (a) durably records every single
+    evaluated variant, regardless of how many; (b) keeps the in-memory/
+    reported leaderboard strictly bounded to top_n_leaderboard, even
+    though far more variants than that are evaluated; and (c) that
+    bounded leaderboard is exactly correct against an independent
+    brute-force recomputation from the full durable summary stream --
+    i.e. boundedness never comes at the cost of correctness."""
+
+    def test_every_variant_is_durably_summarized_while_leaderboard_stays_bounded_and_correct(self):
+        from tradelab.research_run import create_run
+
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=1)
+        self.assertGreater(universe.equivalence_class_count, 0)
+
+        top_n = 3  # deliberately much smaller than the total variant count below
+        total_expected = universe.equivalence_class_count * len(ALL_EXIT_VARIANTS) * len(DEFAULT_INSTRUMENTS)
+        self.assertGreater(total_expected, top_n * 5)  # confirms this test actually exercises bounding, not a no-op
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={}, is_demo=True)
+            completed, final_top = _expand_and_simulate(
+                reporter, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, context,
+                risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG, top_n_leaderboard=top_n, checkpoint_every=7,
+            )
+
+            self.assertEqual(completed, total_expected)
+            self.assertLessEqual(len(final_top), top_n)
+
+            # (a) durable: every single variant landed in the summary stream.
+            import json as _json
+
+            with open(reporter.run_dir / "variant_summaries.jsonl") as f:
+                all_rows = [_json.loads(line) for line in f]
+            self.assertEqual(len(all_rows), total_expected)
+
+            # (b) bounded: the reported leaderboard never exceeds top_n.
+            leaderboard = read_leaderboard(reporter.run_dir)
+            self.assertLessEqual(len(leaderboard.entries), top_n)
+
+            # (c) correct: the bounded leaderboard exactly matches an
+            # independent brute-force recomputation over the FULL durable
+            # summary stream (all_rows), using the same deterministic key.
+            brute_force_ranked = sorted(all_rows, key=lambda r: (r["net_pnl_usd"], -r["max_drawdown_usd"], r["strategy_variant_id"]), reverse=True)
+            expected_top_ids = [r["strategy_variant_id"] for r in brute_force_ranked[:top_n]]
+            actual_top_ids = [e.strategy_id for e in leaderboard.entries]
+            self.assertEqual(actual_top_ids, expected_top_ids)
 
 
 class RandomizedExitResolutionReferenceTests(unittest.TestCase):

@@ -72,6 +72,25 @@ md`` for the full, standalone writeup):
   against the **actual fill bar's own timestamp**, not the raw signal's
   ``known_at`` -- these can differ when a data gap pushes the fill bar
   later. An already-open position is never force-closed by news.
+- **TP/SL source eligibility is likewise evaluated at the actual fill
+  instant, not the raw signal's own ``known_at``** -- the
+  ``MarketEntryContext`` passed to ``detect_tp_target_candidates``/
+  ``detect_sl_target_candidates`` carries ``entry_known_at=fill_bar.
+  timestamp``, for exactly the same reason the news check above already
+  uses the fill bar: a liquidity level or data wick that becomes known
+  strictly *between* the signal's own ``known_at`` and a gap-delayed
+  fill is genuinely available by the time the trade actually opens, and
+  excluding it would be inconsistent with both the news check and with
+  reality. **This is not look-ahead**: the fill bar is, by construction,
+  the first available bar at or after the signal's ``known_at`` --
+  nothing about this candidate window ever reaches past the instant the
+  trade itself opens. The original signal instant is preserved
+  separately and only for audit, as ``ExecutedTrade.signal_known_at``
+  (``_OpenPosition.signal_known_at=entry.known_at``) -- it is never used
+  to filter which TP/SL sources are eligible. In the ordinary, no-gap
+  case (the overwhelming majority) the fill bar's timestamp and the
+  signal's ``known_at`` are numerically identical, so this only ever
+  changes behavior across an actual data gap.
 
 **Exit-variant grammar** (``enumerate_exit_variants``, fixed, 20
 combinations, always fully enumerated regardless of a given strategy's
@@ -93,16 +112,55 @@ omitted from the catalog):
 **Instrument/sizing**: MNQ ($2.00/point) and NQ ($20.00/point), via
 ``tradelab.accounting`` unchanged -- see that module for the exact
 $500-nearest/$550-max/$20-fee algorithm.
+
+**Memory-bounded production orchestration.** ``run_strategy_variant_
+backtest`` itself stays rich and unchanged -- for direct/unit use, its
+return value (``StrategyVariantResult``) still carries every
+``ExecutedTrade``, the full ``AccountBacktestResult``, and the full
+``EquityResult`` (equity curve included). The *production runner*
+(``run_production_backtest_v2``, and the CLI smoke test, both via the
+shared ``_expand_and_simulate``) never accumulates these rich results
+across variants, though: a full exhaustive run is, in the worst case,
+hundreds of thousands to well over a million (equivalence class, exit
+variant, instrument) combinations (see task 040's real discovery
+numbers), and retaining every trade/equity point for every one of them
+in a single Python list is not something this process could support.
+Instead, for every completed variant:
+
+- a small, durable, JSON-serializable ``VariantSummaryRow`` (strategy
+  variant id, equivalence class id, direction, instrument, exit
+  variant, net P&L, ROI, win rate, trade count, max drawdown, >$2,000-
+  drawdown episode count, skipped-entry counts, yearly and monthly
+  summaries -- **no trade-level or equity-point detail**) is appended
+  immediately to ``variant_summaries.jsonl`` in the run directory, via
+  the same atomic ``tradelab.research_run.append_jsonl`` every other
+  progress event already uses -- this is the durable, all-variant
+  record of the entire run;
+- the *full* ``StrategyVariantResult`` is offered to a bounded, in-
+  memory top-N tracker (``_TopNTracker``, a size-capped min-heap keyed
+  by ``(net_pnl_usd, -max_drawdown_usd, strategy_variant_id)`` --
+  higher P&L wins, ties broken by lower drawdown, then by the
+  variant's own globally-unique id for full determinism) that never
+  holds more than ``top_n_leaderboard`` (default 25) rich results at
+  once, discarding anything that doesn't make the current cut. Detailed
+  trades/equity are therefore retained only *transiently*, per
+  evaluated variant, and durably only for whichever handful currently
+  sit in the top N -- never for the full population.
+
+The dashboard leaderboard (``reporter.update_leaderboard``) is rebuilt
+from this bounded structure at every checkpoint and once more at the
+end -- never from a reconstructed giant list.
 """
 from __future__ import annotations
 
 import bisect
+import heapq
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from tradelab.accounting import AccountBacktestResult, Instrument, RiskConfig, apply_accounting
 from tradelab.backtest import (
@@ -116,12 +174,12 @@ from tradelab.backtest import (
 )
 from tradelab.bar import Bar1m
 from tradelab.entry_signal_timeline import LONG, SHORT, EntryEvent, EntryEventKind
-from tradelab.entry_strategy_universe import EntryStrategyEquivalenceClass, ObservedEntry, discover_entry_strategy_universe
+from tradelab.entry_strategy_universe import EntryStrategyEquivalenceClass, EntryStrategyUniverseResult, ObservedEntry, discover_entry_strategy_universe
 from tradelab.equity import EquityConfig, EquityResult, build_equity_curve
 from tradelab.fvg import DEFAULT_TICK_SIZE
 from tradelab.fvg_entry import FVGEntryCandidate
 from tradelab.news import is_entry_blocked
-from tradelab.research_run import LeaderboardEntry, RunPhase, RunReporter, create_run
+from tradelab.research_run import LeaderboardEntry, RunPhase, RunReporter, append_jsonl, create_run
 from tradelab.sl_targets import FVG_SL_TIMEFRAMES, SelectedFVGConfluence, SLTargetCandidate, detect_sl_target_candidates
 from tradelab.sweep_fvg_setup import SweepFVGSetupEvent
 from tradelab.tp_targets import MarketEntryContext, TPTargetCandidate, detect_tp_target_candidates
@@ -353,7 +411,16 @@ def simulate_market_execution(
 
         trade_seq += 1
         trade_id = f"{strategy_variant_id}-{trade_seq:06d}-{entry.entry_id}"
-        market_entry = MarketEntryContext(entry_id=trade_id, direction=direction, entry_price=fill_bar.open, entry_known_at=entry.known_at)
+        # entry_known_at is the FILL bar's own timestamp, not the raw
+        # signal's known_at -- a source that becomes known between the
+        # signal and a gap-delayed fill is genuinely available by the
+        # time the trade actually opens, and must be eligible (see
+        # module docstring's "source eligibility" note; this mirrors the
+        # news-window check just above, which already uses fill_bar.
+        # timestamp for exactly this reason). The original signal
+        # instant is preserved separately, for audit only, as _OpenPosition
+        # .signal_known_at below -- never used for target-eligibility filtering.
+        market_entry = MarketEntryContext(entry_id=trade_id, direction=direction, entry_price=fill_bar.open, entry_known_at=fill_bar.timestamp)
 
         tp_candidate = _resolve_tp_candidate(variant, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results, context.data_wick_result)
         if tp_candidate is None:
@@ -524,8 +591,171 @@ def _to_leaderboard_entry(result: StrategyVariantResult, rank: int) -> Leaderboa
 
 
 # ---------------------------------------------------------------------------
+# Memory-bounded production orchestration: a durable summary row per
+# variant (every variant, no trade/equity detail) + a bounded top-N
+# tracker of full results (at most top_n_leaderboard at a time) -- see
+# module docstring's "Memory-bounded production orchestration" section.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class VariantSummaryRow:
+    """The durable, all-variant record of one completed (equivalence
+    class, exit variant, instrument) backtest -- deliberately lean
+    (no ``ExecutedTrade``/``AccountedTrade``/``EquityPoint`` detail) so
+    appending one of these per variant, for the entire run, stays cheap
+    regardless of how many variants that turns out to be."""
+
+    strategy_variant_id: str
+    equivalence_class_id: str
+    direction: str
+    instrument: str
+    exit_variant_id: str
+    tp_kind: str
+    tp_rank: int | None
+    sl_kind: str
+    sl_rank: int | None
+    sl_fvg_timeframe: str | None
+    net_pnl_usd: float
+    roi: float
+    win_rate: float | None
+    trade_count: int
+    max_drawdown_usd: float
+    drawdowns_over_2000_count: int
+    skipped_entries_by_reason: Mapping[str, int]
+    yearly: Mapping[str, Mapping[str, float | int]]
+    monthly: Mapping[str, Mapping[str, float | int]]
+
+    @staticmethod
+    def from_result(result: StrategyVariantResult) -> "VariantSummaryRow":
+        v = result.exit_variant
+        return VariantSummaryRow(
+            strategy_variant_id=result.strategy_variant_id, equivalence_class_id=result.equivalence_class_id,
+            direction=result.direction, instrument=result.instrument.value, exit_variant_id=v.variant_id,
+            tp_kind=v.tp_kind.value, tp_rank=v.tp_rank, sl_kind=v.sl_kind.value, sl_rank=v.sl_rank, sl_fvg_timeframe=v.sl_fvg_timeframe,
+            net_pnl_usd=result.net_pnl_usd, roi=result.roi, win_rate=result.win_rate, trade_count=result.trade_count,
+            max_drawdown_usd=result.max_drawdown_usd, drawdowns_over_2000_count=result.drawdowns_over_2000_count,
+            skipped_entries_by_reason=dict(result.skipped_entries_by_reason), yearly=dict(result.yearly), monthly=dict(result.monthly),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "strategy_variant_id": self.strategy_variant_id, "equivalence_class_id": self.equivalence_class_id,
+            "direction": self.direction, "instrument": self.instrument, "exit_variant_id": self.exit_variant_id,
+            "tp_kind": self.tp_kind, "tp_rank": self.tp_rank, "sl_kind": self.sl_kind, "sl_rank": self.sl_rank,
+            "sl_fvg_timeframe": self.sl_fvg_timeframe, "net_pnl_usd": self.net_pnl_usd, "roi": self.roi,
+            "win_rate": self.win_rate, "trade_count": self.trade_count, "max_drawdown_usd": self.max_drawdown_usd,
+            "drawdowns_over_2000_count": self.drawdowns_over_2000_count,
+            "skipped_entries_by_reason": dict(self.skipped_entries_by_reason), "yearly": dict(self.yearly), "monthly": dict(self.monthly),
+        }
+
+
+def _leaderboard_sort_key(result: StrategyVariantResult) -> tuple[float, float, str]:
+    """Higher net P&L wins; ties broken by lower max drawdown, then by
+    the variant's own globally-unique id -- fully deterministic (no two
+    distinct variants can ever compare exactly equal, since strategy_
+    variant_id is unique per (class, exit variant, instrument))."""
+    return (result.net_pnl_usd, -result.max_drawdown_usd, result.strategy_variant_id)
+
+
+class _TopNTracker:
+    """A size-capped min-heap holding at most ``n`` full
+    ``StrategyVariantResult`` objects at any time -- the current top-N
+    by :func:`_leaderboard_sort_key`, regardless of how many total
+    variants are ever offered to it. Never grows past ``n`` entries;
+    everything that doesn't make the current cut is discarded
+    immediately, not merely deferred."""
+
+    def __init__(self, n: int) -> None:
+        if n < 1:
+            raise ValueError(f"_TopNTracker size must be >= 1, got {n!r}")
+        self._n = n
+        self._heap: list[tuple[float, float, str, StrategyVariantResult]] = []
+
+    def offer(self, result: StrategyVariantResult) -> None:
+        key = _leaderboard_sort_key(result)
+        if len(self._heap) < self._n:
+            heapq.heappush(self._heap, (*key, result))
+        elif key > self._heap[0][:3]:
+            heapq.heappushpop(self._heap, (*key, result))
+        # else: not in the current top N -- discarded, never retained.
+
+    def top_results(self) -> list[StrategyVariantResult]:
+        """Best-first (rank 1 first) -- an O(n log n) sort over at most
+        ``n`` entries, never over the full population ever offered."""
+        return [entry[-1] for entry in sorted(self._heap, key=lambda entry: entry[:3], reverse=True)]
+
+    def __len__(self) -> int:
+        return len(self._heap)
+
+
+# ---------------------------------------------------------------------------
 # Telemetry-integrated production runner
 # ---------------------------------------------------------------------------
+
+_CHECKPOINT_RESUMABLE_NOTE = (
+    "Not yet resumable: tradelab.research_journal provides real, SQLite-backed "
+    "resumability, but only for the older StrategySpec/EntrySignal evaluation "
+    "stream (tradelab.research_runner.iter_research_evaluations) -- this engine's "
+    "own entry source (EntryStrategyEquivalenceClass.observed_entries) is not yet "
+    "wired into it. This checkpoint records progress position for the live "
+    "dashboard only."
+)
+
+
+def _expand_and_simulate(
+    reporter: RunReporter,
+    universe: EntryStrategyUniverseResult,
+    exit_variants: tuple[ExitVariantSpec, ...],
+    instruments: tuple[Instrument, ...],
+    context: PreparedBacktestContext,
+    *,
+    risk_config: RiskConfig,
+    equity_config: EquityConfig,
+    top_n_leaderboard: int,
+    checkpoint_every: int,
+) -> tuple[int, list[StrategyVariantResult]]:
+    """Shared by :func:`run_production_backtest_v2` and the CLI smoke
+    test: reports ``expanding_exit_variants`` then ``simulating_
+    backtests`` then ``ranking_results``, and is the sole place that
+    implements memory-bounded orchestration (see module docstring's
+    "Memory-bounded production orchestration" section) -- every
+    completed variant's lean summary is durably appended to
+    ``variant_summaries.jsonl`` immediately, and only a bounded top-N of
+    full results is ever held in memory. Returns ``(completed_count,
+    final_top_n_results)`` -- the caller never sees, and this function
+    never builds, a list of all results.
+    """
+    total_variant_runs = universe.equivalence_class_count * len(exit_variants) * len(instruments)
+    reporter.phase_started(RunPhase.EXPANDING_EXIT_VARIANTS, items_total=max(total_variant_runs, 1))
+    reporter.progress(items_completed=max(total_variant_runs, 1), exit_variants_generated=total_variant_runs)
+
+    reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=max(total_variant_runs, 1))
+    summary_path = reporter.run_dir / "variant_summaries.jsonl"
+    top_n = _TopNTracker(top_n_leaderboard)
+    completed = 0
+    for equivalence_class in universe.equivalence_classes:
+        for variant in exit_variants:
+            for instrument in instruments:
+                result = run_strategy_variant_backtest(equivalence_class, variant, instrument, context, risk_config=risk_config, equity_config=equity_config)
+                append_jsonl(summary_path, VariantSummaryRow.from_result(result).to_dict())
+                top_n.offer(result)
+                completed += 1
+                if completed % checkpoint_every == 0 or completed == total_variant_runs:
+                    reporter.progress(items_completed=completed, backtests_completed=completed)
+                    reporter.record_resource_usage()
+                    reporter.checkpoint_written(
+                        cursor={"stage": "simulating_backtests", "completed": completed, "total": total_variant_runs},
+                        resumable=False, resumable_note=_CHECKPOINT_RESUMABLE_NOTE,
+                    )
+                    top_results = top_n.top_results()
+                    reporter.update_leaderboard([_to_leaderboard_entry(r, rank) for rank, r in enumerate(top_results, start=1)])
+
+    reporter.phase_started(RunPhase.RANKING_RESULTS, items_total=1)
+    final_top = top_n.top_results()
+    reporter.update_leaderboard([_to_leaderboard_entry(r, rank) for rank, r in enumerate(final_top, start=1)])
+    reporter.progress(items_completed=1)
+    return completed, final_top
 
 
 def run_production_backtest_v2(
@@ -554,6 +784,13 @@ def run_production_backtest_v2(
     checkpoints, resource usage, and leaderboard updates through the
     real ``tradelab.research_run`` reporter API, so ``tradelab.research_
     dashboard`` can watch it live in a second terminal.
+
+    **Memory-bounded.** This function itself never holds more than a
+    handful of ``StrategyVariantResult`` objects at once -- see module
+    docstring. The durable, all-variant record of the run is ``runs/
+    <run_id>/variant_summaries.jsonl`` (one lean row per variant,
+    written immediately as each completes), not anything returned or
+    retained by this function.
 
     **Resumability is honestly not implemented here.** Every checkpoint
     is written with ``resumable=False`` and an explicit note -- real,
@@ -612,47 +849,15 @@ def run_production_backtest_v2(
         reporter.progress(items_completed=1, unique_entry_classes=universe.equivalence_class_count)
         reporter.checkpoint_written(cursor={"stage": "deduplicating_entries", "equivalence_class_count": universe.equivalence_class_count})
 
-        total_variant_runs = universe.equivalence_class_count * len(exit_variants) * len(instruments)
-        reporter.phase_started(RunPhase.EXPANDING_EXIT_VARIANTS, items_total=max(total_variant_runs, 1))
-        reporter.progress(items_completed=max(total_variant_runs, 1), exit_variants_generated=total_variant_runs)
-
-        reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=max(total_variant_runs, 1))
-        results: list[StrategyVariantResult] = []
-        completed = 0
-        for equivalence_class in universe.equivalence_classes:
-            for variant in exit_variants:
-                for instrument in instruments:
-                    result = run_strategy_variant_backtest(equivalence_class, variant, instrument, context, risk_config=risk_config, equity_config=equity_config)
-                    results.append(result)
-                    completed += 1
-                    if completed % checkpoint_every == 0 or completed == total_variant_runs:
-                        reporter.progress(items_completed=completed, backtests_completed=completed)
-                        reporter.record_resource_usage()
-                        reporter.checkpoint_written(
-                            cursor={"stage": "simulating_backtests", "completed": completed, "total": total_variant_runs},
-                            resumable=False,
-                            resumable_note=(
-                                "Not yet resumable: tradelab.research_journal provides real, SQLite-backed "
-                                "resumability, but only for the older StrategySpec/EntrySignal evaluation "
-                                "stream (tradelab.research_runner.iter_research_evaluations) -- this engine's "
-                                "own entry source (EntryStrategyEquivalenceClass.observed_entries) is not yet "
-                                "wired into it. This checkpoint records progress position for the live "
-                                "dashboard only."
-                            ),
-                        )
-                        top = sorted(results, key=lambda r: r.net_pnl_usd, reverse=True)[:top_n_leaderboard]
-                        reporter.update_leaderboard([_to_leaderboard_entry(r, rank) for rank, r in enumerate(top, start=1)])
-
-        reporter.phase_started(RunPhase.RANKING_RESULTS, items_total=1)
-        ranked = sorted(results, key=lambda r: r.net_pnl_usd, reverse=True)
-        top = ranked[:top_n_leaderboard]
-        reporter.update_leaderboard([_to_leaderboard_entry(r, rank) for rank, r in enumerate(top, start=1)])
-        reporter.progress(items_completed=1)
+        completed, final_top = _expand_and_simulate(
+            reporter, universe, exit_variants, instruments, context, risk_config=risk_config, equity_config=equity_config,
+            top_n_leaderboard=top_n_leaderboard, checkpoint_every=checkpoint_every,
+        )
 
         reporter.completed(
             summary={
                 "equivalence_class_count": universe.equivalence_class_count, "exit_variant_count": len(exit_variants),
-                "strategy_variant_result_count": len(results), "top_net_pnl_usd": (ranked[0].net_pnl_usd if ranked else None),
+                "strategy_variant_result_count": completed, "top_net_pnl_usd": (final_top[0].net_pnl_usd if final_top else None),
             }
         )
     except Exception as exc:  # noqa: BLE001 -- deliberately broad: any failure must be reported, never silently crash the run directory into an inconsistent state
@@ -749,6 +954,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run_smoke_pipeline(reporter: RunReporter, context: PreparedBacktestContext, *, min_entries_per_year: int) -> None:
+    """Drives the same memory-bounded ``_expand_and_simulate`` the
+    production runner uses -- the smoke test's own scale is tiny, but
+    it exercises exactly the same durable-summary-stream + bounded-top-N
+    orchestration path, not a separate, divergent implementation."""
     try:
         reporter.phase_started(RunPhase.PREPARING_DATA, items_total=1)
         reporter.progress(items_completed=1)
@@ -762,28 +971,13 @@ def _run_smoke_pipeline(reporter: RunReporter, context: PreparedBacktestContext,
         reporter.phase_started(RunPhase.DEDUPLICATING_ENTRIES, items_total=1)
         reporter.progress(items_completed=1, unique_entry_classes=universe.equivalence_class_count)
 
-        exit_variants = ALL_EXIT_VARIANTS
-        total = universe.equivalence_class_count * len(exit_variants) * len(DEFAULT_INSTRUMENTS)
-        reporter.phase_started(RunPhase.EXPANDING_EXIT_VARIANTS, items_total=max(total, 1))
-        reporter.progress(items_completed=max(total, 1), exit_variants_generated=total)
-
-        reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=max(total, 1))
-        results = []
-        completed = 0
-        for equivalence_class in universe.equivalence_classes:
-            for variant in exit_variants:
-                for instrument in DEFAULT_INSTRUMENTS:
-                    results.append(run_strategy_variant_backtest(equivalence_class, variant, instrument, context))
-                    completed += 1
-        if completed:
-            reporter.progress(items_completed=completed, backtests_completed=completed)
-            reporter.checkpoint_written(cursor={"stage": "simulating_backtests", "completed": completed, "total": total})
-            top = sorted(results, key=lambda r: r.net_pnl_usd, reverse=True)[:10]
-            reporter.update_leaderboard([_to_leaderboard_entry(r, rank) for rank, r in enumerate(top, start=1)])
-
-        reporter.phase_started(RunPhase.RANKING_RESULTS, items_total=1)
-        reporter.progress(items_completed=1)
-        reporter.completed(summary={"strategy_variant_result_count": len(results)})
+        completed, final_top = _expand_and_simulate(
+            reporter, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, context, risk_config=DEFAULT_RISK_CONFIG,
+            equity_config=DEFAULT_EQUITY_CONFIG, top_n_leaderboard=10, checkpoint_every=25,
+        )
+        reporter.completed(
+            summary={"strategy_variant_result_count": completed, "top_net_pnl_usd": (final_top[0].net_pnl_usd if final_top else None)}
+        )
     except Exception as exc:  # noqa: BLE001
         reporter.failed(error=f"{type(exc).__name__}: {exc}", traceback_text=traceback.format_exc())
         raise
