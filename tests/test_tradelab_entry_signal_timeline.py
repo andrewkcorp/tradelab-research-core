@@ -39,6 +39,7 @@ from tradelab.entry_signal_timeline import (
     iter_fvg_lifecycle_transitions,
     query_active_signals,
 )
+from tradelab.fvg import FVGDetectionResult, FVGStatus, FVGZone
 from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, FVGEntryCandidateResult, FVGMitigationEvent, SourceType
 from tradelab.liquidity import HIGH, LOW, LiquidityType
 from tradelab.liquidity_entry import (
@@ -174,6 +175,66 @@ def liquidity_result(*candidates: LiquidityEntryCandidate) -> LiquidityEntryCand
 
 EMPTY_FVG = fvg_result()
 EMPTY_LIQUIDITY = liquidity_result()
+
+
+def fvg_results_for(fvg_entry_result: FVGEntryCandidateResult) -> dict[str, FVGDetectionResult]:
+    """Test-only: synthesizes a minimal ``FVGZone`` (``formed_at`` one
+    minute before the zone's own earliest referenced known_at, matching
+    every real detector's own "formed strictly before its first
+    touch/mitigation" guarantee) for every distinct zone_id referenced
+    by ``fvg_entry_result``'s candidates/mitigations, grouped by
+    timeframe -- lets existing candidate-only test fixtures also
+    exercise ``iter_candidate_entry_snapshots``'s zone-formation-based
+    persistent state without hand-building a separate ``FVGZone`` for
+    every scenario. Tests that specifically need to control ``formed_at``
+    themselves (e.g. the untouched-zone-visibility regressions) build
+    ``FVGZone`` objects directly instead."""
+    known_ats_by_zone: dict[tuple[str, str], list[datetime]] = {}
+    original_direction_by_zone: dict[tuple[str, str], str] = {}
+
+    for candidate in fvg_entry_result.candidates:
+        key = (candidate.zone_id, candidate.timeframe)
+        known_ats_by_zone.setdefault(key, []).append(candidate.known_at)
+        if candidate.source_type == SourceType.FVG_TOUCH:
+            original_direction_by_zone[key] = candidate.direction
+    for mitigation in fvg_entry_result.zone_mitigations:
+        key = (mitigation.zone_id, mitigation.timeframe)
+        known_ats_by_zone.setdefault(key, []).append(mitigation.known_at)
+        original_direction_by_zone.setdefault(key, mitigation.direction)
+    # A zone only ever referenced by an IFVG (immediate inversion, no
+    # separate earlier touch) -- its own original direction is the
+    # IFVG's opposite.
+    for candidate in fvg_entry_result.candidates:
+        if candidate.source_type == SourceType.IFVG:
+            key = (candidate.zone_id, candidate.timeframe)
+            original_direction_by_zone.setdefault(key, SHORT if candidate.direction == LONG else LONG)
+
+    zones_by_timeframe: dict[str, list[FVGZone]] = {}
+    for (zone_id, timeframe), known_ats in known_ats_by_zone.items():
+        formed_at = min(known_ats) - timedelta(minutes=1)
+        direction_str = BIAS_BULLISH if original_direction_by_zone[(zone_id, timeframe)] == LONG else BIAS_BEARISH
+        zones_by_timeframe.setdefault(timeframe, []).append(
+            FVGZone(
+                zone_id=zone_id, timeframe=timeframe, direction=direction_str, lower=100.0, upper=101.5,
+                candle_1_timestamp=formed_at - timedelta(minutes=3), candle_2_timestamp=formed_at - timedelta(minutes=2),
+                candle_3_timestamp=formed_at - timedelta(minutes=1), formed_at=formed_at, status=FVGStatus.ACTIVE,
+                resolved_at=None, produced_ifvg=False,
+            )
+        )
+    return {timeframe: FVGDetectionResult(zones=zones, events=[]) for timeframe, zones in zones_by_timeframe.items()}
+
+
+def _zone(zone_id: str, timeframe: str, direction: str, formed_at: datetime) -> FVGZone:
+    """A minimal, directly-controlled ``FVGZone`` -- used by tests that
+    need to hand-pick ``formed_at`` themselves (e.g. the untouched-zone-
+    visibility regressions), rather than deriving it via ``fvg_results_
+    for``."""
+    return FVGZone(
+        zone_id=zone_id, timeframe=timeframe, direction=direction, lower=100.0, upper=101.5,
+        candle_1_timestamp=formed_at - timedelta(minutes=3), candle_2_timestamp=formed_at - timedelta(minutes=2),
+        candle_3_timestamp=formed_at - timedelta(minutes=1), formed_at=formed_at, status=FVGStatus.ACTIVE,
+        resolved_at=None, produced_ifvg=False,
+    )
 
 
 class NormalizationTests(unittest.TestCase):
@@ -911,6 +972,23 @@ def _random_fvg_zone_stories(
                     contact_type=FVGContactType.FULL_MITIGATION_NO_INVERSION, direction=direction, known_at=touch_known_at,
                 )
             )
+            # A real detector (tradelab.fvg._apply_lifecycle) always emits a
+            # matching FVGMitigationEvent for a non-inverting resolution,
+            # whether that is the zone's first contact or a later one -- a
+            # FULL_MITIGATION_NO_INVERSION touch is never realistic on its
+            # own. A no-op for the older, EntrySignal-keyed model (whose own
+            # _resolve_zone only retires a zone via touch_by_zone, which is
+            # never populated for a non-durable touch, so this changes
+            # nothing for iter_active_signal_snapshots/query_active_signals/
+            # iter_fvg_lifecycle_transitions/iter_active_pool_scalar_
+            # snapshots) -- but required for the newer, zone-keyed model
+            # (_apply_fvg_zone_batch) to correctly retire the zone.
+            mitigations.append(
+                FVGMitigationEvent(
+                    zone_id=zone_id, timeframe=timeframe, direction=direction, lower=100.0, upper=102.0,
+                    timestamp=touch_known_at, known_at=touch_known_at,
+                )
+            )
         elif kind == "partial_then_mitigated":
             mitigation_known_at = _avoid_maintenance_break(touch_known_at + timedelta(minutes=rng.randint(1, 200)))
             touch, mitigation = fvg_touch_then_mitigation(zone_id, timeframe, direction, touch_known_at, mitigation_known_at)
@@ -918,6 +996,93 @@ def _random_fvg_zone_stories(
             mitigations.append(mitigation)
         else:
             inversion_known_at = _avoid_maintenance_break(touch_known_at + timedelta(minutes=rng.randint(1, 200)))
+            touch, ifvg = fvg_touch_then_inversion(zone_id, timeframe, direction, touch_known_at, inversion_known_at)
+            candidates.append(touch)
+            if kind == "partial_then_inverted":
+                candidates.append(ifvg)
+    return candidates, mitigations
+
+
+_ALL_ZONE_STORY_KINDS = ("partial_only", "partial_then_inverted", "partial_then_mitigated", "full_mitigation", "immediate_inversion")
+
+
+def _non_colliding_fvg_zone_stories(
+    rng: random.Random, zone_count: int, base_dt: datetime, id_prefix: str, *, kinds: tuple[str, ...] = _ALL_ZONE_STORY_KINDS
+) -> tuple[list[FVGEntryCandidate], list[FVGMitigationEvent]]:
+    """Same generator as ``_random_fvg_zone_stories``, except every
+    zone gets its own exclusive, non-overlapping 120-minute time slot
+    (comfortably wider than the at-most-90-minute span a touch-plus-
+    resolution pair can reach after ``_avoid_maintenance_break``'s own
+    worst-case 60-minute forward nudge -- a narrower slot would let that
+    nudge push a timestamp into the *next* zone's slot, silently
+    reintroducing the exact cross-zone collision this generator exists
+    to eliminate) -- guaranteeing no two *different* zones' events ever
+    share the exact same ``known_at``. Used only by
+    ``FVGZoneStateEquivalenceTests``:
+    when two different zones' events DO share an exact instant, and one
+    challenges the other, the older, EntrySignal-keyed model and the
+    newer, zone-keyed model can legitimately disagree -- the old model
+    protects a zone from a same-batch challenge purely because it also
+    happens to be that zone's own first appearance (its own step-3
+    unconditional (re-)activation runs after the batch's own step-2
+    challenges), which is exactly the blind spot this whole amendment
+    fixes, not a bug in the new model. Excluding same-instant cross-
+    zone collisions isolates the suspend/restore/retire logic itself
+    for a clean, meaningful cross-model comparison.
+
+    ``kinds`` lets a caller exclude ``"full_mitigation"`` (a zone whose
+    own FIRST touch is FULL_MITIGATION_NO_INVERSION): the older,
+    EntrySignal-keyed ``_apply_fvg_batch`` has its own **independent,
+    pre-existing bug** for this exact contact_type -- its own step-1
+    retirement is a no-op for it (``touch_by_zone`` is only ever
+    populated for a *durable*, PARTIAL_TOUCH touch, never for a non-
+    durable one), so step 3 unconditionally re-adds the signal to
+    ``active`` regardless of the *matching, same-known_at*
+    ``FVGMitigationEvent`` having just resolved that exact zone in step
+    1 -- meaning the old model incorrectly keeps such a zone "active"
+    forever afterward, exactly the kind of indefinitely-persisting-
+    atomic-event bug this whole amendment exists to eliminate. The new,
+    zone-keyed model correctly retires it in the same batch. This is a
+    real, permanent divergence between the two models for this specific
+    contact_type -- not something a collision-free fixture can paper
+    over -- so ``FVGZoneStateEquivalenceTests`` excludes it via
+    ``kinds`` to isolate a clean comparison of the rules both models
+    are actually meant to agree on (same-timeframe suspend, restore via
+    later inversion, restore via a later *separate* mitigation)."""
+    candidates: list[FVGEntryCandidate] = []
+    mitigations: list[FVGMitigationEvent] = []
+    for i in range(zone_count):
+        zone_id = f"{id_prefix}-{i}"
+        timeframe = rng.choice(FVG_TIMEFRAME_POOL)
+        direction = rng.choice([LONG, SHORT])
+        slot_start = base_dt + timedelta(minutes=i * 120)
+        touch_known_at = _avoid_maintenance_break(slot_start + timedelta(minutes=rng.randint(0, 5)))
+        kind = rng.choice(kinds)
+        if kind == "immediate_inversion":
+            inverted = SHORT if direction == LONG else LONG
+            candidates.append(
+                fvg_candidate(zone_id=zone_id, timeframe=timeframe, source_type=SourceType.IFVG, direction=inverted, known_at=touch_known_at)
+            )
+        elif kind == "full_mitigation":
+            candidates.append(
+                fvg_candidate(
+                    zone_id=zone_id, timeframe=timeframe, source_type=SourceType.FVG_TOUCH,
+                    contact_type=FVGContactType.FULL_MITIGATION_NO_INVERSION, direction=direction, known_at=touch_known_at,
+                )
+            )
+            mitigations.append(
+                FVGMitigationEvent(
+                    zone_id=zone_id, timeframe=timeframe, direction=direction, lower=100.0, upper=102.0,
+                    timestamp=touch_known_at, known_at=touch_known_at,
+                )
+            )
+        elif kind == "partial_then_mitigated":
+            mitigation_known_at = _avoid_maintenance_break(touch_known_at + timedelta(minutes=rng.randint(1, 20)))
+            touch, mitigation = fvg_touch_then_mitigation(zone_id, timeframe, direction, touch_known_at, mitigation_known_at)
+            candidates.append(touch)
+            mitigations.append(mitigation)
+        else:
+            inversion_known_at = _avoid_maintenance_break(touch_known_at + timedelta(minutes=rng.randint(1, 20)))
             touch, ifvg = fvg_touch_then_inversion(zone_id, timeframe, direction, touch_known_at, inversion_known_at)
             candidates.append(touch)
             if kind == "partial_then_inverted":
@@ -1434,7 +1599,7 @@ class MarketStateVsEntryEventRegressionTests(unittest.TestCase):
         self.assertEqual([e.event_id for e in events], [touch.candidate_id, later.candidate_id])
         self.assertEqual(events[0].known_at, touch.known_at)
 
-        snapshots = {s.event.event_id: s for s in iter_candidate_entry_snapshots(result, EMPTY_LIQUIDITY, EMPTY_BIAS)}
+        snapshots = {s.event.event_id: s for s in iter_candidate_entry_snapshots(fvg_results_for(result), result, EMPTY_LIQUIDITY, EMPTY_BIAS)}
         self.assertEqual(len(snapshots), 2)
         # The touch's own zone never resolved -- its STATE (not the event itself) legitimately
         # persists as context for the later, unrelated event. This is the intended distinction,
@@ -1449,7 +1614,9 @@ class MarketStateVsEntryEventRegressionTests(unittest.TestCase):
         later_long = fvg_candidate(zone_id="C", direction=LONG, known_at=ny_dt(2026, 1, 5, 14, 0))
         result = fvg_result(bullish, bearish_touch, bearish_ifvg, later_long)
 
-        snapshots = {s.event.event_id: s for s in iter_candidate_entry_snapshots(result, EMPTY_LIQUIDITY, EMPTY_BIAS)}
+        snapshots = {
+            s.event.event_id: s for s in iter_candidate_entry_snapshots(fvg_results_for(result), result, EMPTY_LIQUIDITY, EMPTY_BIAS)
+        }
         later_state = snapshots[later_long.candidate_id].market_state
         # bullish was suspended by bearish_touch, then restored when bearish_touch's own
         # zone inverted (a partially-touched opposing FVG never permanently cancels the
@@ -1466,7 +1633,7 @@ class MarketStateVsEntryEventRegressionTests(unittest.TestCase):
         events = build_entry_events(result_fvg, result_liq)
         self.assertEqual(len([e for e in events if e.event_id == sweep.candidate_id]), 1)
 
-        snapshots = list(iter_candidate_entry_snapshots(result_fvg, result_liq, EMPTY_BIAS))
+        snapshots = list(iter_candidate_entry_snapshots(fvg_results_for(result_fvg), result_fvg, result_liq, EMPTY_BIAS))
         sweep_snapshots = [s for s in snapshots if s.event.event_id == sweep.candidate_id]
         self.assertEqual(len(sweep_snapshots), 1)
         # The sweep never contributes to, or appears in, persistent FVG-family state.
@@ -1486,7 +1653,9 @@ class MarketStateVsEntryEventRegressionTests(unittest.TestCase):
         event_c = fvg_candidate(zone_id="C", direction=LONG, known_at=t_bear + timedelta(hours=1))
         result = fvg_result(event_a, event_b, event_c)
 
-        snapshots = {s.event.event_id: s for s in iter_candidate_entry_snapshots(result, EMPTY_LIQUIDITY, bias_result)}
+        snapshots = {
+            s.event.event_id: s for s in iter_candidate_entry_snapshots(fvg_results_for(result), result, EMPTY_LIQUIDITY, bias_result)
+        }
         self.assertEqual(snapshots[event_a.candidate_id].market_state.bias.global_bias, BIAS_BULLISH)
         self.assertEqual(snapshots[event_b.candidate_id].market_state.bias.global_bias, BIAS_BULLISH)
         self.assertEqual(snapshots[event_c.candidate_id].market_state.bias.global_bias, BIAS_BEARISH)
@@ -1503,8 +1672,9 @@ class MarketStateVsEntryEventRegressionTests(unittest.TestCase):
         )
         fvg_res = fvg_result(*candidates, mitigations=mitigations)
         liq_res = liquidity_result(*liquidity_signals)
+        full_fvg_results = fvg_results_for(fvg_res)
 
-        full_snapshots = {s.event.event_id: s for s in iter_candidate_entry_snapshots(fvg_res, liq_res, bias_result)}
+        full_snapshots = {s.event.event_id: s for s in iter_candidate_entry_snapshots(full_fvg_results, fvg_res, liq_res, bias_result)}
         all_events = build_entry_events(fvg_res, liq_res)
 
         checked = 0
@@ -1516,9 +1686,16 @@ class MarketStateVsEntryEventRegressionTests(unittest.TestCase):
             truncated_bias = make_bias_result(
                 {tf: [c for c in changes if c.known_at <= cutoff] for tf, changes in bias_result.timeframe_changes.items()}
             )
+            # Zone formations must be truncated too -- a zone formed after the
+            # cutoff must never leak into the truncated run's market state.
+            truncated_fvg_results = {
+                timeframe: FVGDetectionResult(zones=[z for z in result.zones if z.formed_at <= cutoff], events=[])
+                for timeframe, result in full_fvg_results.items()
+            }
             truncated_snapshots = {
                 s.event.event_id: s
                 for s in iter_candidate_entry_snapshots(
+                    truncated_fvg_results,
                     fvg_result(*truncated_fvg_candidates, mitigations=truncated_mitigations),
                     liquidity_result(*truncated_liquidity),
                     truncated_bias,
@@ -1562,7 +1739,7 @@ class BiasIncrementalTrackingEquivalenceTests(unittest.TestCase):
         events = _random_fvg_signals(rng, 60, base, "bias-eq")
         result = fvg_result(*events)
 
-        for snapshot in iter_candidate_entry_snapshots(result, EMPTY_LIQUIDITY, bias_result):
+        for snapshot in iter_candidate_entry_snapshots(fvg_results_for(result), result, EMPTY_LIQUIDITY, bias_result):
             expected = bias_at(bias_result, snapshot.event.known_at)
             self.assertEqual(snapshot.market_state.bias, expected, f"mismatch at known_at={snapshot.event.known_at!r}")
 
@@ -1576,16 +1753,17 @@ class CandidateEntrySnapshotStructuralTests(unittest.TestCase):
         result_liq = liquidity_result(*liquidity_signals)
 
         events = build_entry_events(result_fvg, result_liq)
-        snapshots = list(iter_candidate_entry_snapshots(result_fvg, result_liq, EMPTY_BIAS))
+        snapshots = list(iter_candidate_entry_snapshots(fvg_results_for(result_fvg), result_fvg, result_liq, EMPTY_BIAS))
         self.assertEqual(len(snapshots), len(events))
         self.assertEqual([s.event.event_id for s in snapshots], [e.event_id for e in events])
 
     def test_empty_inputs_yield_no_snapshots(self):
-        self.assertEqual(list(iter_candidate_entry_snapshots(EMPTY_FVG, EMPTY_LIQUIDITY, EMPTY_BIAS)), [])
+        self.assertEqual(list(iter_candidate_entry_snapshots({}, EMPTY_FVG, EMPTY_LIQUIDITY, EMPTY_BIAS)), [])
 
     def test_market_state_as_of_matches_the_events_own_known_at(self):
         touch = fvg_candidate(zone_id="A", direction=LONG, known_at=ny_dt(2026, 1, 5, 10, 0))
-        (snapshot,) = list(iter_candidate_entry_snapshots(fvg_result(touch), EMPTY_LIQUIDITY, EMPTY_BIAS))
+        result = fvg_result(touch)
+        (snapshot,) = list(iter_candidate_entry_snapshots(fvg_results_for(result), result, EMPTY_LIQUIDITY, EMPTY_BIAS))
         self.assertEqual(snapshot.market_state.as_of, touch.known_at)
 
     def test_active_fvg_selector_pool_never_exceeds_the_fixed_selector_catalog_size(self):
@@ -1596,9 +1774,162 @@ class CandidateEntrySnapshotStructuralTests(unittest.TestCase):
         rng = random.Random(112233)
         candidates, mitigations = _random_fvg_zone_stories(rng, 300, ny_dt(2026, 1, 5, 9, 0), "bounded")
         result = fvg_result(*candidates, mitigations=mitigations)
-        for snapshot in iter_candidate_entry_snapshots(result, EMPTY_LIQUIDITY, EMPTY_BIAS):
+        for snapshot in iter_candidate_entry_snapshots(fvg_results_for(result), result, EMPTY_LIQUIDITY, EMPTY_BIAS):
             for direction in (LONG, SHORT):
                 self.assertLessEqual(len(snapshot.market_state.active_fvg_selectors_by_direction[direction]), 12)
+
+
+class UntouchedZoneVisibilityRegressionTests(unittest.TestCase):
+    """Amendment to PR #36 (Codex review): FVG zone state must be built
+    from the real ``FVGZone`` detector output, not inferred from entry
+    candidates -- a zone that has never been touched still has no entry
+    candidate at all, so it was invisible as persistent context until
+    something finally touched it, even though it was genuinely,
+    structurally active the whole time. The four focused regressions
+    this amendment requires."""
+
+    def test_a_untouched_zone_remains_visible_for_an_unrelated_later_event(self):
+        """FVG formed at T0 and never touched still remains visible in
+        MarketStateSnapshot for an unrelated entry event at T1."""
+        t0 = ny_dt(2026, 1, 5, 10, 0)
+        t1 = ny_dt(2026, 1, 5, 12, 0)
+        untouched = _zone("Z-UNTOUCHED", "1m", BIAS_BULLISH, formed_at=t0)
+        later = fvg_candidate(zone_id="OTHER", timeframe="5m", direction=LONG, known_at=t1)
+        fvg_results = {"1m": FVGDetectionResult(zones=[untouched], events=[]), "5m": FVGDetectionResult(zones=[], events=[])}
+        result = fvg_result(later)
+
+        (snapshot,) = list(iter_candidate_entry_snapshots(fvg_results, result, EMPTY_LIQUIDITY, EMPTY_BIAS))
+        self.assertIn("fvg-1m-fvg_touch", snapshot.market_state.active_fvg_selectors_by_direction[LONG])
+
+    def test_b_untouched_zone_is_suspended_by_an_opposing_touch_and_restored_by_its_later_inversion(self):
+        """The untouched zone disappears/suspends/restores according to
+        the existing lifecycle rules -- exactly like a touched one
+        would (a partially-touched opposing FVG never permanently
+        cancels it, since the challenger may later become a same-
+        direction iFVG)."""
+        t0 = ny_dt(2026, 1, 5, 10, 0)  # untouched zone formed
+        t1 = ny_dt(2026, 1, 5, 11, 0)  # opposing touch (challenger) -- suspends the untouched zone
+        t_mid = ny_dt(2026, 1, 5, 12, 0)  # probe while still suspended
+        t2 = ny_dt(2026, 1, 5, 13, 0)  # challenger's own inversion -- restores it
+        t_after = ny_dt(2026, 1, 5, 14, 0)  # probe after restoration
+
+        untouched = _zone("Z-A", "1m", BIAS_BULLISH, formed_at=t0)
+        challenger_touch = fvg_candidate(zone_id="Z-B", timeframe="1m", direction=SHORT, known_at=t1)
+        probe_mid = fvg_candidate(zone_id="Z-MID", timeframe="5m", direction=LONG, known_at=t_mid)
+        challenger_ifvg = fvg_candidate(zone_id="Z-B", timeframe="1m", source_type=SourceType.IFVG, direction=LONG, known_at=t2)
+        probe_after = fvg_candidate(zone_id="Z-AFTER", timeframe="5m", direction=LONG, known_at=t_after)
+
+        fvg_results = {"1m": FVGDetectionResult(zones=[untouched], events=[]), "5m": FVGDetectionResult(zones=[], events=[])}
+        result = fvg_result(challenger_touch, probe_mid, challenger_ifvg, probe_after)
+
+        snapshots = {s.event.event_id: s for s in iter_candidate_entry_snapshots(fvg_results, result, EMPTY_LIQUIDITY, EMPTY_BIAS)}
+        mid_state = snapshots[probe_mid.candidate_id].market_state
+        after_state = snapshots[probe_after.candidate_id].market_state
+        self.assertNotIn("fvg-1m-fvg_touch", mid_state.active_fvg_selectors_by_direction[LONG])
+        self.assertIn("fvg-1m-fvg_touch", after_state.active_fvg_selectors_by_direction[LONG])
+        self.assertIn("fvg-1m-ifvg", after_state.active_fvg_selectors_by_direction[LONG])
+
+    def test_c_a_later_events_snapshot_never_re_offers_an_earlier_touch_as_its_own_event(self):
+        t0 = ny_dt(2026, 1, 5, 10, 0)
+        t1 = ny_dt(2026, 1, 5, 12, 0)
+        touch = fvg_candidate(zone_id="Z-A", timeframe="1m", direction=LONG, known_at=t0)
+        later = fvg_candidate(zone_id="Z-B", timeframe="5m", direction=LONG, known_at=t1)
+        result = fvg_result(touch, later)
+
+        events = build_entry_events(result, EMPTY_LIQUIDITY)
+        self.assertEqual([e.event_id for e in events], [touch.candidate_id, later.candidate_id])
+
+        snapshots = list(iter_candidate_entry_snapshots(fvg_results_for(result), result, EMPTY_LIQUIDITY, EMPTY_BIAS))
+        later_snapshot = next(s for s in snapshots if s.event.event_id == later.candidate_id)
+        self.assertNotEqual(later_snapshot.event.event_id, touch.candidate_id)
+        self.assertEqual(sum(1 for s in snapshots if s.event.event_id == touch.candidate_id), 1)
+
+    def test_d_a_zone_is_never_visible_before_its_own_formation(self):
+        t_form = ny_dt(2026, 1, 5, 12, 0)
+        t_before = ny_dt(2026, 1, 5, 10, 0)
+        t_after = t_form + timedelta(hours=1)
+        zone_ = _zone("Z-A", "1m", BIAS_BULLISH, formed_at=t_form)
+        probe_before = fvg_candidate(zone_id="Z-PROBE-BEFORE", timeframe="5m", direction=LONG, known_at=t_before)
+        probe_after = fvg_candidate(zone_id="Z-PROBE-AFTER", timeframe="5m", direction=LONG, known_at=t_after)
+        fvg_results = {"1m": FVGDetectionResult(zones=[zone_], events=[]), "5m": FVGDetectionResult(zones=[], events=[])}
+        result = fvg_result(probe_before, probe_after)
+
+        snapshots = {s.event.event_id: s for s in iter_candidate_entry_snapshots(fvg_results, result, EMPTY_LIQUIDITY, EMPTY_BIAS)}
+        self.assertNotIn("fvg-1m-fvg_touch", snapshots[probe_before.candidate_id].market_state.active_fvg_selectors_by_direction[LONG])
+        self.assertIn("fvg-1m-fvg_touch", snapshots[probe_after.candidate_id].market_state.active_fvg_selectors_by_direction[LONG])
+
+
+class FVGZoneStateEquivalenceTests(unittest.TestCase):
+    """For zones that ARE touched, the new zone-keyed persistent state
+    (``_apply_fvg_zone_batch``) must produce the exact same unique-
+    selector set as the older, already-tested signal-keyed active pool
+    (``iter_active_signal_snapshots``) -- proving the reimplementation
+    this amendment required introduces no semantic drift for the part
+    the old model already covered correctly. (Untouched zones are, by
+    definition, outside the old model's own coverage -- that is exactly
+    the bug being fixed -- so this comparison is restricted to real
+    touch/iFVG events, where both models must agree.)
+
+    Uses ``_non_colliding_fvg_zone_stories``, not ``_random_fvg_zone_
+    stories``: when two *different* zones' events land on the exact
+    same known_at and one challenges the other, the old model can
+    protect the target purely because that instant also happens to be
+    the target's own first appearance (see that generator's own
+    docstring) -- a real, legitimate divergence this amendment
+    introduces on purpose, not something a same-instant-collision-free
+    fixture should be exercising here. Also excludes the
+    ``"full_mitigation"`` story kind -- the old model has its own
+    independent, pre-existing bug for that exact contact_type (see the
+    generator's own docstring) that this amendment correctly does not
+    reproduce, so equality there is neither expected nor desired."""
+
+    _EQUIVALENCE_KINDS = ("partial_only", "partial_then_inverted", "partial_then_mitigated", "immediate_inversion")
+
+    def test_matches_the_older_signal_keyed_active_pool_for_touched_zones(self):
+        rng = random.Random(864213)
+        candidates, mitigations = _non_colliding_fvg_zone_stories(
+            rng, 150, ny_dt(2026, 1, 5, 9, 0), "equiv", kinds=self._EQUIVALENCE_KINDS
+        )
+        fvg_res = fvg_result(*candidates, mitigations=mitigations)
+        fvg_results = fvg_results_for(fvg_res)
+        timeline = build_entry_signal_timeline(fvg_res, EMPTY_LIQUIDITY)
+
+        old_by_id = {s.signal.candidate_id: s for s in iter_active_signal_snapshots(timeline)}
+        new_by_id = {s.event.event_id: s for s in iter_candidate_entry_snapshots(fvg_results, fvg_res, EMPTY_LIQUIDITY, EMPTY_BIAS)}
+
+        checked = 0
+        for candidate_id, old_snapshot in old_by_id.items():
+            new_snapshot = new_by_id[candidate_id]
+            direction = old_snapshot.signal.direction
+            old_selectors = set(old_snapshot.active_by_selector.keys())
+            new_selectors = set(new_snapshot.market_state.active_fvg_selectors_by_direction[direction])
+            self.assertEqual(old_selectors, new_selectors, f"mismatch at {candidate_id!r}")
+            checked += 1
+        self.assertGreater(checked, 0)
+
+    def test_matches_on_a_second_random_seed(self):
+        rng = random.Random(24681357)
+        candidates, mitigations = _non_colliding_fvg_zone_stories(
+            rng, 200, ny_dt(2026, 3, 1, 9, 0), "equiv2", kinds=self._EQUIVALENCE_KINDS
+        )
+        fvg_res = fvg_result(*candidates, mitigations=mitigations)
+        fvg_results = fvg_results_for(fvg_res)
+        timeline = build_entry_signal_timeline(fvg_res, EMPTY_LIQUIDITY)
+
+        old_by_id = {s.signal.candidate_id: s for s in iter_active_signal_snapshots(timeline)}
+        new_by_id = {s.event.event_id: s for s in iter_candidate_entry_snapshots(fvg_results, fvg_res, EMPTY_LIQUIDITY, EMPTY_BIAS)}
+
+        checked = 0
+        for candidate_id, old_snapshot in old_by_id.items():
+            new_snapshot = new_by_id[candidate_id]
+            direction = old_snapshot.signal.direction
+            self.assertEqual(
+                set(old_snapshot.active_by_selector.keys()),
+                set(new_snapshot.market_state.active_fvg_selectors_by_direction[direction]),
+                f"mismatch at {candidate_id!r}",
+            )
+            checked += 1
+        self.assertGreater(checked, 0)
 
 
 if __name__ == "__main__":

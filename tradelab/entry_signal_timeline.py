@@ -174,6 +174,7 @@ from zoneinfo import ZoneInfo
 
 from tradelab.bias import BEARISH, BULLISH, NEUTRAL, BiasSnapshot, HTFBiasResult, TimeframeBiasChange
 from tradelab.bias import SUPPORTED_TIMEFRAMES as _BIAS_TIMEFRAMES
+from tradelab.fvg import FVGDetectionResult, FVGZone
 from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, FVGEntryCandidateResult, FVGMitigationEvent
 from tradelab.fvg_entry import SourceType as FVGSourceType
 from tradelab.liquidity_entry import LiquidityEntryCandidate, LiquidityEntryCandidateResult
@@ -999,12 +1000,7 @@ def iter_active_pool_scalar_snapshots(timeline: EntrySignalTimeline) -> Iterator
 #   retired structural status, or the current HTF bias) genuinely does not
 #   expire on its own -- it stays valid, unbounded, until its own explicit
 #   structural terminal rule fires (a same-timeframe opposite challenger's
-#   resolution, or its own inversion/mitigation; a bias change). This is
-#   exactly the FVG suspend/restore/retire engine ``_apply_fvg_batch``
-#   already implements, and ``tradelab.bias.bias_at``'s own contract --
-#   reused here completely unmodified, never reimplemented, so this
-#   refactor cannot introduce semantic drift from the already-correct,
-#   already-tested lifecycle rules.
+#   resolution, or its own inversion/mitigation; a bias change).
 # - An **atomic entry event** (an FVG touch, a confirmed iFVG, or a
 #   liquidity sweep) is known exactly once, at its own ``known_at`` -- it
 #   may be a strategy's primary trigger *at that instant*, but there is no
@@ -1013,6 +1009,26 @@ def iter_active_pool_scalar_snapshots(timeline: EntrySignalTimeline) -> Iterator
 #   ``EntrySignal``. A historical event that nothing later specifically
 #   invalidated does not thereby remain an eligible primary indefinitely --
 #   it simply is not offered again after its own instant.
+#
+# **A zone's persistent state must be visible from its own formation, not
+# only from its first touch.** An earlier version of this section built FVG
+# state solely from ``FVGEntryCandidateResult.candidates`` (touch/iFVG
+# entry candidates) -- but a zone that has never been touched has no entry
+# candidate at all, so it was invisible as context until *something*
+# finally touched it, even though it was genuinely, structurally active
+# (unmitigated) the whole time. A zone formed at 10:00 and never touched
+# must still be visible in the ``MarketStateSnapshot`` of an unrelated
+# entry event at 12:00. Fixed by tracking FVG zone state **by zone_id**,
+# entering the pool at each zone's own ``formed_at`` (read straight from
+# ``tradelab.fvg.FVGZone``, the real detector output -- never inferred from
+# entry candidates), via a dedicated ``_apply_fvg_zone_batch`` that
+# reimplements (necessarily -- the value model is zone-keyed, not
+# candidate_id-keyed, so ``_apply_fvg_batch`` itself cannot be reused
+# as-is) the exact same suspend/restore/retire/mitigation-resolution rules
+# already proven correct above. ``EntryEvent``s themselves are unaffected
+# by this: they are still built only from actual touch/iFVG/liquidity
+# candidates (``build_entry_events``, unchanged) -- formation is never an
+# ``EntryEvent``, only ever a persistent-state fact.
 # ---------------------------------------------------------------------------
 
 
@@ -1069,14 +1085,18 @@ class MarketStateSnapshot:
       ifvg}"``) with at least one zone that is currently structurally
       ACTIVE -- not currently suspended by a same-timeframe opposite-
       direction challenger, and not permanently retired by its own
-      resolution. This is exactly the same active/suspended/retired FVG
-      zone lifecycle ``_apply_fvg_batch`` already implements (reused
-      here completely unmodified), just exposed as *state* rather than
-      folded into an ever-accumulating list of individual touch/iFVG
-      facts. At most 6 timeframes x 2 source types = 12 possible
-      strings per direction, system-wide, ever -- bounded by the FVG-
-      family selector catalog itself, never by how much history has
-      accumulated.
+      resolution. A zone contributes to its timeframe's ``fvg_touch``
+      selector from its own ``formed_at`` onward -- **whether or not it
+      has ever actually been touched** -- and switches to that
+      timeframe's ``ifvg`` selector only once it has itself inverted;
+      the same suspend/restore/retire/mitigation-resolution rules
+      ``_apply_fvg_batch`` implements for the older, signal-keyed model
+      apply here too, just tracked by zone_id instead of candidate_id
+      (see ``_apply_fvg_zone_batch``) so an untouched, unresolved zone
+      is never invisible. At most 6 timeframes x 2 source types = 12
+      possible strings per direction, system-wide, ever -- bounded by
+      the FVG-family selector catalog itself, never by how much history
+      has accumulated.
     - ``bias``: the HTF bias snapshot (``tradelab.bias.BiasSnapshot``,
       identical to what ``tradelab.bias.bias_at`` would return at this
       same instant -- proven equivalent by randomized test, computed
@@ -1163,23 +1183,26 @@ def build_entry_events(
 
 
 def _merge_confluence_streams(
+    formations: list[FVGZone],
     fvg_signals: list[EntrySignal],
     mitigations: list[FVGMitigationEvent],
     bias_changes: list[TimeframeBiasChange],
     liquidity_signals: list[EntrySignal],
 ):
-    """Yields ``(fvg_signal_batch, mitigation_batch, bias_change_batch,
-    liquidity_batch)`` tuples, one per distinct ``known_at`` across all
-    four streams combined, chronological -- generalizes ``_merge_known_
-    at_groups`` to the two additional streams ``iter_candidate_entry_
-    snapshots`` needs (bias changes, liquidity events), with the exact
-    same guarantee: batch members sharing one ``known_at`` never affect
-    each other, only strictly earlier batches do."""
+    """Yields ``(formation_batch, fvg_signal_batch, mitigation_batch,
+    bias_change_batch, liquidity_batch)`` tuples, one per distinct
+    ``known_at``/``formed_at`` across all five streams combined,
+    chronological -- generalizes ``_merge_known_at_groups`` to the
+    additional streams ``iter_candidate_entry_snapshots`` needs (zone
+    formations, bias changes, liquidity events), with the exact same
+    guarantee: batch members sharing one instant never affect each
+    other, only strictly earlier batches do."""
     tagged = (
-        [(s.known_at, s.candidate_id, 0, s) for s in fvg_signals]
-        + [(m.known_at, m.zone_id, 1, m) for m in mitigations]
-        + [(c.known_at, c.timeframe, 2, c) for c in bias_changes]
-        + [(s.known_at, s.candidate_id, 3, s) for s in liquidity_signals]
+        [(z.formed_at, z.zone_id, 0, z) for z in formations]
+        + [(s.known_at, s.candidate_id, 1, s) for s in fvg_signals]
+        + [(m.known_at, m.zone_id, 2, m) for m in mitigations]
+        + [(c.known_at, c.timeframe, 3, c) for c in bias_changes]
+        + [(s.known_at, s.candidate_id, 4, s) for s in liquidity_signals]
     )
     tagged.sort(key=lambda t: (t[0], t[2], t[1]))
     for _known_at, group_iter in groupby(tagged, key=lambda t: t[0]):
@@ -1189,10 +1212,183 @@ def _merge_confluence_streams(
             [t[3] for t in group if t[2] == 1],
             [t[3] for t in group if t[2] == 2],
             [t[3] for t in group if t[2] == 3],
+            [t[3] for t in group if t[2] == 4],
         )
 
 
+@dataclass(frozen=True)
+class _ZoneStateEntry:
+    """Leaf value for the zone-keyed persistent-FVG-state pool
+    ``_apply_fvg_zone_batch`` maintains -- carries exactly what
+    ``_RefCountingDict`` needs (``.direction``, ``.selector``) plus the
+    zone's own identity, so ``iter_candidate_entry_snapshots`` never
+    needs to look anything up in ``fvg_result.candidates`` to answer
+    "which selectors are currently active."""
+
+    zone_id: str
+    timeframe: str
+    direction: str
+    selector: str
+
+
+def _fvg_zone_selector(timeframe: str, kind: str) -> str:
+    """Identical string format to ``_fvg_selector`` (``"fvg-{timeframe}-
+    {fvg_touch|ifvg}"``), built from a raw ``FVGZone`` (which has no
+    ``source_type``) instead of an ``FVGEntryCandidate``."""
+    return f"fvg-{timeframe}-{kind}"
+
+
+# tradelab.bias re-exports tradelab.fvg's own BULLISH/BEARISH verbatim
+# (see tradelab/bias.py), so this is the exact same direction vocabulary
+# FVGZone.direction uses -- translated to this module's LONG/SHORT, the
+# same translation tradelab.fvg_entry's own (private) candidate-building
+# code already performs for touch/iFVG candidates.
+_FVG_ZONE_DIRECTION = {BULLISH: LONG, BEARISH: SHORT}
+
+
+def _apply_fvg_zone_batch(
+    formation_batch: list[FVGZone],
+    touch_batch: list[EntrySignal],
+    mitigation_batch: list[FVGMitigationEvent],
+    zone_active: dict[str, dict[str, dict[str, _ZoneStateEntry]]],
+    zone_suspended: dict[str, _ZoneStateEntry],
+    zone_suspended_by: dict[str, str],
+    zone_entries: dict[str, _ZoneStateEntry],
+    pending_resolution: dict[str, list[str]],
+) -> None:
+    """Mutates ``zone_active``/``zone_suspended``/``zone_suspended_by``/
+    ``zone_entries``/``pending_resolution`` in place for one instant's
+    batch -- the zone-keyed counterpart of ``_apply_fvg_batch``,
+    covering every zone (touched or not) instead of only zones that
+    have an ``EntrySignal``. Necessarily a **reimplementation**, not a
+    reuse, of ``_apply_fvg_batch``: that function's value model is
+    keyed by an entry candidate's own ``candidate_id``, which does not
+    exist for an untouched zone at all, so it structurally cannot
+    represent "zone formed, never touched, still active." The rules
+    themselves are identical (same suspend/restore/retire/mitigation-
+    resolution semantics, same same-timeframe/opposite-direction/
+    durable-vs-immediate-resolution challenge logic) -- see this
+    module's own docstring and ``tests/test_tradelab_entry_signal_
+    timeline.py``'s ``FVGZoneStateEquivalenceTests`` for direct
+    cross-checks against ``_apply_fvg_batch`` on every zone that *does*
+    get touched, proving no semantic drift.
+
+    ``zone_entries`` always holds a zone's current representation
+    (timeframe/direction/selector) for every zone currently tracked,
+    whether it lives in ``zone_active`` or ``zone_suspended`` --
+    avoiding the need for a separate "which touch is this zone's own"
+    lookup the way ``_apply_fvg_batch``'s ``touch_by_zone`` needs, since
+    the zone itself (never a derived touch candidate_id) is the key
+    throughout. ``zone_suspended_by`` maps a currently-suspended zone to
+    its own challenger's zone_id, so that if the suspended zone is later
+    separately retired (nested conflict), the challenger's own
+    ``pending_resolution`` entry is cleaned up -- the exact same
+    nested-conflict handling ``_apply_fvg_batch`` performs via
+    ``suspended_by``.
+    """
+
+    def _resolve(zone_id: str) -> None:
+        if zone_id in zone_entries:
+            entry = zone_entries.pop(zone_id)
+            if zone_id in zone_suspended:
+                del zone_suspended[zone_id]
+                challenger_zone_id = zone_suspended_by.pop(zone_id)
+                still_pending = [zid for zid in pending_resolution.get(challenger_zone_id, []) if zid != zone_id]
+                if still_pending:
+                    pending_resolution[challenger_zone_id] = still_pending
+                else:
+                    pending_resolution.pop(challenger_zone_id, None)
+            else:
+                del zone_active[entry.timeframe][entry.direction][zone_id]
+
+        pending = pending_resolution.pop(zone_id, None)
+        if pending:
+            for suspended_zone_id in pending:
+                restored_entry = zone_suspended.pop(suspended_zone_id)
+                zone_suspended_by.pop(suspended_zone_id, None)
+                zone_entries[suspended_zone_id] = restored_entry
+                zone_active.setdefault(restored_entry.timeframe, {}).setdefault(restored_entry.direction, {})[
+                    suspended_zone_id
+                ] = restored_entry
+
+    # 1. Resolve zones whose own confirmed iFVG or mitigation is in this
+    #    batch -- permanently retires that zone's ORIGINAL-direction (or
+    #    already-inverted) presence and restores whatever it had itself
+    #    suspended. A zone's own FULL_MITIGATION_NO_INVERSION touch
+    #    always has a matching FVGMitigationEvent at this exact known_at
+    #    (tradelab.fvg._apply_lifecycle emits one unconditionally on
+    #    every non-inverting resolution, first contact or not), so it is
+    #    already retired here -- no separate handling needed below.
+    for signal in touch_batch:
+        candidate: FVGEntryCandidate = signal.source
+        if candidate.source_type != FVGSourceType.IFVG:
+            continue
+        _resolve(candidate.zone_id)
+    for mitigation in mitigation_batch:
+        _resolve(mitigation.zone_id)
+
+    # 2. Challenges -- a still-open PARTIAL_TOUCH, or an immediately-
+    #    resolved FULL_MITIGATION_NO_INVERSION touch, challenges the
+    #    pre-batch (post step-1) active pool for the opposite direction,
+    #    same timeframe -- every zone there, touched or not. A durable
+    #    (PARTIAL_TOUCH) challenge actually suspends the target; a
+    #    non-durable one is an immediate no-op for state (the target was
+    #    never really removed -- see _apply_fvg_batch's own docstring
+    #    for the identical rule).
+    challenge_actions: list[tuple[str, str, bool]] = []
+    for signal in touch_batch:
+        candidate = signal.source
+        if candidate.source_type != FVGSourceType.FVG_TOUCH:
+            continue
+        if candidate.contact_type not in (FVGContactType.PARTIAL_TOUCH, FVGContactType.FULL_MITIGATION_NO_INVERSION):
+            continue
+        is_durable = candidate.contact_type == FVGContactType.PARTIAL_TOUCH
+        opposite = _OPPOSITE_DIRECTION[signal.direction]
+        for target_zone_id in list(zone_active.get(signal.timeframe, {}).get(opposite, {}).keys()):
+            challenge_actions.append((target_zone_id, candidate.zone_id, is_durable))
+
+    for target_zone_id, challenger_zone_id, is_durable in challenge_actions:
+        entry = zone_entries.get(target_zone_id)
+        if entry is None:
+            continue  # already resolved (retired) earlier in this batch
+        tf_pool = zone_active.get(entry.timeframe, {}).get(entry.direction, {})
+        if target_zone_id not in tf_pool:
+            continue  # already suspended earlier in this same batch
+        if not is_durable:
+            continue
+        del tf_pool[target_zone_id]
+        zone_suspended[target_zone_id] = entry
+        zone_suspended_by[target_zone_id] = challenger_zone_id
+        pending_resolution.setdefault(challenger_zone_id, []).append(target_zone_id)
+
+    # 3. New zone formations enter the pool, in their own direction, as
+    #    fvg_touch-kind -- structurally active from this instant on,
+    #    whether or not anything ever touches them.
+    for zone in formation_batch:
+        direction = _FVG_ZONE_DIRECTION[zone.direction]
+        entry = _ZoneStateEntry(
+            zone_id=zone.zone_id, timeframe=zone.timeframe, direction=direction,
+            selector=_fvg_zone_selector(zone.timeframe, FVGSourceType.FVG_TOUCH.value),
+        )
+        zone_entries[zone.zone_id] = entry
+        zone_active.setdefault(zone.timeframe, {}).setdefault(direction, {})[zone.zone_id] = entry
+
+    # 4. A confirmed iFVG in this batch is itself a new active
+    #    confluence, in the inverted direction, as ifvg-kind.
+    for signal in touch_batch:
+        candidate = signal.source
+        if candidate.source_type != FVGSourceType.IFVG:
+            continue
+        entry = _ZoneStateEntry(
+            zone_id=candidate.zone_id, timeframe=candidate.timeframe, direction=signal.direction,
+            selector=_fvg_zone_selector(candidate.timeframe, FVGSourceType.IFVG.value),
+        )
+        zone_entries[candidate.zone_id] = entry
+        zone_active.setdefault(candidate.timeframe, {}).setdefault(signal.direction, {})[candidate.zone_id] = entry
+
+
 def iter_candidate_entry_snapshots(
+    fvg_results: Mapping[str, FVGDetectionResult],
     fvg_result: FVGEntryCandidateResult,
     liquidity_result: LiquidityEntryCandidateResult,
     htf_bias_result: HTFBiasResult,
@@ -1203,45 +1399,53 @@ def iter_candidate_entry_snapshots(
     ``known_at``, and the primary, intended entry point for future
     strategy-discovery confluence semantics (spec, this task).
 
-    One linear forward sweep, merging FVG signals, zone mitigations,
-    HTF bias changes, and liquidity signals by ``known_at``
-    (``_merge_confluence_streams``). FVG zone state is tracked via the
-    exact same, completely unmodified ``_apply_fvg_batch`` engine every
-    other function in this module already uses (never reimplemented --
-    same suspend/restore/retire/mitigation-resolution rules, so this
-    cannot semantically drift from them), wrapped in a ``_RefCountingDict``
-    so reading ``active_fvg_selectors_by_direction`` is ``O(1)`` per
-    snapshot rather than rescanning the whole active pool (same
-    technique as ``iter_active_pool_scalar_snapshots``). HTF bias is
-    tracked incrementally (never by calling ``tradelab.bias.bias_at``
-    per event, which would rescan from the start of its own change list
-    every time -- proven exactly equivalent to ``bias_at`` by randomized
-    test instead). Liquidity signals never touch FVG or bias state at
-    all (no persistent role -- see ``MarketStateSnapshot``'s own
-    docstring); they only ever appear as the primary event of their own,
-    single snapshot. Total: ``O(N log N)``, memory ``O(number of
-    currently active unique FVG selectors)`` -- never ``O(number of
-    snapshots x active pool size)``.
+    ``fvg_results`` (keyed by timeframe, exactly ``PreparedBacktestContext
+    .fvg_results`` -- the raw detector output, **not** ``fvg_result``'s
+    own entry candidates) is what makes an untouched, structurally
+    active zone visible: its own ``FVGZone.formed_at`` is read directly,
+    never inferred from ``fvg_result.candidates`` (which only exist for
+    zones that have actually been touched or inverted).
+
+    One linear forward sweep, merging zone formations, FVG entry
+    signals, zone mitigations, HTF bias changes, and liquidity signals
+    by instant (``_merge_confluence_streams``). FVG zone state is
+    tracked by ``_apply_fvg_zone_batch`` (zone-keyed, so an untouched
+    zone is never invisible -- see this module's own docstring),
+    wrapped in a ``_RefCountingDict`` so reading ``active_fvg_selectors_
+    by_direction`` is ``O(1)`` per snapshot rather than rescanning the
+    whole active pool (same technique as ``iter_active_pool_scalar_
+    snapshots``). HTF bias is tracked incrementally (never by calling
+    ``tradelab.bias.bias_at`` per event, which would rescan from the
+    start of its own change list every time -- proven exactly
+    equivalent to ``bias_at`` by randomized test instead). Liquidity
+    signals never touch FVG or bias state at all (no persistent role --
+    see ``MarketStateSnapshot``'s own docstring); they only ever appear
+    as the primary event of their own, single snapshot. Total:
+    ``O(N log N)``, memory ``O(number of currently active unique FVG
+    zones)`` -- never ``O(number of snapshots x active pool size)``.
     """
+    all_zones = [zone for result in fvg_results.values() for zone in result.zones]
     fvg_signals = [_signal_from_fvg(c) for c in fvg_result.candidates]
     liquidity_signals = [_signal_from_liquidity(c) for c in liquidity_result.candidates]
     bias_changes = [change for timeframe in _BIAS_TIMEFRAMES for change in htf_bias_result.timeframe_changes[timeframe]]
 
     counter = _ActivePoolRefCounter()
-    fvg_active: dict[str, dict[str, dict[str, EntrySignal]]] = _RefCountingDict(counter)
-    fvg_suspended: dict[str, EntrySignal] = {}
-    fvg_suspended_by: dict[str, SignalSuspension] = {}
-    fvg_pending_resolution: dict[str, list[str]] = {}
-    fvg_touch_by_zone: dict[str, tuple[str, str]] = {}
+    zone_active: dict[str, dict[str, dict[str, _ZoneStateEntry]]] = _RefCountingDict(counter)
+    zone_suspended: dict[str, _ZoneStateEntry] = {}
+    zone_suspended_by: dict[str, str] = {}
+    zone_entries: dict[str, _ZoneStateEntry] = {}
+    pending_resolution: dict[str, list[str]] = {}
 
     bias_timeframe_states: dict[str, str] = {tf: NEUTRAL for tf in _BIAS_TIMEFRAMES}
     bias_global = NEUTRAL
 
-    for fvg_batch, mitigation_batch, bias_batch, liquidity_batch in _merge_confluence_streams(
-        fvg_signals, fvg_result.zone_mitigations, bias_changes, liquidity_signals
+    for formation_batch, fvg_batch, mitigation_batch, bias_batch, liquidity_batch in _merge_confluence_streams(
+        all_zones, fvg_signals, fvg_result.zone_mitigations, bias_changes, liquidity_signals
     ):
-        if fvg_batch or mitigation_batch:
-            _apply_fvg_batch(fvg_batch, mitigation_batch, fvg_active, fvg_suspended, fvg_suspended_by, fvg_pending_resolution, fvg_touch_by_zone)
+        if formation_batch or fvg_batch or mitigation_batch:
+            _apply_fvg_zone_batch(
+                formation_batch, fvg_batch, mitigation_batch, zone_active, zone_suspended, zone_suspended_by, zone_entries, pending_resolution
+            )
 
         if bias_batch:
             for change in bias_batch:

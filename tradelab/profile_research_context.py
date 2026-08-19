@@ -849,10 +849,18 @@ _ENTRY_EVENT_MODEL_NOTE = (
     "and is never re-offered as a fresh primary trigger at any later "
     "instant; only the FVG zone's own structural state and HTF bias -- "
     "genuinely persistent facts, not events -- are usable as context for "
-    "a later, unrelated event. This is not a cap, a time window, or an "
-    "approximation of any kind -- see no_accumulation_evidence below for "
-    "machine-checkable proof that events are not silently accumulating "
-    "as if they were persistent facts."
+    "a later, unrelated event. persistent_state_fact_counts.fvg_zone_"
+    "count_total and active_persistent_context_at_candidate_timestamps "
+    "are built from the real tradelab.fvg.FVGZone detector output (see "
+    "tradelab.entry_signal_timeline.iter_candidate_entry_snapshots's own "
+    "fvg_results parameter) -- a zone is visible as context from its own "
+    "formed_at, whether or not it has ever actually been touched, never "
+    "inferred from (and therefore never limited to) FVG entry candidates "
+    "that already required an actual touch to exist. This is not a cap, "
+    "a time window, or an approximation of any kind -- see "
+    "no_accumulation_evidence below for machine-checkable proof that "
+    "events are not silently accumulating as if they were persistent "
+    "facts."
 )
 
 
@@ -883,12 +891,18 @@ def _entry_event_model_section(
     snapshot_count = 0
     max_active_fvg_selectors_observed = 0
 
-    for snapshot in iter_candidate_entry_snapshots(fvg_entry_result, liquidity_entry_result, htf_bias_result):
+    for snapshot in iter_candidate_entry_snapshots(fvg_results, fvg_entry_result, liquidity_entry_result, htf_bias_result):
         snapshot_count += 1
         same_direction_selectors = snapshot.market_state.active_fvg_selectors_by_direction[snapshot.event.direction]
         including = len(same_direction_selectors)
-        is_fvg_primary = snapshot.event.kind in (EntryEventKind.FVG_TOUCH, EntryEventKind.IFVG)
-        excluding = including - 1 if is_fvg_primary else including
+        # Never blindly subtract 1: under the zone-keyed model, a primary's
+        # own zone can itself be suspended in this exact same batch by a
+        # same-instant, same-timeframe opposing challenger (the challenger
+        # targets the pre-batch pool, which now includes zones active since
+        # formation, not just zones this same batch happens to touch) -- so
+        # the primary's own selector is not guaranteed present. Only
+        # subtract when it is actually there, or this could go negative.
+        excluding = including - (1 if snapshot.event.selector in same_direction_selectors else 0)
         including_primary.append(including)
         excluding_primary.append(excluding)
         max_active_fvg_selectors_observed = max(max_active_fvg_selectors_observed, including)
@@ -907,11 +921,17 @@ def _entry_event_model_section(
                 "tradelab.entry_signal_timeline.MarketStateSnapshot "
                 "reports for that direction. active_fvg_selector_count_"
                 "including_primary includes the event's own selector "
-                "when the event is itself FVG-family (touch/iFVG); "
+                "whenever it is actually present in that set (an "
+                "FVG-family event's own zone can itself be suspended in "
+                "this exact same batch by a same-instant, same-timeframe "
+                "opposing challenger, so presence is checked directly, "
+                "never assumed from the event's own kind alone); "
                 "required_confluence_selector_count_excluding_primary "
-                "subtracts it in that case, and is identical to the "
-                "including-primary count for a liquidity-sweep primary "
-                "(liquidity is never itself in this pool)."
+                "subtracts exactly one only when the primary's own "
+                "selector is present -- identical to the including-"
+                "primary count for a liquidity-sweep primary (liquidity "
+                "is never itself in this pool) or for a suspended-at-"
+                "this-instant FVG-family primary."
             ),
             "active_fvg_selector_count_including_primary": _stat_summary(including_primary),
             "required_confluence_selector_count_excluding_primary": _stat_summary(excluding_primary),

@@ -312,18 +312,21 @@ class ExplicitWindowsHalfOpenTests(unittest.TestCase):
         self.assertEqual(counts_2024, [{"selector": "fvg-1m-fvg_touch", "direction": "short", "count": 1}])
 
 
-def zone(zone_id: str, timeframe: str, direction: str, status: FVGStatus = FVGStatus.ACTIVE) -> FVGZone:
+def zone(
+    zone_id: str, timeframe: str, direction: str, status: FVGStatus = FVGStatus.ACTIVE, formed_at: datetime | None = None
+) -> FVGZone:
     t0 = datetime(2024, 1, 1, tzinfo=UTC)
+    resolved_formed_at = formed_at if formed_at is not None else t0 + timedelta(minutes=3)
     return FVGZone(
         zone_id=zone_id,
         timeframe=timeframe,
         direction=direction,
         lower=100.0,
         upper=101.5,
-        candle_1_timestamp=t0,
-        candle_2_timestamp=t0 + timedelta(minutes=1),
-        candle_3_timestamp=t0 + timedelta(minutes=2),
-        formed_at=t0 + timedelta(minutes=3),
+        candle_1_timestamp=resolved_formed_at - timedelta(minutes=3),
+        candle_2_timestamp=resolved_formed_at - timedelta(minutes=2),
+        candle_3_timestamp=resolved_formed_at - timedelta(minutes=1),
+        formed_at=resolved_formed_at,
         status=status,
         resolved_at=None,
         produced_ifvg=False,
@@ -1155,7 +1158,15 @@ class EntryEventModelSectionTests(unittest.TestCase):
         ifvg = fvg_ifvg_candidate("z2", "1m", "long", t0 + timedelta(minutes=1))
         sweep = liquidity_candidate_for_model("sw1", "1m", "long", t0 + timedelta(minutes=2))
 
-        fvg_results = {"1m": FVGDetectionResult(zones=[zone("z1", "1m", BULLISH), zone("z2", "1m", BULLISH)], events=[])}
+        fvg_results = {
+            "1m": FVGDetectionResult(
+                zones=[
+                    zone("z1", "1m", BULLISH, formed_at=t0 - timedelta(minutes=1)),
+                    zone("z2", "1m", BEARISH, formed_at=t0 - timedelta(minutes=1)),
+                ],
+                events=[],
+            )
+        }
         fvg_entry_result = FVGEntryCandidateResult(candidates=[touch, ifvg])
         liquidity_entry_result = LiquidityEntryCandidateResult(candidates=[sweep])
         htf_bias_result = HTFBiasResult(timeframe_changes={"1H": [], "4H": [], "1D": []})
@@ -1165,6 +1176,35 @@ class EntryEventModelSectionTests(unittest.TestCase):
         self.assertEqual(section["persistent_state_fact_counts"], {"fvg_zone_count_total": 2, "htf_bias_change_count_total": 0})
         self.assertEqual(section["entry_event_count_by_kind"], {"fvg_touch": 1, "ifvg": 1, "liquidity_sweep": 1, "total": 3})
         self.assertEqual(section["candidate_entry_snapshot_count"], 3)
+
+    def test_excluding_primary_never_goes_negative_when_the_primarys_own_zone_is_suspended_in_the_same_batch(self):
+        """Under the zone-keyed model, a primary event's own zone can
+        itself be suspended in this exact same batch by a same-instant,
+        same-timeframe opposing challenger -- the challenger targets the
+        pre-batch pool, which includes zones active since formation, not
+        just zones this same batch happens to touch. Found via a real-
+        MNQ smoke run: required_confluence_selector_count_excluding_
+        primary's min was -1 before this was fixed to check actual
+        selector presence instead of blindly subtracting one whenever
+        the event was FVG-family."""
+        t_form = datetime(2024, 1, 1, tzinfo=UTC)
+        t_touch = t_form + timedelta(hours=1)
+        zone_a = zone("A", "1m", BULLISH, formed_at=t_form)
+        zone_b = zone("B", "1m", BEARISH, formed_at=t_form)
+        touch_a = fvg_touch_candidate("A", "1m", "long", FVGContactType.PARTIAL_TOUCH, t_touch)
+        touch_b = fvg_touch_candidate("B", "1m", "short", FVGContactType.PARTIAL_TOUCH, t_touch)
+
+        fvg_results = {"1m": FVGDetectionResult(zones=[zone_a, zone_b], events=[])}
+        fvg_entry_result = FVGEntryCandidateResult(candidates=[touch_a, touch_b])
+        liquidity_entry_result = LiquidityEntryCandidateResult(candidates=[])
+        htf_bias_result = HTFBiasResult(timeframe_changes={"1H": [], "4H": [], "1D": []})
+
+        section = _entry_event_model_section(fvg_results, fvg_entry_result, liquidity_entry_result, htf_bias_result)
+
+        excluding_stats = section["active_persistent_context_at_candidate_timestamps"][
+            "required_confluence_selector_count_excluding_primary"
+        ]
+        self.assertGreaterEqual(excluding_stats["min"], 0)
 
     def test_no_accumulation_evidence_holds_on_a_realistic_fixture(self):
         t0 = datetime(2024, 1, 1, tzinfo=UTC)
