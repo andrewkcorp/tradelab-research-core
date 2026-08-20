@@ -403,13 +403,13 @@ def discover_entry_strategy_universe(
     htf_bias_result: HTFBiasResult,
     *,
     min_entries_per_year: int = DEFAULT_MIN_ENTRIES_PER_YEAR,
+    require_yearly_eligibility: bool = True,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> EntryStrategyUniverseResult:
     """Enumerate the full, fixed 1,554,432-spec syntactic universe,
     determine each spec's exact, no-look-ahead observed eligible-entry
-    sequence, keep only specs meeting ``min_entries_per_year`` in both
-    2024 and 2025 (the default, 100, is the real business rule --
-    override only for small-fixture tests/diagnostics), and group
+    sequence, normally keep only specs meeting ``min_entries_per_year`` in
+    both 2024 and 2025 (the default, 100, is the real business rule), and group
     eligible specs by identical observed sequence into equivalence
     classes. One shared ``event_id -> MarketStateSnapshot`` lookup (built
     from ``iter_candidate_entry_snapshots``, already no-look-ahead and
@@ -421,6 +421,13 @@ def discover_entry_strategy_universe(
     the vast majority of the 3036-primary catalog that never fires at
     all in a given dataset costs nothing beyond the fixed arithmetic
     ``SYNTACTIC_SPEC_COUNT`` total.
+
+    ``require_yearly_eligibility=False`` is reserved for bounded engine
+    benchmarks on a short real-data prefix. It does not alter the observed
+    entries or the strategy grammar; it merely admits every non-empty
+    observed sequence so the inner execution loop can be measured before two
+    full calendar years are available. Production callers must retain the
+    default ``True``.
 
     ``on_progress`` (task 044), if given, is called with ``(primaries_
     processed, primaries_total)`` once per real (already-fired) primary
@@ -483,7 +490,7 @@ def discover_entry_strategy_universe(
 
         for (req, pattern), observed_list in cells.items():
             count_2024, count_2025 = _year_counts(observed_list)
-            if count_2024 < min_entries_per_year or count_2025 < min_entries_per_year:
+            if require_yearly_eligibility and (count_2024 < min_entries_per_year or count_2025 < min_entries_per_year):
                 continue
             spec = EntryStrategySpec(
                 spec_id=_build_spec_id(primary, req, pattern), primary=primary, required_fvg_context_selectors=req, bias_requirement=pattern

@@ -2287,6 +2287,22 @@ class BatchedExitBenchmarkTests(unittest.TestCase):
         exit_code = backtest_v2_main(["batch-benchmark", "--sample-size", "1"])
         self.assertEqual(exit_code, 0)
 
+    def test_short_prefix_benchmark_mode_can_admit_observed_entries(self):
+        full_context = build_synthetic_smoke_context()
+        # This 2025-only slice cannot meet the production two-year rule, but
+        # it is still valid to measure the inner execution loop.
+        short_context = prepare_backtest_context(full_context.bars_1m[60:], [], tick_size=0.25, pivot_strength=2, reclaim_window_bars=3)
+        production_universe = discover_entry_strategy_universe(
+            short_context.fvg_results, short_context.fvg_entry_result, short_context.liquidity_entry_result, short_context.htf_bias_result,
+            min_entries_per_year=1,
+        )
+        benchmark_universe = discover_entry_strategy_universe(
+            short_context.fvg_results, short_context.fvg_entry_result, short_context.liquidity_entry_result, short_context.htf_bias_result,
+            min_entries_per_year=1, require_yearly_eligibility=False,
+        )
+        self.assertEqual(production_universe.equivalence_class_count, 0)
+        self.assertGreater(benchmark_universe.equivalence_class_count, 0)
+
 
 class StageDiagnosticTests(unittest.TestCase):
     """task 047, requirements 1-2: run_stage_diagnostic actually measures

@@ -2602,7 +2602,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             context = build_synthetic_smoke_context()
         universe = discover_entry_strategy_universe(
-            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=args.min_entries_per_year
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result,
+            min_entries_per_year=args.min_entries_per_year,
         )
         report = run_execution_acceleration_benchmark(context, universe, ALL_EXIT_VARIANTS, sample_size=args.sample_size)
         print(json.dumps(report, indent=2))
@@ -2623,7 +2624,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             context = build_synthetic_smoke_context()
         universe = discover_entry_strategy_universe(
-            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=args.min_entries_per_year
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result,
+            min_entries_per_year=args.min_entries_per_year,
+            require_yearly_eligibility=(args.mode != "batch-benchmark"),
         )
         if args.mode == "stage-diagnostic":
             report = run_stage_diagnostic(context, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, sample_size=args.sample_size)
