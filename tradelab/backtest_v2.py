@@ -2330,6 +2330,23 @@ def run_batched_exit_benchmark(
         )
     batched_elapsed_seconds = time.perf_counter() - batched_start
 
+    # The production path: a bounded cache survives across classes. This
+    # measures the incremental effect beyond task 048's batched traversal.
+    run_wide_start = time.perf_counter()
+    run_wide_results: dict[str, dict[str, tuple[list[ExecutedTrade], list[SkippedEntryV2]]]] = {}
+    run_wide_cache = EntryTargetCache(max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES)
+    for equivalence_class in classes:
+        run_wide_results[equivalence_class.class_id] = simulate_market_execution_batched(
+            equivalence_class.observed_entries,
+            equivalence_class.representative_spec.primary.direction,
+            exit_variants,
+            context,
+            equivalence_class.class_id,
+            bar_range_index=bar_range_index,
+            entry_target_cache=run_wide_cache,
+        )
+    run_wide_elapsed_seconds = time.perf_counter() - run_wide_start
+
     variant_count = len(classes) * len(exit_variants)
     return {
         "sample_size": len(classes),
@@ -2338,10 +2355,13 @@ def run_batched_exit_benchmark(
         "exit_variant_count": len(exit_variants),
         "sequential_cached_elapsed_seconds": sequential_elapsed_seconds,
         "batched_elapsed_seconds": batched_elapsed_seconds,
+        "run_wide_cached_batched_elapsed_seconds": run_wide_elapsed_seconds,
         "sequential_cached_variants_per_second": (variant_count / sequential_elapsed_seconds) if sequential_elapsed_seconds > 0 else None,
         "batched_variants_per_second": (variant_count / batched_elapsed_seconds) if batched_elapsed_seconds > 0 else None,
+        "run_wide_cached_batched_variants_per_second": (variant_count / run_wide_elapsed_seconds) if run_wide_elapsed_seconds > 0 else None,
         "speedup_factor": (sequential_elapsed_seconds / batched_elapsed_seconds) if batched_elapsed_seconds > 0 else None,
-        "exact_result_equality": sequential_results == batched_results,
+        "run_wide_cache_speedup_factor": (batched_elapsed_seconds / run_wide_elapsed_seconds) if run_wide_elapsed_seconds > 0 else None,
+        "exact_result_equality": sequential_results == batched_results == run_wide_results,
     }
 
 

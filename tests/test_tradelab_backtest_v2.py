@@ -2281,7 +2281,9 @@ class BatchedExitBenchmarkTests(unittest.TestCase):
         self.assertTrue(report["exact_result_equality"])
         self.assertGreater(report["sequential_cached_elapsed_seconds"], 0.0)
         self.assertGreater(report["batched_elapsed_seconds"], 0.0)
+        self.assertGreater(report["run_wide_cached_batched_elapsed_seconds"], 0.0)
         self.assertIsNotNone(report["speedup_factor"])
+        self.assertIsNotNone(report["run_wide_cache_speedup_factor"])
 
     def test_benchmark_cli_runs_and_prints_a_report(self):
         exit_code = backtest_v2_main(["batch-benchmark", "--sample-size", "1"])
