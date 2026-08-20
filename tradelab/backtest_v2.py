@@ -1958,16 +1958,17 @@ def _measure_sample_throughput(
     bar_range_index = _build_bar_range_index_with_heartbeat(reporter, context.bars_1m) if reporter is not None else BarRangeIndex.build(context.bars_1m)
     completed = 0
     start = time.perf_counter()
-    current_class_id: str | None = None
-    entry_target_cache: EntryTargetCache | None = None
-    for (_class_id, _variant_id), group in itertools.groupby(combos, key=lambda c: (c[0].class_id, c[1].variant_id)):
-        group = list(group)
-        equivalence_class, variant = group[0][0], group[0][1]
-        if equivalence_class.class_id != current_class_id:
-            current_class_id = equivalence_class.class_id
-            entry_target_cache = EntryTargetCache()
-        group_instruments = tuple(c[2] for c in group)
-        lead_variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, group_instruments[0].value)
+    entry_target_cache = EntryTargetCache(max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES)
+    liquidity_target_index = LiquidityTargetIndex.build(context.swing_equal_liquidity_results, context.session_liquidity_results)
+    for _class_id, class_group_iter in itertools.groupby(combos, key=lambda c: c[0].class_id):
+        class_group = list(class_group_iter)
+        equivalence_class = class_group[0][0]
+        pending_by_variant: list[tuple[ExitVariantSpec, tuple[Instrument, ...]]] = []
+        for _variant_id, variant_group_iter in itertools.groupby(class_group, key=lambda c: c[1].variant_id):
+            variant_group = list(variant_group_iter)
+            pending_by_variant.append((variant_group[0][1], tuple(c[2] for c in variant_group)))
+        lead_variant, lead_instruments = pending_by_variant[0]
+        lead_variant_id = strategy_variant_id(equivalence_class.class_id, lead_variant.variant_id, lead_instruments[0].value)
         on_bar_progress = None
         on_entry_progress = None
         if reporter is not None:
@@ -1983,22 +1984,28 @@ def _measure_sample_throughput(
             )
             on_bar_progress = bar_progress.maybe
             on_entry_progress = _entry_progress_callback(reporter, variant_id=lead_variant_id)
-        results_by_instrument = run_strategy_variant_backtest_all_instruments(
-            equivalence_class, variant, group_instruments, context, risk_config=risk_config, equity_config=equity_config,
+        executions_by_variant = simulate_market_execution_batched(
+            equivalence_class.observed_entries, equivalence_class.representative_spec.primary.direction,
+            tuple(variant for variant, _instruments in pending_by_variant), context, equivalence_class.class_id,
             on_bar_progress=on_bar_progress, on_entry_progress=on_entry_progress, bar_range_index=bar_range_index,
-            entry_target_cache=entry_target_cache,
+            entry_target_cache=entry_target_cache, liquidity_target_index=liquidity_target_index,
         )
-        for instrument in group_instruments:
-            result = results_by_instrument[instrument]
-            row = VariantSummaryRow.from_result(result)
-            row_byte_sizes.append(len(json.dumps(row.to_dict()).encode("utf-8")))
-            completed += 1
-            if reporter is not None:
-                variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value)
-                reporter.heartbeat(
-                    operation="sampling_throughput", variant_id=variant_id, unit_index=completed, unit_total=len(combos),
-                    bars_scanned=len(context.bars_1m), bars_total=len(context.bars_1m),
+        for variant, group_instruments in pending_by_variant:
+            trades, skipped = executions_by_variant[variant.variant_id]
+            for instrument in group_instruments:
+                result = _build_variant_result_for_instrument(
+                    equivalence_class, variant, instrument, trades, skipped,
+                    risk_config=risk_config, equity_config=equity_config,
                 )
+                row = VariantSummaryRow.from_result(result)
+                row_byte_sizes.append(len(json.dumps(row.to_dict()).encode("utf-8")))
+                completed += 1
+                if reporter is not None:
+                    variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value)
+                    reporter.heartbeat(
+                        operation="sampling_throughput", variant_id=variant_id, unit_index=completed, unit_total=len(combos),
+                        bars_scanned=len(context.bars_1m), bars_total=len(context.bars_1m),
+                    )
     elapsed_seconds = time.perf_counter() - start
     variants_per_second = (len(combos) / elapsed_seconds) if elapsed_seconds > 0 else None
     return {
