@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tradelab.accounting import Instrument, RiskConfig, UntradeableReason, apply_accounting, point_value_usd
+from tradelab.entry_target_cache import EntryTargetCache
 from tradelab.backtest import BacktestResult, TradeExitReason, prepare_backtest_context
 from tradelab.backtest_v2 import (
     ALL_EXIT_VARIANTS,
@@ -1973,6 +1974,110 @@ class SlowReferenceVsAcceleratedEquivalenceTests(unittest.TestCase):
         self.assertIn(ExecutionSkipReason.NEWS_BLOCK, skip_reasons_seen)
 
 
+class EntryTargetCacheEquivalenceTests(unittest.TestCase):
+    """task 047, requirement 5: an ``EntryTargetCache`` -- scoped per
+    equivalence class, exactly like ``_expand_and_simulate`` now builds
+    it -- must produce byte-for-byte identical trades, skips, and
+    per-instrument ``StrategyVariantResult`` fields (both MNQ and NQ) to
+    running with no cache at all, for every real (equivalence class,
+    exit variant) a randomized zigzag context discovers. The cache only
+    ever memoizes an already-deterministic computation (``detect_tp_
+    target_candidates``/``detect_sl_target_candidates`` keyed on the
+    observed entry's own stable id, plus -- for SL -- the FVG confluence
+    it was resolved with); it must never change which target is chosen,
+    for either exit family.
+
+    Reuses ``_random_zigzag_context`` (same fixture as
+    ``SlowReferenceVsAcceleratedEquivalenceTests`` above), so this
+    organically covers long/short, same-bar TP+SL ambiguity, news
+    windows, both SL families (liquidity-rank and FVG-boundary --
+    proven below by asserting SL_kind FVG_BOUNDARY was actually
+    resolved into at least one trade across the trials, not merely
+    attempted), and liquidity TP targets."""
+
+    def test_cached_matches_uncached_across_many_randomized_trials(self):
+        rng = random.Random(74110)
+        total_compared = 0
+        sl_kinds_with_trades_seen = set()
+        directions_seen = set()
+
+        for trial in range(20):
+            context = _random_zigzag_context(rng, n_bars=rng.choice([300, 500, 900]))
+            universe = discover_entry_strategy_universe(
+                context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=1,
+            )
+            if universe.equivalence_class_count == 0:
+                continue
+            bar_range_index = BarRangeIndex.build(context.bars_1m)
+
+            for equivalence_class in universe.equivalence_classes:
+                direction = equivalence_class.representative_spec.primary.direction
+                directions_seen.add(direction)
+                # One fresh cache per class, shared across all of that
+                # class's own exit variants -- exactly how
+                # _expand_and_simulate uses it in production.
+                entry_target_cache = EntryTargetCache()
+                for variant in ALL_EXIT_VARIANTS:
+                    uncached_results = run_strategy_variant_backtest_all_instruments(
+                        equivalence_class, variant, DEFAULT_INSTRUMENTS, context, bar_range_index=bar_range_index,
+                    )
+                    cached_results = run_strategy_variant_backtest_all_instruments(
+                        equivalence_class, variant, DEFAULT_INSTRUMENTS, context, bar_range_index=bar_range_index,
+                        entry_target_cache=entry_target_cache,
+                    )
+                    for instrument in DEFAULT_INSTRUMENTS:
+                        uncached, cached = uncached_results[instrument], cached_results[instrument]
+                        msg = f"trial={trial} class={equivalence_class.class_id} variant={variant.variant_id} instrument={instrument.value}"
+                        self.assertEqual(uncached.trades, cached.trades, msg=msg)
+                        self.assertEqual(uncached.account_result.accounted_trades, cached.account_result.accounted_trades, msg=msg)
+                        self.assertEqual(uncached.skipped_entries_by_reason, cached.skipped_entries_by_reason, msg=msg)
+                        self.assertEqual(uncached.net_pnl_usd, cached.net_pnl_usd, msg=msg)
+                        self.assertEqual(uncached.trade_count, cached.trade_count, msg=msg)
+                        self.assertEqual(uncached.max_drawdown_usd, cached.max_drawdown_usd, msg=msg)
+                        self.assertEqual(uncached.win_rate, cached.win_rate, msg=msg)
+                        self.assertEqual(uncached.yearly, cached.yearly, msg=msg)
+                        self.assertEqual(uncached.monthly, cached.monthly, msg=msg)
+                        total_compared += 1
+                        for trade in uncached.trades:
+                            sl_kinds_with_trades_seen.add(variant.sl_kind)
+
+        self.assertGreater(total_compared, 500)  # confirms this genuinely exercised many real combinations
+        self.assertEqual(directions_seen, {LONG, SHORT})
+        self.assertIn(SLVariantKind.LIQUIDITY_RANK, sl_kinds_with_trades_seen)
+        self.assertIn(SLVariantKind.FVG_BOUNDARY, sl_kinds_with_trades_seen)
+
+    def test_cache_is_never_shared_across_equivalence_classes(self):
+        """A cache scoped to one class must never leak a memoized result
+        into a different class -- passing the SAME cache instance across
+        two different classes' own variants (never done in production,
+        but must not silently corrupt results if it somehow happened)
+        would only be safe because the cache key includes the observed
+        entry's own id, which real entries across different classes
+        never share -- confirmed here by asserting a shared cache still
+        matches a fresh-per-class cache, rather than by construction
+        alone."""
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=1,
+        )
+        self.assertGreaterEqual(universe.equivalence_class_count, 2)
+        bar_range_index = BarRangeIndex.build(context.bars_1m)
+        variant = ALL_EXIT_VARIANTS[0]
+
+        shared_cache = EntryTargetCache()
+        for equivalence_class in universe.equivalence_classes[:2]:
+            fresh_cache = EntryTargetCache()
+            with_shared = run_strategy_variant_backtest_all_instruments(
+                equivalence_class, variant, DEFAULT_INSTRUMENTS, context, bar_range_index=bar_range_index, entry_target_cache=shared_cache,
+            )
+            with_fresh = run_strategy_variant_backtest_all_instruments(
+                equivalence_class, variant, DEFAULT_INSTRUMENTS, context, bar_range_index=bar_range_index, entry_target_cache=fresh_cache,
+            )
+            for instrument in DEFAULT_INSTRUMENTS:
+                self.assertEqual(with_shared[instrument].trades, with_fresh[instrument].trades)
+                self.assertEqual(with_shared[instrument].net_pnl_usd, with_fresh[instrument].net_pnl_usd)
+
+
 class InstrumentDedupTests(unittest.TestCase):
     """task 045, requirement 4: market execution runs exactly once per
     (equivalence class, exit variant), shared across every instrument --
@@ -2084,6 +2189,47 @@ class ExecutionAccelerationBenchmarkTests(unittest.TestCase):
 
     def test_benchmark_cli_runs_and_prints_a_report(self):
         exit_code = backtest_v2_main(["benchmark", "--sample-size", "10"])
+        self.assertEqual(exit_code, 0)
+
+
+class StageDiagnosticTests(unittest.TestCase):
+    """task 047, requirements 1-2: run_stage_diagnostic actually measures
+    (never fabricates) both an uncached and a cached pass over a real,
+    bounded sample -- reporting wall/CPU time, peak RSS, and all five
+    required stage buckets for each, on the deterministic synthetic
+    representative fixture (the real-data run is done manually/out of
+    band -- see the PR description -- never as part of the automated
+    suite, per the task's own "never run the full 3-year backtest" and
+    general test-speed constraints)."""
+
+    def test_reports_measured_timings_for_both_passes(self):
+        from tradelab.backtest_v2 import run_stage_diagnostic
+
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=1
+        )
+        self.assertGreater(universe.equivalence_class_count, 0)
+
+        report = run_stage_diagnostic(context, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, sample_size=5)
+
+        self.assertEqual(report["sample_size"], 5)
+        required_stages = {"bar_range_index_build", "entry_target_resolution", "exit_resolution", "accounting_equity", "persistence"}
+        for pass_name in ("uncached", "cached"):
+            pass_report = report[pass_name]
+            self.assertGreater(pass_report["wall_elapsed_seconds"], 0.0)
+            self.assertGreaterEqual(pass_report["cpu_elapsed_seconds"], 0.0)
+            self.assertGreater(pass_report["peak_rss_bytes"], 0)
+            self.assertIsNotNone(pass_report["variants_per_second"])
+            self.assertTrue(required_stages.issubset(pass_report["stage_timings"]["totals_seconds"].keys()))
+        self.assertEqual(report["uncached"]["use_cache"], False)
+        self.assertEqual(report["uncached"]["entry_target_cache_entries"], 0)
+        self.assertEqual(report["cached"]["use_cache"], True)
+        self.assertGreater(report["cached"]["entry_target_cache_entries"], 0)
+        self.assertIsNotNone(report["speedup_factor"])
+
+    def test_stage_diagnostic_cli_runs_and_prints_a_report(self):
+        exit_code = backtest_v2_main(["stage-diagnostic", "--sample-size", "3"])
         self.assertEqual(exit_code, 0)
 
 

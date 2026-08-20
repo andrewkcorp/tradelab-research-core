@@ -199,12 +199,14 @@ from tradelab.backtest import (
     _check_exit,
     _finalize_trade,
     _OpenPosition,
+    _peak_rss_bytes,
 )
 from tradelab.backtest_v2_journal import BacktestV2Journal, JournalVariantSummary
 from tradelab.bar import Bar1m
 from tradelab.bar_range_index import BarRangeIndex
 from tradelab.entry_signal_timeline import LONG, SHORT, EntryEvent, EntryEventKind
 from tradelab.entry_strategy_universe import EntryStrategyEquivalenceClass, EntryStrategyUniverseResult, ObservedEntry, discover_entry_strategy_universe
+from tradelab.entry_target_cache import EntryTargetCache
 from tradelab.equity import EquityConfig, EquityResult, build_equity_curve
 from tradelab.fvg import DEFAULT_TICK_SIZE
 from tradelab.fvg_entry import FVGEntryCandidate
@@ -213,6 +215,7 @@ from tradelab.research_run import LeaderboardEntry, ProgressThrottle, RunPhase, 
 from tradelab.research_run import _git_provenance as _current_git_provenance
 from tradelab.research_run import _sha256_of_file as _hash_file
 from tradelab.sl_targets import FVG_SL_TIMEFRAMES, SelectedFVGConfluence, SLTargetCandidate, detect_sl_target_candidates
+from tradelab.stage_timings import StageTimings
 from tradelab.sweep_fvg_setup import SweepFVGSetupEvent
 from tradelab.tp_targets import MarketEntryContext, TPTargetCandidate, detect_tp_target_candidates
 
@@ -347,8 +350,19 @@ def _resolve_tp_candidate(
     swing_equal_results: Mapping,
     session_results: Mapping,
     data_wick_result,
+    *,
+    entry_target_cache: "EntryTargetCache | None" = None,
 ) -> TPTargetCandidate | None:
-    result = detect_tp_target_candidates(market_entry, swing_equal_results, session_results, data_wick_result)
+    """``entry_target_cache`` (task 047), if given, memoizes ``detect_tp_
+    target_candidates`` across the ~20 exit variants sharing the same
+    observed entry -- see ``tradelab.entry_target_cache`` module
+    docstring for why this is exact, not approximate. ``None`` (the
+    default, and always what the reference implementation effectively
+    gets) recomputes every call, unchanged from before this task."""
+    if entry_target_cache is not None:
+        result = entry_target_cache.tp_candidates(market_entry, swing_equal_results, session_results, data_wick_result)
+    else:
+        result = detect_tp_target_candidates(market_entry, swing_equal_results, session_results, data_wick_result)
     if variant.tp_kind == TPVariantKind.DATA_WICK:
         return result.data_wick_targets[0] if result.data_wick_targets else None
     for candidate in result.liquidity_targets:
@@ -363,10 +377,20 @@ def _resolve_sl_candidate(
     market_entry: MarketEntryContext,
     swing_equal_results: Mapping,
     session_results: Mapping,
+    *,
+    entry_target_cache: "EntryTargetCache | None" = None,
 ) -> SLTargetCandidate | None:
+    """``entry_target_cache`` (task 047) -- see ``_resolve_tp_candidate``.
+    The SL cache key additionally carries a ``confluence_key`` (``None``
+    for the liquidity-rank family, else the linked FVG's own timeframe)
+    since, unlike TP, the SL detector's result also depends on which FVG
+    confluence -- if any -- is passed in."""
     if variant.sl_kind == SLVariantKind.LIQUIDITY_RANK:
         empty_confluence = SelectedFVGConfluence(entry_id=market_entry.entry_id, fvg_candidates=())
-        result = detect_sl_target_candidates(market_entry, empty_confluence, swing_equal_results, session_results)
+        if entry_target_cache is not None:
+            result = entry_target_cache.sl_candidates(market_entry, None, empty_confluence, swing_equal_results, session_results)
+        else:
+            result = detect_sl_target_candidates(market_entry, empty_confluence, swing_equal_results, session_results)
         for candidate in result.liquidity_targets:
             if candidate.rank == variant.sl_rank:
                 return candidate
@@ -375,7 +399,10 @@ def _resolve_sl_candidate(
     if linked is None or linked.timeframe != variant.sl_fvg_timeframe:
         return None
     confluence = SelectedFVGConfluence(entry_id=market_entry.entry_id, fvg_candidates=(linked,))
-    result = detect_sl_target_candidates(market_entry, confluence, swing_equal_results, session_results)
+    if entry_target_cache is not None:
+        result = entry_target_cache.sl_candidates(market_entry, linked.timeframe, confluence, swing_equal_results, session_results)
+    else:
+        result = detect_sl_target_candidates(market_entry, confluence, swing_equal_results, session_results)
     return result.fvg_targets[0] if result.fvg_targets else None
 
 
@@ -570,6 +597,8 @@ def simulate_market_execution(
     on_bar_progress: Callable[[int, int], None] | None = None,
     on_entry_progress: Callable[[int, int], None] | None = None,
     bar_range_index: BarRangeIndex | None = None,
+    entry_target_cache: EntryTargetCache | None = None,
+    stage_timings: StageTimings | None = None,
 ) -> tuple[list[ExecutedTrade], list[SkippedEntryV2]]:
     """**The real, accelerated execution loop (task 045).** Identical
     rules to ``_simulate_market_execution_reference`` -- same observed
@@ -608,7 +637,22 @@ def simulate_market_execution(
     ``bars_scanned``/``bars_total`` unset (see ``_expand_and_simulate``'s
     own wiring) -- showing a stale or invented bar figure while entries,
     not bars, are actually the unit of work would violate task 046's own
-    "do not fake progress" requirement."""
+    "do not fake progress" requirement.
+
+    ``entry_target_cache`` (task 047), if given, must be an ``EntryTarget
+    Cache`` scoped to *this* equivalence class (never shared across
+    classes -- see its own module docstring) -- callers driving all ~20
+    exit variants for one class should build one cache and pass it to
+    every call, exactly like ``bar_range_index`` above. ``None`` (the
+    default) recomputes every observed entry's TP/SL candidates from
+    scratch, unchanged from before this task.
+
+    ``stage_timings`` (task 047), if given, accumulates measured wall-
+    clock seconds into two of its five stages: ``entry_target_
+    resolution`` (fill-index lookup + TP/SL candidate resolution, per
+    observed entry) and ``exit_resolution`` (every ``_find_first_exit``
+    call, mid-loop and end-of-loop drain alike). See ``tradelab.stage_
+    timings`` and ``run_stage_diagnostic``."""
     bars = context.bars_1m
     total_bars = len(bars)
     total_entries = len(observed_entries)
@@ -622,12 +666,20 @@ def simulate_market_execution(
     for entry_index, entry in enumerate(observed_entries, start=1):
         if on_entry_progress is not None:
             on_entry_progress(entry_index, total_entries)
+        if stage_timings is not None:
+            _t0 = time.perf_counter()
         fill_index = index.find_bar_at_or_after(entry.known_at, bar_cursor)
+        if stage_timings is not None:
+            stage_timings.record("entry_target_resolution", time.perf_counter() - _t0)
         advance_to = fill_index if fill_index is not None else len(bars)
 
         if bar_cursor < advance_to:
             if position is not None:
+                if stage_timings is not None:
+                    _t0 = time.perf_counter()
                 hit = _find_first_exit(bars, index, position, bar_cursor, advance_to)
+                if stage_timings is not None:
+                    stage_timings.record("exit_resolution", time.perf_counter() - _t0)
                 if hit is not None:
                     exit_index, reason, exit_price = hit
                     trades.append(_finalize_trade(position, exit_timestamp=bars[exit_index].timestamp, exit_price=exit_price, reason=reason))
@@ -653,17 +705,41 @@ def simulate_market_execution(
 
         trade_seq += 1
         trade_id = f"{strategy_variant_id}-{trade_seq:06d}-{entry.entry_id}"
+        # entry_id is the observed entry's own stable id (task 047), not
+        # trade_id -- trade_id is per-variant (embeds strategy_variant_id
+        # and this variant's own trade_seq), while entry_id must be
+        # identical across all exit variants sharing this same observed
+        # entry for entry_target_cache to correctly reuse work across
+        # them. Safe: entry_id/target_id/sl_target_id are pure internal
+        # audit labels, never read outside tp_targets.py/sl_targets.py's
+        # own duplicate-detection logic (ExecutedTrade.tp_source_id/
+        # sl_source_id come from .source_id, not .target_id/.entry_id).
+        #
         # entry_known_at is the FILL bar's own timestamp, not the raw
         # signal's known_at -- see _simulate_market_execution_reference's
         # own identical comment for the full reasoning (unchanged here).
-        market_entry = MarketEntryContext(entry_id=trade_id, direction=direction, entry_price=fill_bar.open, entry_known_at=fill_bar.timestamp)
+        market_entry = MarketEntryContext(entry_id=entry.entry_id, direction=direction, entry_price=fill_bar.open, entry_known_at=fill_bar.timestamp)
 
-        tp_candidate = _resolve_tp_candidate(variant, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results, context.data_wick_result)
+        if stage_timings is not None:
+            _t0 = time.perf_counter()
+        tp_candidate = _resolve_tp_candidate(
+            variant, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results, context.data_wick_result,
+            entry_target_cache=entry_target_cache,
+        )
+        if stage_timings is not None:
+            stage_timings.record("entry_target_resolution", time.perf_counter() - _t0)
         if tp_candidate is None:
             skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.MISSING_TP_TARGET))
             continue
 
-        sl_candidate = _resolve_sl_candidate(variant, entry, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results)
+        if stage_timings is not None:
+            _t0 = time.perf_counter()
+        sl_candidate = _resolve_sl_candidate(
+            variant, entry, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results,
+            entry_target_cache=entry_target_cache,
+        )
+        if stage_timings is not None:
+            stage_timings.record("entry_target_resolution", time.perf_counter() - _t0)
         if sl_candidate is None:
             skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.MISSING_SL_TARGET))
             continue
@@ -691,7 +767,11 @@ def simulate_market_execution(
 
     # Drain any still-open position through the remaining bars.
     if bar_cursor < len(bars) and position is not None:
+        if stage_timings is not None:
+            _t0 = time.perf_counter()
         hit = _find_first_exit(bars, index, position, bar_cursor, len(bars))
+        if stage_timings is not None:
+            stage_timings.record("exit_resolution", time.perf_counter() - _t0)
         if hit is not None:
             exit_index, reason, exit_price = hit
             trades.append(_finalize_trade(position, exit_timestamp=bars[exit_index].timestamp, exit_price=exit_price, reason=reason))
@@ -789,6 +869,8 @@ def simulate_variant_execution(
     on_bar_progress: Callable[[int, int], None] | None = None,
     on_entry_progress: Callable[[int, int], None] | None = None,
     bar_range_index: BarRangeIndex | None = None,
+    entry_target_cache: EntryTargetCache | None = None,
+    stage_timings: StageTimings | None = None,
 ) -> tuple[list[ExecutedTrade], list[SkippedEntryV2]]:
     """The **instrument-independent** market execution for one
     (equivalence class, exit variant) -- task 045, requirement 4.
@@ -811,12 +893,23 @@ def simulate_variant_execution(
     through, never branch on it). The authoritative, instrument-specific
     identifier is ``StrategyVariantResult.strategy_variant_id``, computed
     separately, per instrument, in ``_build_variant_result_for_
-    instrument`` below -- unchanged from before this task."""
+    instrument`` below -- unchanged from before this task.
+
+    ``entry_target_cache`` (task 047), if given, must be scoped to this
+    same ``equivalence_class`` -- callers looping over this class's own
+    exit variants should build one cache before that loop and pass it to
+    every call here, letting all ~20 variants reuse each observed
+    entry's already-resolved TP/SL candidates. See ``simulate_market_
+    execution``'s own docstring and ``tradelab.entry_target_cache``.
+
+    ``stage_timings`` (task 047), if given, is forwarded unmodified to
+    ``simulate_market_execution``."""
     direction = equivalence_class.representative_spec.primary.direction
     neutral_id = f"{equivalence_class.class_id}::{variant.variant_id}"
     return simulate_market_execution(
         equivalence_class.observed_entries, direction, variant, context, neutral_id,
         on_bar_progress=on_bar_progress, on_entry_progress=on_entry_progress, bar_range_index=bar_range_index,
+        entry_target_cache=entry_target_cache, stage_timings=stage_timings,
     )
 
 
@@ -829,6 +922,7 @@ def _build_variant_result_for_instrument(
     *,
     risk_config: RiskConfig,
     equity_config: EquityConfig,
+    stage_timings: StageTimings | None = None,
 ) -> StrategyVariantResult:
     """Sizing/P&L (``tradelab.accounting.apply_accounting``, unmodified)
     then equity/drawdown (``tradelab.equity.build_equity_curve``,
@@ -837,7 +931,11 @@ def _build_variant_result_for_instrument(
     market execution. ``strategy_variant_id`` here (unlike the neutral
     one fed into the shared simulation) is the real, instrument-specific
     identifier used everywhere downstream (journal, leaderboard,
-    ranking) -- unchanged from before this task."""
+    ranking) -- unchanged from before this task.
+
+    ``stage_timings`` (task 047), if given, accumulates the combined
+    ``apply_accounting``+``build_equity_curve`` wall-clock cost into its
+    ``accounting_equity`` stage."""
     direction = equivalence_class.representative_spec.primary.direction
     variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value)
 
@@ -848,8 +946,12 @@ def _build_variant_result_for_instrument(
         open_unresolved_count=sum(1 for t in trades if t.exit_reason == TradeExitReason.OPEN_UNRESOLVED),
         gross_pnl_points_total=sum(t.gross_pnl_points for t in trades if t.gross_pnl_points is not None),
     )
+    if stage_timings is not None:
+        _t0 = time.perf_counter()
     account_result = apply_accounting(backtest_result, instrument, risk_config)
     equity_result = build_equity_curve(account_result, equity_config)
+    if stage_timings is not None:
+        stage_timings.record("accounting_equity", time.perf_counter() - _t0)
 
     skipped_by_reason: dict[str, int] = {}
     for entry in skipped:
@@ -880,6 +982,7 @@ def run_strategy_variant_backtest(
     on_bar_progress: Callable[[int, int], None] | None = None,
     on_entry_progress: Callable[[int, int], None] | None = None,
     bar_range_index: BarRangeIndex | None = None,
+    entry_target_cache: EntryTargetCache | None = None,
 ) -> StrategyVariantResult:
     """Simulate one full (equivalence class, exit variant, instrument)
     strategy backtest -- a thin, single-instrument convenience wrapper
@@ -891,12 +994,13 @@ def run_strategy_variant_backtest(
     instead, to avoid running market execution twice for an identical
     result.
 
-    ``on_bar_progress``/``bar_range_index`` (task 044/045) are forwarded,
-    unmodified, straight through to ``simulate_market_execution`` --
-    purely observational/accelerating, never read back into anything
-    this function returns."""
+    ``on_bar_progress``/``bar_range_index`` (task 044/045)/``entry_
+    target_cache`` (task 047) are forwarded, unmodified, straight
+    through to ``simulate_variant_execution`` -- purely observational/
+    accelerating, never read back into anything this function returns."""
     trades, skipped = simulate_variant_execution(
-        equivalence_class, variant, context, on_bar_progress=on_bar_progress, on_entry_progress=on_entry_progress, bar_range_index=bar_range_index,
+        equivalence_class, variant, context, on_bar_progress=on_bar_progress, on_entry_progress=on_entry_progress,
+        bar_range_index=bar_range_index, entry_target_cache=entry_target_cache,
     )
     return _build_variant_result_for_instrument(equivalence_class, variant, instrument, trades, skipped, risk_config=risk_config, equity_config=equity_config)
 
@@ -912,6 +1016,8 @@ def run_strategy_variant_backtest_all_instruments(
     on_bar_progress: Callable[[int, int], None] | None = None,
     on_entry_progress: Callable[[int, int], None] | None = None,
     bar_range_index: BarRangeIndex | None = None,
+    entry_target_cache: EntryTargetCache | None = None,
+    stage_timings: StageTimings | None = None,
 ) -> dict[Instrument, StrategyVariantResult]:
     """Simulate market execution for this (equivalence class, exit
     variant) **exactly once** and apply accounting/equity separately for
@@ -920,12 +1026,21 @@ def run_strategy_variant_backtest_all_instruments(
     variant_backtest`` would have returned for that one instrument,
     called individually -- proven by ``tests/test_tradelab_backtest_v2.
     py``'s own equivalence test -- just without repeating the O(entries +
-    exits) simulation work per instrument."""
+    exits) simulation work per instrument.
+
+    ``entry_target_cache`` (task 047), if given, must be scoped to this
+    same ``equivalence_class`` -- see ``simulate_variant_execution``'s
+    own docstring. ``stage_timings`` (task 047), if given, is forwarded
+    to both ``simulate_variant_execution`` and every per-instrument
+    ``_build_variant_result_for_instrument`` call below."""
     trades, skipped = simulate_variant_execution(
-        equivalence_class, variant, context, on_bar_progress=on_bar_progress, on_entry_progress=on_entry_progress, bar_range_index=bar_range_index,
+        equivalence_class, variant, context, on_bar_progress=on_bar_progress, on_entry_progress=on_entry_progress,
+        bar_range_index=bar_range_index, entry_target_cache=entry_target_cache, stage_timings=stage_timings,
     )
     return {
-        instrument: _build_variant_result_for_instrument(equivalence_class, variant, instrument, trades, skipped, risk_config=risk_config, equity_config=equity_config)
+        instrument: _build_variant_result_for_instrument(
+            equivalence_class, variant, instrument, trades, skipped, risk_config=risk_config, equity_config=equity_config, stage_timings=stage_timings,
+        )
         for instrument in instruments
     }
 
@@ -1175,6 +1290,22 @@ def _expand_and_simulate(
     backtest_v2``), which independently guarantees ``live_status.json``
     keeps refreshing at least once a second even through any remaining
     stretch with no progress callback available at all.
+
+    **Entry-target caching (task 047).** Task 045's own acceleration
+    left the dominant real cost untouched: ``detect_tp_target_
+    candidates``/``detect_sl_target_candidates`` were being redundantly
+    recomputed once per exit variant (up to ~20x) for the exact same
+    observed entry, since their result never actually depends on which
+    exit variant is asking. A fresh ``tradelab.entry_target_cache.
+    EntryTargetCache`` is now built here for each equivalence class --
+    *before* its own inner exit-variant loop -- and threaded through
+    every one of that class's ``run_strategy_variant_backtest_all_
+    instruments`` calls, so each observed entry's TP/SL candidates are
+    resolved at most once per class rather than once per (class,
+    variant) pair. Exact, not approximate -- see that module's own
+    docstring for the full proof, and ``tests/test_tradelab_backtest_v2.
+    py``'s ``EntryTargetCacheEquivalenceTests`` for the randomized
+    equivalence proof against running with no cache at all.
     """
     total_variant_runs = universe.equivalence_class_count * len(exit_variants) * len(instruments)
     reporter.phase_started(RunPhase.EXPANDING_EXIT_VARIANTS, items_total=max(total_variant_runs, 1))
@@ -1193,6 +1324,15 @@ def _expand_and_simulate(
         reporter.update_leaderboard(_merged_leaderboard(durable_top_n, top_n, top_n_leaderboard))
 
     for equivalence_class in universe.equivalence_classes:
+        # task 047: one EntryTargetCache per equivalence class, built
+        # fresh here and shared across every exit variant below -- each
+        # observed entry's TP/SL candidates are computed at most once
+        # per class rather than once per (class, variant) pair, since
+        # they are provably identical for the same observed entry
+        # regardless of which exit variant is asking (see tradelab.
+        # entry_target_cache module docstring). Discarded when this
+        # class's own variant loop ends -- never shared across classes.
+        entry_target_cache = EntryTargetCache()
         for variant in exit_variants:
             variant_ids = {instrument: strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value) for instrument in instruments}
             pending_instruments = [instrument for instrument in instruments if not journal.is_completed(variant_ids[instrument])]
@@ -1225,7 +1365,7 @@ def _expand_and_simulate(
             results_by_instrument = run_strategy_variant_backtest_all_instruments(
                 equivalence_class, variant, tuple(pending_instruments), context, risk_config=risk_config, equity_config=equity_config,
                 on_bar_progress=bar_progress.maybe, on_entry_progress=_entry_progress_callback(reporter, variant_id=lead_variant_id),
-                bar_range_index=bar_range_index,
+                bar_range_index=bar_range_index, entry_target_cache=entry_target_cache,
             )
 
             for instrument in pending_instruments:
@@ -1633,15 +1773,28 @@ def _measure_sample_throughput(
     backtest_all_instruments``, exactly mirroring ``_expand_and_
     simulate``'s own dedup. This makes the measured throughput honestly
     reflect production's real, deduplicated cost, not an inflated
-    per-instrument-redone estimate."""
+    per-instrument-redone estimate.
+
+    **Entry-target caching (task 047).** A single ``EntryTargetCache``
+    is also reused across every (still-consecutive) group that shares
+    the same equivalence class -- reset only when the class actually
+    changes -- exactly mirroring ``_expand_and_simulate``'s own per-
+    class cache scope, so a real throughput sample honestly reflects
+    production's real, cached cost too, not an inflated always-cold
+    one."""
     combos = list(itertools.islice(_iter_variant_combinations(universe, exit_variants, instruments), sample_size))
     row_byte_sizes: list[int] = []
     bar_range_index = _build_bar_range_index_with_heartbeat(reporter, context.bars_1m) if reporter is not None else BarRangeIndex.build(context.bars_1m)
     completed = 0
     start = time.perf_counter()
+    current_class_id: str | None = None
+    entry_target_cache: EntryTargetCache | None = None
     for (_class_id, _variant_id), group in itertools.groupby(combos, key=lambda c: (c[0].class_id, c[1].variant_id)):
         group = list(group)
         equivalence_class, variant = group[0][0], group[0][1]
+        if equivalence_class.class_id != current_class_id:
+            current_class_id = equivalence_class.class_id
+            entry_target_cache = EntryTargetCache()
         group_instruments = tuple(c[2] for c in group)
         lead_variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, group_instruments[0].value)
         on_bar_progress = None
@@ -1662,6 +1815,7 @@ def _measure_sample_throughput(
         results_by_instrument = run_strategy_variant_backtest_all_instruments(
             equivalence_class, variant, group_instruments, context, risk_config=risk_config, equity_config=equity_config,
             on_bar_progress=on_bar_progress, on_entry_progress=on_entry_progress, bar_range_index=bar_range_index,
+            entry_target_cache=entry_target_cache,
         )
         for instrument in group_instruments:
             result = results_by_instrument[instrument]
@@ -1963,6 +2117,147 @@ def run_execution_acceleration_benchmark(
     }
 
 
+def _run_stage_diagnostic_pass(
+    context: PreparedBacktestContext,
+    universe: EntryStrategyUniverseResult,
+    exit_variants: tuple[ExitVariantSpec, ...],
+    instruments: tuple[Instrument, ...],
+    *,
+    sample_size: int,
+    risk_config: RiskConfig,
+    equity_config: EquityConfig,
+    use_cache: bool,
+    tmp_dir: Path,
+) -> dict[str, Any]:
+    """One measured pass (task 047, requirement 1/2) over up to
+    ``sample_size`` real ``(equivalence class, exit variant, instrument)``
+    combinations, in the exact same enumeration order ``_expand_and_
+    simulate``/``_iter_variant_combinations`` use, with every one of the
+    five required stages timed via ``StageTimings``. ``use_cache=False``
+    never constructs an ``EntryTargetCache`` at all (every observed
+    entry's TP/SL candidates are recomputed from scratch, exactly like
+    every run before this task) -- ``use_cache=True`` builds one fresh
+    cache per equivalence class, exactly like ``_expand_and_simulate``
+    now does unconditionally. Persistence is measured against a real,
+    throwaway SQLite journal + JSONL file under ``tmp_dir`` (deleted by
+    the caller), not a mock -- the actual ``BacktestV2Journal.commit_
+    summary``/``append_jsonl`` calls production itself makes."""
+    stage_timings = StageTimings()
+
+    _t0 = time.perf_counter()
+    bar_range_index = BarRangeIndex.build(context.bars_1m)
+    stage_timings.record("bar_range_index_build", time.perf_counter() - _t0)
+
+    journal = BacktestV2Journal(
+        tmp_dir / "diagnostic.sqlite3", run_id="stage-diagnostic",
+        market_artifact_path=None, market_artifact_sha256=None, news_csv_path=None, news_csv_sha256=None, git_commit=None,
+        parameters={"note": "task 047 stage diagnostic -- never a durable/resumable run"},
+        risk_config=dataclasses.asdict(risk_config), equity_config=dataclasses.asdict(equity_config),
+        exit_variant_ids=[v.variant_id for v in exit_variants], instruments=[i.value for i in instruments],
+    )
+    jsonl_path = tmp_dir / "diagnostic_variant_summaries.jsonl"
+
+    completed = 0
+    max_cache_entries = 0  # peak SINGLE-class cache size seen -- the real memory bound, since classes are never held concurrently
+    wall_start = time.perf_counter()
+    cpu_start = time.process_time()
+    try:
+        for equivalence_class in universe.equivalence_classes:
+            if completed >= sample_size:
+                break
+            entry_target_cache = EntryTargetCache() if use_cache else None
+            for variant in exit_variants:
+                if completed >= sample_size:
+                    break
+                results_by_instrument = run_strategy_variant_backtest_all_instruments(
+                    equivalence_class, variant, instruments, context, risk_config=risk_config, equity_config=equity_config,
+                    bar_range_index=bar_range_index, entry_target_cache=entry_target_cache, stage_timings=stage_timings,
+                )
+                for instrument in instruments:
+                    result = results_by_instrument[instrument]
+                    row = VariantSummaryRow.from_result(result)
+                    _t0 = time.perf_counter()
+                    journal.commit_summary(row.to_dict())
+                    append_jsonl(jsonl_path, row.to_dict())
+                    stage_timings.record("persistence", time.perf_counter() - _t0)
+                completed += 1  # one (class, variant) combination, all its instruments -- matches "5-variant real sample" phrasing
+            if entry_target_cache is not None:
+                max_cache_entries = max(max_cache_entries, len(entry_target_cache))
+    finally:
+        journal.close()
+    wall_elapsed_seconds = time.perf_counter() - wall_start
+    cpu_elapsed_seconds = time.process_time() - cpu_start
+    peak_rss_bytes = _peak_rss_bytes()  # whole-process high-water mark, not a per-pass delta -- see that helper's own docstring
+
+    return {
+        "use_cache": use_cache,
+        "variants_completed": completed,
+        "wall_elapsed_seconds": wall_elapsed_seconds,
+        "cpu_elapsed_seconds": cpu_elapsed_seconds,
+        "variants_per_second": (completed / wall_elapsed_seconds) if wall_elapsed_seconds > 0 else None,
+        "peak_rss_bytes": peak_rss_bytes,
+        "entry_target_cache_entries": max_cache_entries,
+        "stage_timings": stage_timings.to_dict(),
+    }
+
+
+def run_stage_diagnostic(
+    context: PreparedBacktestContext,
+    universe: EntryStrategyUniverseResult,
+    exit_variants: tuple[ExitVariantSpec, ...],
+    instruments: tuple[Instrument, ...],
+    *,
+    sample_size: int,
+    risk_config: RiskConfig = DEFAULT_RISK_CONFIG,
+    equity_config: EquityConfig = DEFAULT_EQUITY_CONFIG,
+) -> dict[str, Any]:
+    """**Task 047, requirements 1-2.** Runs the SAME bounded, real sample
+    of up to ``sample_size`` ``(equivalence class, exit variant)``
+    combinations twice -- once with ``entry_target_cache`` disabled
+    (the "before" baseline, byte-for-byte what every run before this
+    task did) and once with it enabled (the "after" measurement) --
+    reporting wall time, CPU time, peak RSS, and each of the five
+    required stage shares (``bar_range_index_build``, ``entry_target_
+    resolution``, ``exit_resolution``, ``accounting_equity``,
+    ``persistence``) for both, plus the measured speedup between them.
+    Never runs the full 3-year production backtest -- ``sample_size`` is
+    the caller's own small, explicit, bounded budget (see ``main(["stage
+    -diagnostic", ...])``'s own ``--sample-size`` default).
+
+    Deliberately does **not** attempt to reuse work between the two
+    passes (each builds its own ``BarRangeIndex`` and, for the cached
+    pass, its own per-class caches from scratch) -- reusing anything
+    between passes would contaminate the very comparison this function
+    exists to produce."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="tradelab-stage-diagnostic-") as tmp:
+        tmp_path = Path(tmp)
+        uncached = _run_stage_diagnostic_pass(
+            context, universe, exit_variants, instruments, sample_size=sample_size,
+            risk_config=risk_config, equity_config=equity_config, use_cache=False, tmp_dir=tmp_path / "uncached",
+        )
+        cached = _run_stage_diagnostic_pass(
+            context, universe, exit_variants, instruments, sample_size=sample_size,
+            risk_config=risk_config, equity_config=equity_config, use_cache=True, tmp_dir=tmp_path / "cached",
+        )
+
+    speedup_factor = (
+        uncached["wall_elapsed_seconds"] / cached["wall_elapsed_seconds"]
+        if cached["wall_elapsed_seconds"] > 0 else None
+    )
+    return {
+        "sample_size": sample_size,
+        "bar_count": len(context.bars_1m),
+        "equivalence_class_count": universe.equivalence_class_count,
+        "exit_variant_count": len(exit_variants),
+        "instrument_count": len(instruments),
+        "uncached": uncached,
+        "cached": cached,
+        "speedup_factor": speedup_factor,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -2019,6 +2314,21 @@ def main(argv: list[str] | None = None) -> int:
     benchmark.add_argument("--min-entries-per-year", type=int, default=1)
     benchmark.add_argument("--sample-size", type=int, default=200, help="Number of (equivalence class, exit variant) combinations to benchmark.")
 
+    stage_diag = sub.add_parser(
+        "stage-diagnostic",
+        help="Task 047: run a small, bounded real-data sample twice (entry-target cache off, then on) and report "
+        "measured wall time, CPU time, peak RSS, and per-stage share for each of bar_range_index_build, "
+        "entry_target_resolution, exit_resolution, accounting_equity, and persistence. Never runs the full "
+        "3-year production backtest.",
+    )
+    stage_diag.add_argument("--market-artifact", type=Path, default=None, help="Optional real market artifact manifest; omit to use the deterministic synthetic fixture.")
+    stage_diag.add_argument("--news-csv", type=Path, default=None)
+    stage_diag.add_argument("--prefix-bars", type=int, default=None, help="Truncate the loaded real artifact to this many leading bars (ignored without --market-artifact).")
+    stage_diag.add_argument("--pivot-strength", type=int, default=2)
+    stage_diag.add_argument("--reclaim-window-bars", type=int, default=3)
+    stage_diag.add_argument("--min-entries-per-year", type=int, default=1)
+    stage_diag.add_argument("--sample-size", type=int, default=5, help="Number of (equivalence class, exit variant) combinations to run per pass (uncached, then cached).")
+
     args = parser.parse_args(argv)
 
     if args.mode == "run":
@@ -2052,6 +2362,27 @@ def main(argv: list[str] | None = None) -> int:
             context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=args.min_entries_per_year
         )
         report = run_execution_acceleration_benchmark(context, universe, ALL_EXIT_VARIANTS, sample_size=args.sample_size)
+        print(json.dumps(report, indent=2))
+        return 0
+    elif args.mode == "stage-diagnostic":
+        if args.market_artifact is not None:
+            from tradelab.backtest import prepare_backtest_context
+            from tradelab.market_data_artifact import load_market_data_artifact, load_market_data_series
+            from tradelab.news_loaders import read_news_events_csv
+
+            artifact = load_market_data_artifact(args.market_artifact)
+            series_result = load_market_data_series(artifact, base_dir=args.market_artifact.parent)
+            bars = list(series_result.bars)
+            if args.prefix_bars is not None:
+                bars = bars[: args.prefix_bars]
+            news_events = list(read_news_events_csv(args.news_csv)) if args.news_csv is not None else []
+            context = prepare_backtest_context(bars, news_events, pivot_strength=args.pivot_strength, reclaim_window_bars=args.reclaim_window_bars)
+        else:
+            context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=args.min_entries_per_year
+        )
+        report = run_stage_diagnostic(context, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, sample_size=args.sample_size)
         print(json.dumps(report, indent=2))
         return 0
     else:
