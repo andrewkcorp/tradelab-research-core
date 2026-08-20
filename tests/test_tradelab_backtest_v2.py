@@ -58,6 +58,7 @@ from tradelab.backtest_v2 import (
 )
 from tradelab.bar import Bar1m
 from tradelab.bar_range_index import BarRangeIndex
+from tradelab.liquidity_target_index import LiquidityTargetIndex
 from tradelab.entry_signal_timeline import LONG, SHORT, EntryEvent, EntryEventKind
 from tradelab.entry_strategy_universe import ObservedEntry, discover_entry_strategy_universe
 from tradelab.equity import build_equity_curve
@@ -2153,6 +2154,26 @@ class BatchedExitVariantExecutionTests(unittest.TestCase):
         self.assertGreater(compared, 100)
         self.assertEqual(directions_seen, {LONG, SHORT})
 
+    def test_price_index_matches_full_target_scan_exactly(self):
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result,
+            context.htf_bias_result, min_entries_per_year=1,
+        )
+        index = BarRangeIndex.build(context.bars_1m)
+        target_index = LiquidityTargetIndex.build(context.swing_equal_liquidity_results, context.session_liquidity_results)
+        for equivalence_class in universe.equivalence_classes[:3]:
+            plain = simulate_market_execution_batched(
+                equivalence_class.observed_entries, equivalence_class.representative_spec.primary.direction,
+                ALL_EXIT_VARIANTS, context, equivalence_class.class_id, bar_range_index=index, entry_target_cache=EntryTargetCache(),
+            )
+            indexed = simulate_market_execution_batched(
+                equivalence_class.observed_entries, equivalence_class.representative_spec.primary.direction,
+                ALL_EXIT_VARIANTS, context, equivalence_class.class_id, bar_range_index=index, entry_target_cache=EntryTargetCache(),
+                liquidity_target_index=target_index,
+            )
+            self.assertEqual(indexed, plain)
+
 
 class InstrumentDedupTests(unittest.TestCase):
     """task 045, requirement 4: market execution runs exactly once per
@@ -2282,8 +2303,10 @@ class BatchedExitBenchmarkTests(unittest.TestCase):
         self.assertGreater(report["sequential_cached_elapsed_seconds"], 0.0)
         self.assertGreater(report["batched_elapsed_seconds"], 0.0)
         self.assertGreater(report["run_wide_cached_batched_elapsed_seconds"], 0.0)
+        self.assertGreater(report["indexed_batched_elapsed_seconds"], 0.0)
         self.assertIsNotNone(report["speedup_factor"])
         self.assertIsNotNone(report["run_wide_cache_speedup_factor"])
+        self.assertIsNotNone(report["price_index_speedup_factor"])
 
     def test_benchmark_cli_runs_and_prints_a_report(self):
         exit_code = backtest_v2_main(["batch-benchmark", "--sample-size", "1"])

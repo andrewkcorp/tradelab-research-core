@@ -207,6 +207,7 @@ from tradelab.bar_range_index import BarRangeIndex
 from tradelab.entry_signal_timeline import LONG, SHORT, EntryEvent, EntryEventKind
 from tradelab.entry_strategy_universe import EntryStrategyEquivalenceClass, EntryStrategyUniverseResult, ObservedEntry, discover_entry_strategy_universe
 from tradelab.entry_target_cache import EntryTargetCache
+from tradelab.liquidity_target_index import LiquidityTargetIndex
 from tradelab.equity import EquityConfig, EquityResult, build_equity_curve
 from tradelab.fvg import DEFAULT_TICK_SIZE
 from tradelab.fvg_entry import FVGEntryCandidate
@@ -353,6 +354,7 @@ def _resolve_tp_candidate(
     data_wick_result,
     *,
     entry_target_cache: "EntryTargetCache | None" = None,
+    liquidity_target_index: LiquidityTargetIndex | None = None,
 ) -> TPTargetCandidate | None:
     """``entry_target_cache`` (task 047), if given, memoizes ``detect_tp_
     target_candidates`` across the ~20 exit variants sharing the same
@@ -361,9 +363,9 @@ def _resolve_tp_candidate(
     default, and always what the reference implementation effectively
     gets) recomputes every call, unchanged from before this task."""
     if entry_target_cache is not None:
-        result = entry_target_cache.tp_candidates(market_entry, swing_equal_results, session_results, data_wick_result)
+        result = entry_target_cache.tp_candidates(market_entry, swing_equal_results, session_results, data_wick_result, liquidity_index=liquidity_target_index)
     else:
-        result = detect_tp_target_candidates(market_entry, swing_equal_results, session_results, data_wick_result)
+        result = detect_tp_target_candidates(market_entry, swing_equal_results, session_results, data_wick_result, liquidity_index=liquidity_target_index)
     if variant.tp_kind == TPVariantKind.DATA_WICK:
         return result.data_wick_targets[0] if result.data_wick_targets else None
     for candidate in result.liquidity_targets:
@@ -380,6 +382,7 @@ def _resolve_sl_candidate(
     session_results: Mapping,
     *,
     entry_target_cache: "EntryTargetCache | None" = None,
+    liquidity_target_index: LiquidityTargetIndex | None = None,
 ) -> SLTargetCandidate | None:
     """``entry_target_cache`` (task 047) -- see ``_resolve_tp_candidate``.
     The SL cache key additionally carries a ``confluence_key`` (``None``
@@ -389,9 +392,9 @@ def _resolve_sl_candidate(
     if variant.sl_kind == SLVariantKind.LIQUIDITY_RANK:
         empty_confluence = SelectedFVGConfluence(entry_id=market_entry.entry_id, fvg_candidates=())
         if entry_target_cache is not None:
-            result = entry_target_cache.sl_candidates(market_entry, None, empty_confluence, swing_equal_results, session_results)
+            result = entry_target_cache.sl_candidates(market_entry, None, empty_confluence, swing_equal_results, session_results, liquidity_index=liquidity_target_index)
         else:
-            result = detect_sl_target_candidates(market_entry, empty_confluence, swing_equal_results, session_results)
+            result = detect_sl_target_candidates(market_entry, empty_confluence, swing_equal_results, session_results, liquidity_index=liquidity_target_index)
         for candidate in result.liquidity_targets:
             if candidate.rank == variant.sl_rank:
                 return candidate
@@ -401,9 +404,9 @@ def _resolve_sl_candidate(
         return None
     confluence = SelectedFVGConfluence(entry_id=market_entry.entry_id, fvg_candidates=(linked,))
     if entry_target_cache is not None:
-        result = entry_target_cache.sl_candidates(market_entry, linked.timeframe, confluence, swing_equal_results, session_results)
+        result = entry_target_cache.sl_candidates(market_entry, linked.timeframe, confluence, swing_equal_results, session_results, liquidity_index=liquidity_target_index)
     else:
-        result = detect_sl_target_candidates(market_entry, confluence, swing_equal_results, session_results)
+        result = detect_sl_target_candidates(market_entry, confluence, swing_equal_results, session_results, liquidity_index=liquidity_target_index)
     return result.fvg_targets[0] if result.fvg_targets else None
 
 
@@ -820,6 +823,7 @@ def simulate_market_execution_batched(
     on_entry_progress: Callable[[int, int], None] | None = None,
     bar_range_index: BarRangeIndex | None = None,
     entry_target_cache: EntryTargetCache | None = None,
+    liquidity_target_index: LiquidityTargetIndex | None = None,
 ) -> dict[str, tuple[list[ExecutedTrade], list[SkippedEntryV2]]]:
     """Execute every supplied exit variant in one chronological entry pass.
 
@@ -901,6 +905,7 @@ def simulate_market_execution_batched(
                 state.variant, market_entry, context.swing_equal_liquidity_results,
                 context.session_liquidity_results, context.data_wick_result,
                 entry_target_cache=cache,
+                liquidity_target_index=liquidity_target_index,
             )
             if tp_candidate is None:
                 state.skipped.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.MISSING_TP_TARGET))
@@ -908,6 +913,7 @@ def simulate_market_execution_batched(
             sl_candidate = _resolve_sl_candidate(
                 state.variant, entry, market_entry, context.swing_equal_liquidity_results,
                 context.session_liquidity_results, entry_target_cache=cache,
+                liquidity_target_index=liquidity_target_index,
             )
             if sl_candidate is None:
                 state.skipped.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.MISSING_SL_TARGET))
@@ -1475,6 +1481,7 @@ def _expand_and_simulate(
     reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=max(total_variant_runs, 1))
     summary_path = reporter.run_dir / "variant_summaries.jsonl"
     bar_range_index = _build_bar_range_index_with_heartbeat(reporter, context.bars_1m)
+    liquidity_target_index = LiquidityTargetIndex.build(context.swing_equal_liquidity_results, context.session_liquidity_results)
 
     completed = journal.completed_count()
     durable_top_n = [_leaderboard_entry_from_journal_summary(s) for s in journal.top_n_summaries(top_n_leaderboard)]
@@ -1524,7 +1531,7 @@ def _expand_and_simulate(
             tuple(variant for variant, _pending in pending_by_variant), context, equivalence_class.class_id,
             on_bar_progress=bar_progress.maybe,
             on_entry_progress=_entry_progress_callback(reporter, variant_id=lead_variant_id),
-            bar_range_index=bar_range_index, entry_target_cache=entry_target_cache,
+            bar_range_index=bar_range_index, entry_target_cache=entry_target_cache, liquidity_target_index=liquidity_target_index,
         )
 
         for variant, pending_instruments in pending_by_variant:
@@ -2347,6 +2354,23 @@ def run_batched_exit_benchmark(
         )
     run_wide_elapsed_seconds = time.perf_counter() - run_wide_start
 
+    indexed_start = time.perf_counter()
+    indexed_results: dict[str, dict[str, tuple[list[ExecutedTrade], list[SkippedEntryV2]]]] = {}
+    target_index = LiquidityTargetIndex.build(context.swing_equal_liquidity_results, context.session_liquidity_results)
+    indexed_cache = EntryTargetCache(max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES)
+    for equivalence_class in classes:
+        indexed_results[equivalence_class.class_id] = simulate_market_execution_batched(
+            equivalence_class.observed_entries,
+            equivalence_class.representative_spec.primary.direction,
+            exit_variants,
+            context,
+            equivalence_class.class_id,
+            bar_range_index=bar_range_index,
+            entry_target_cache=indexed_cache,
+            liquidity_target_index=target_index,
+        )
+    indexed_elapsed_seconds = time.perf_counter() - indexed_start
+
     variant_count = len(classes) * len(exit_variants)
     return {
         "sample_size": len(classes),
@@ -2356,12 +2380,15 @@ def run_batched_exit_benchmark(
         "sequential_cached_elapsed_seconds": sequential_elapsed_seconds,
         "batched_elapsed_seconds": batched_elapsed_seconds,
         "run_wide_cached_batched_elapsed_seconds": run_wide_elapsed_seconds,
+        "indexed_batched_elapsed_seconds": indexed_elapsed_seconds,
         "sequential_cached_variants_per_second": (variant_count / sequential_elapsed_seconds) if sequential_elapsed_seconds > 0 else None,
         "batched_variants_per_second": (variant_count / batched_elapsed_seconds) if batched_elapsed_seconds > 0 else None,
         "run_wide_cached_batched_variants_per_second": (variant_count / run_wide_elapsed_seconds) if run_wide_elapsed_seconds > 0 else None,
+        "indexed_batched_variants_per_second": (variant_count / indexed_elapsed_seconds) if indexed_elapsed_seconds > 0 else None,
         "speedup_factor": (sequential_elapsed_seconds / batched_elapsed_seconds) if batched_elapsed_seconds > 0 else None,
         "run_wide_cache_speedup_factor": (batched_elapsed_seconds / run_wide_elapsed_seconds) if run_wide_elapsed_seconds > 0 else None,
-        "exact_result_equality": sequential_results == batched_results == run_wide_results,
+        "price_index_speedup_factor": (run_wide_elapsed_seconds / indexed_elapsed_seconds) if indexed_elapsed_seconds > 0 else None,
+        "exact_result_equality": sequential_results == batched_results == run_wide_results == indexed_results,
     }
 
 

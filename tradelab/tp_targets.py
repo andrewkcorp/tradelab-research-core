@@ -70,6 +70,7 @@ from tradelab.data_wicks import DataWickDetectionResult, DataWickDirection, Data
 from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityLevel, LiquidityStatus, LiquidityType
 from tradelab.liquidity import SUPPORTED_TIMEFRAMES as _SWING_EQUAL_TIMEFRAMES
 from tradelab.session_liquidity import SUPPORTED_TIMEFRAMES as _SESSION_TIMEFRAMES
+from tradelab.liquidity_target_index import LiquidityTargetIndex
 
 LONG = "long"
 SHORT = "short"
@@ -173,6 +174,8 @@ def detect_tp_target_candidates(
     swing_equal_results: dict[str, LiquidityDetectionResult],
     session_results: dict[str, LiquidityDetectionResult],
     data_wick_result: DataWickDetectionResult,
+    *,
+    liquidity_index: LiquidityTargetIndex | None = None,
 ) -> TPTargetCandidateResult:
     """Build the ordered TP target candidates for ``entry``.
 
@@ -184,7 +187,7 @@ def detect_tp_target_candidates(
     set is imposed here: a TP target is not an entry trigger, so an HTF
     swing high is just as valid a target as a 1m one.
     """
-    liquidity_candidates = _liquidity_candidates(entry, swing_equal_results, session_results)
+    liquidity_candidates = _liquidity_candidates(entry, swing_equal_results, session_results, liquidity_index=liquidity_index)
     data_wick_candidates = _data_wick_candidates(entry, data_wick_result)
 
     liquidity_candidates.sort(key=lambda c: (c.distance, c.known_at, c.target_id))
@@ -230,7 +233,16 @@ def _liquidity_candidates(
     entry: MarketEntryContext,
     swing_equal_results: dict[str, LiquidityDetectionResult],
     session_results: dict[str, LiquidityDetectionResult],
+    *,
+    liquidity_index: LiquidityTargetIndex | None = None,
 ) -> list[TPTargetCandidate]:
+    if liquidity_index is not None:
+        wanted_side = HIGH if entry.direction == LONG else LOW
+        levels = liquidity_index.nearest(side=wanted_side, entry_price=entry.entry_price, entry_known_at=entry.entry_known_at)
+        families = {LiquiditySourceFamily.SWING, LiquiditySourceFamily.EQUAL, LiquiditySourceFamily.SESSION}
+        return [candidate for level in levels for candidate in _candidates_from_levels(
+            entry, level.timeframe, LiquidityDetectionResult(levels=[level], takes=[], reclaims=[]), allowed_families=families
+        )]
     candidates: list[TPTargetCandidate] = []
     for timeframe, result in swing_equal_results.items():
         if timeframe not in _SWING_EQUAL_TIMEFRAMES:

@@ -69,6 +69,7 @@ from collections import OrderedDict
 
 from tradelab.sl_targets import SelectedFVGConfluence, SLTargetCandidateResult, detect_sl_target_candidates
 from tradelab.tp_targets import MarketEntryContext, TPTargetCandidateResult, detect_tp_target_candidates
+from tradelab.liquidity_target_index import LiquidityTargetIndex
 
 
 class EntryTargetCache:
@@ -113,12 +114,14 @@ class EntryTargetCache:
         swing_equal_results,
         session_results,
         data_wick_result,
+        *,
+        liquidity_index: LiquidityTargetIndex | None = None,
     ) -> TPTargetCandidateResult:
         cached = self._tp.get(market_entry.entry_id)
         if cached is not None:
             self._touch(("tp", market_entry.entry_id))
             return cached
-        result = detect_tp_target_candidates(market_entry, swing_equal_results, session_results, data_wick_result)
+        result = detect_tp_target_candidates(market_entry, swing_equal_results, session_results, data_wick_result, liquidity_index=liquidity_index)
         self._tp[market_entry.entry_id] = result
         self._touch(("tp", market_entry.entry_id))
         return result
@@ -130,13 +133,15 @@ class EntryTargetCache:
         confluence: SelectedFVGConfluence,
         swing_equal_results,
         session_results,
+        *,
+        liquidity_index: LiquidityTargetIndex | None = None,
     ) -> SLTargetCandidateResult:
         key = (market_entry.entry_id, confluence_key)
         cached = self._sl.get(key)
         if cached is not None:
             self._touch(("sl", key))
             return cached
-        result = detect_sl_target_candidates(market_entry, confluence, swing_equal_results, session_results)
+        result = detect_sl_target_candidates(market_entry, confluence, swing_equal_results, session_results, liquidity_index=liquidity_index)
         self._sl[key] = result
         self._touch(("sl", key))
         return result

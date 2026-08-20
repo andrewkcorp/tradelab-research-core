@@ -91,6 +91,7 @@ from tradelab.tp_targets import LONG, SHORT  # noqa: F401  (re-exported)
 from tradelab.tp_targets import LiquiditySourceFamily  # noqa: F401  (re-exported)
 from tradelab.tp_targets import MarketEntryContext  # noqa: F401  (re-exported)
 from tradelab.tp_targets import _liquidity_source_family
+from tradelab.liquidity_target_index import LiquidityTargetIndex
 
 MAX_LIQUIDITY_SL_TARGETS = 3
 FVG_SL_TIMEFRAMES = frozenset({"5m", "15m"})
@@ -168,6 +169,8 @@ def detect_sl_target_candidates(
     selected_fvg: SelectedFVGConfluence,
     swing_equal_results: dict[str, LiquidityDetectionResult],
     session_results: dict[str, LiquidityDetectionResult],
+    *,
+    liquidity_index: LiquidityTargetIndex | None = None,
 ) -> SLTargetCandidateResult:
     """Build the ordered SL target candidates for ``entry``.
 
@@ -182,7 +185,7 @@ def detect_sl_target_candidates(
             f"SelectedFVGConfluence.entry_id {selected_fvg.entry_id!r} does not match entry.entry_id {entry.entry_id!r}"
         )
 
-    liquidity_candidates = _liquidity_sl_candidates(entry, swing_equal_results, session_results)
+    liquidity_candidates = _liquidity_sl_candidates(entry, swing_equal_results, session_results, liquidity_index=liquidity_index)
     fvg_candidates = _fvg_sl_candidates(entry, selected_fvg)
 
     liquidity_candidates.sort(key=lambda c: (c.distance, c.known_at, c.sl_target_id))
@@ -225,7 +228,16 @@ def _liquidity_sl_candidates(
     entry: MarketEntryContext,
     swing_equal_results: dict[str, LiquidityDetectionResult],
     session_results: dict[str, LiquidityDetectionResult],
+    *,
+    liquidity_index: LiquidityTargetIndex | None = None,
 ) -> list[SLTargetCandidate]:
+    if liquidity_index is not None:
+        wanted_side = LOW if entry.direction == LONG else HIGH
+        levels = liquidity_index.nearest(side=wanted_side, entry_price=entry.entry_price, entry_known_at=entry.entry_known_at)
+        families = {LiquiditySourceFamily.SWING, LiquiditySourceFamily.EQUAL, LiquiditySourceFamily.SESSION}
+        return [candidate for level in levels for candidate in _candidates_from_levels(
+            entry, level.timeframe, LiquidityDetectionResult(levels=[level], takes=[], reclaims=[]), allowed_families=families
+        )]
     candidates: list[SLTargetCandidate] = []
     for timeframe, result in swing_equal_results.items():
         if timeframe not in _SWING_EQUAL_TIMEFRAMES:
