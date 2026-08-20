@@ -52,6 +52,7 @@ from tradelab.backtest_v2 import (
     run_strategy_variant_backtest,
     run_strategy_variant_backtest_all_instruments,
     simulate_market_execution,
+    simulate_market_execution_batched,
     simulate_variant_execution,
 )
 from tradelab.bar import Bar1m
@@ -2076,6 +2077,80 @@ class EntryTargetCacheEquivalenceTests(unittest.TestCase):
             for instrument in DEFAULT_INSTRUMENTS:
                 self.assertEqual(with_shared[instrument].trades, with_fresh[instrument].trades)
                 self.assertEqual(with_shared[instrument].net_pnl_usd, with_fresh[instrument].net_pnl_usd)
+
+
+class BatchedExitVariantExecutionTests(unittest.TestCase):
+    """Task 048: one batched entry pass must be exactly equivalent to
+    running every exit variant independently.  This deliberately shares a
+    cache in both paths, so the assertion isolates batching/state handling
+    rather than task 047's already-tested cache itself."""
+
+    def test_batched_matches_independent_execution_for_all_exit_variants(self):
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result,
+            context.htf_bias_result, min_entries_per_year=1,
+        )
+        self.assertGreater(universe.equivalence_class_count, 0)
+        index = BarRangeIndex.build(context.bars_1m)
+
+        # The deterministic smoke fixture is intentionally compact; every
+        # variant is asserted for each of its available entry classes.
+        for equivalence_class in universe.equivalence_classes:
+            direction = equivalence_class.representative_spec.primary.direction
+            expected_cache = EntryTargetCache()
+            expected = {
+                variant.variant_id: simulate_variant_execution(
+                    equivalence_class, variant, context, bar_range_index=index,
+                    entry_target_cache=expected_cache,
+                )
+                for variant in ALL_EXIT_VARIANTS
+            }
+            actual = simulate_market_execution_batched(
+                equivalence_class.observed_entries, direction, ALL_EXIT_VARIANTS,
+                context, equivalence_class.class_id, bar_range_index=index,
+                entry_target_cache=EntryTargetCache(),
+            )
+            self.assertEqual(set(actual), {variant.variant_id for variant in ALL_EXIT_VARIANTS})
+            for variant in ALL_EXIT_VARIANTS:
+                self.assertEqual(actual[variant.variant_id], expected[variant.variant_id], msg=variant.variant_id)
+
+    def test_batched_matches_independent_execution_for_randomized_long_and_short_classes(self):
+        rng = random.Random(48048)
+        directions_seen = set()
+        compared = 0
+        for _trial in range(6):
+            context = _random_zigzag_context(rng, n_bars=500)
+            universe = discover_entry_strategy_universe(
+                context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result,
+                context.htf_bias_result, min_entries_per_year=1,
+            )
+            if not universe.equivalence_classes:
+                continue
+            index = BarRangeIndex.build(context.bars_1m)
+            classes_by_direction = {}
+            for candidate in universe.equivalence_classes:
+                classes_by_direction.setdefault(candidate.representative_spec.primary.direction, candidate)
+            for direction, equivalence_class in classes_by_direction.items():
+                directions_seen.add(direction)
+                expected_cache = EntryTargetCache()
+                expected = {
+                    variant.variant_id: simulate_variant_execution(
+                        equivalence_class, variant, context, bar_range_index=index,
+                        entry_target_cache=expected_cache,
+                    )
+                    for variant in ALL_EXIT_VARIANTS
+                }
+                actual = simulate_market_execution_batched(
+                    equivalence_class.observed_entries, direction, ALL_EXIT_VARIANTS,
+                    context, equivalence_class.class_id, bar_range_index=index,
+                    entry_target_cache=EntryTargetCache(),
+                )
+                for variant in ALL_EXIT_VARIANTS:
+                    self.assertEqual(actual[variant.variant_id], expected[variant.variant_id], msg=variant.variant_id)
+                    compared += 1
+        self.assertGreater(compared, 100)
+        self.assertEqual(directions_seen, {LONG, SHORT})
 
 
 class InstrumentDedupTests(unittest.TestCase):

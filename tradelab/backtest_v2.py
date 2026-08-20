@@ -788,6 +788,166 @@ def simulate_market_execution(
     return trades, skipped
 
 
+@dataclass
+class _BatchedVariantState:
+    """Mutable execution state of one exit variant inside a batched pass.
+
+    The state deliberately remains independent per variant.  Batched
+    execution shares only entry facts (fill bar, news block and cached target
+    candidate discovery); it never shares a position, trade sequence or bar
+    cursor.  This is what preserves the one-position rule exactly after two
+    variants diverge at a different TP/SL exit.
+    """
+
+    variant: ExitVariantSpec
+    neutral_strategy_id: str
+    trades: list[ExecutedTrade]
+    skipped: list[SkippedEntryV2]
+    position: _OpenPosition | None = None
+    trade_seq: int = 0
+    bar_cursor: int = 0
+
+
+def simulate_market_execution_batched(
+    observed_entries: tuple[ObservedEntry, ...],
+    direction: str,
+    variants: tuple[ExitVariantSpec, ...],
+    context: PreparedBacktestContext,
+    equivalence_class_id: str,
+    *,
+    on_bar_progress: Callable[[int, int], None] | None = None,
+    on_entry_progress: Callable[[int, int], None] | None = None,
+    bar_range_index: BarRangeIndex | None = None,
+    entry_target_cache: EntryTargetCache | None = None,
+) -> dict[str, tuple[list[ExecutedTrade], list[SkippedEntryV2]]]:
+    """Execute every supplied exit variant in one chronological entry pass.
+
+    This is an exact batching optimisation, not a new strategy model.  A
+    variant still has its own open position, fill/exit sequence and skipped
+    entries; the only shared work is information that is variant-invariant:
+    each observed entry's fill bar, news eligibility and TP/SL candidate
+    discovery.  Candidate *selection* remains per variant, so all 4 TP x 5
+    SL rules are retained.  The result for every variant is identical to
+    calling :func:`simulate_market_execution` independently with the same
+    per-class ``EntryTargetCache``.
+    """
+    if not variants:
+        return {}
+    if len({variant.variant_id for variant in variants}) != len(variants):
+        raise ValueError("simulate_market_execution_batched requires unique variant_id values")
+
+    bars = context.bars_1m
+    index = bar_range_index if bar_range_index is not None else BarRangeIndex.build(bars)
+    cache = entry_target_cache if entry_target_cache is not None else EntryTargetCache()
+    states = [
+        _BatchedVariantState(
+            variant=variant,
+            neutral_strategy_id=f"{equivalence_class_id}::{variant.variant_id}",
+            trades=[],
+            skipped=[],
+        )
+        for variant in variants
+    ]
+
+    for entry_index, entry in enumerate(observed_entries, start=1):
+        if on_entry_progress is not None:
+            on_entry_progress(entry_index, len(observed_entries))
+
+        # This lookup has no variant dependency.  Observed entries are
+        # chronological, and an entry's fill is independent of whether any
+        # individual variant currently has a position open.
+        fill_index = index.find_bar_at_or_after(entry.known_at)
+        if fill_index is None:
+            for state in states:
+                state.skipped.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.NO_BAR_AVAILABLE))
+            continue
+
+        fill_bar = bars[fill_index]
+        blocked, _blocking = is_entry_blocked(fill_bar.timestamp, context.news_events)
+        market_entry = MarketEntryContext(
+            entry_id=entry.entry_id,
+            direction=direction,
+            entry_price=fill_bar.open,
+            entry_known_at=fill_bar.timestamp,
+        )
+
+        for state in states:
+            # Settle this variant's position up to (but not past) the next
+            # entry's fill instant, exactly as the independent engine does.
+            if state.bar_cursor < fill_index and state.position is not None:
+                hit = _find_first_exit(bars, index, state.position, state.bar_cursor, fill_index)
+                if hit is not None:
+                    exit_index, reason, exit_price = hit
+                    state.trades.append(_finalize_trade(state.position, exit_timestamp=bars[exit_index].timestamp, exit_price=exit_price, reason=reason))
+                    state.position = None
+            state.bar_cursor = fill_index
+
+            if state.position is not None:
+                state.skipped.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.POSITION_ALREADY_OPEN))
+                continue
+            if blocked:
+                state.skipped.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.NEWS_BLOCK))
+                continue
+
+            # The independent engine allocates the per-variant trade
+            # sequence before target feasibility is known.  Preserve that
+            # audit-id behavior even when this entry later becomes a
+            # missing-target/non-positive-risk skip.
+            state.trade_seq += 1
+            # The cache makes discovery once-per-entry/confluence; selection
+            # of rank/timeframe remains variant-specific and exact.
+            tp_candidate = _resolve_tp_candidate(
+                state.variant, market_entry, context.swing_equal_liquidity_results,
+                context.session_liquidity_results, context.data_wick_result,
+                entry_target_cache=cache,
+            )
+            if tp_candidate is None:
+                state.skipped.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.MISSING_TP_TARGET))
+                continue
+            sl_candidate = _resolve_sl_candidate(
+                state.variant, entry, market_entry, context.swing_equal_liquidity_results,
+                context.session_liquidity_results, entry_target_cache=cache,
+            )
+            if sl_candidate is None:
+                state.skipped.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.MISSING_SL_TARGET))
+                continue
+            if sl_candidate.distance <= 0 or tp_candidate.distance <= 0:
+                state.skipped.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.NON_POSITIVE_RISK))
+                continue
+
+            position = _OpenPosition(
+                trade_id=f"{state.neutral_strategy_id}-{state.trade_seq:06d}-{entry.entry_id}",
+                strategy_id=state.neutral_strategy_id,
+                direction=direction,
+                signal_known_at=entry.known_at,
+                entry_timestamp=fill_bar.timestamp,
+                entry_price=fill_bar.open,
+                tp_candidate=tp_candidate,
+                sl_candidate=sl_candidate,
+            )
+            exit_outcome = _check_exit(position, fill_bar)
+            if exit_outcome is None:
+                state.position = position
+            else:
+                reason, exit_price = exit_outcome
+                state.trades.append(_finalize_trade(position, exit_timestamp=fill_bar.timestamp, exit_price=exit_price, reason=reason))
+
+        if on_bar_progress is not None:
+            on_bar_progress(fill_index, len(bars))
+
+    for state in states:
+        if state.position is not None and state.bar_cursor < len(bars):
+            hit = _find_first_exit(bars, index, state.position, state.bar_cursor, len(bars))
+            if hit is not None:
+                exit_index, reason, exit_price = hit
+                state.trades.append(_finalize_trade(state.position, exit_timestamp=bars[exit_index].timestamp, exit_price=exit_price, reason=reason))
+                state.position = None
+        if state.position is not None:
+            state.trades.append(_finalize_trade(state.position, exit_timestamp=None, exit_price=None, reason=TradeExitReason.OPEN_UNRESOLVED))
+
+    return {state.variant.variant_id: (state.trades, state.skipped) for state in states}
+
+
 # ---------------------------------------------------------------------------
 # Per-strategy-variant result
 # ---------------------------------------------------------------------------
@@ -1333,43 +1493,50 @@ def _expand_and_simulate(
         # entry_target_cache module docstring). Discarded when this
         # class's own variant loop ends -- never shared across classes.
         entry_target_cache = EntryTargetCache()
+        pending_by_variant: list[tuple[ExitVariantSpec, tuple[Instrument, ...]]] = []
         for variant in exit_variants:
-            variant_ids = {instrument: strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value) for instrument in instruments}
-            pending_instruments = [instrument for instrument in instruments if not journal.is_completed(variant_ids[instrument])]
-            if not pending_instruments:
-                continue  # every instrument for this (class, variant) already durably completed
+            pending_instruments = tuple(
+                instrument for instrument in instruments
+                if not journal.is_completed(strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value))
+            )
+            if pending_instruments:
+                pending_by_variant.append((variant, pending_instruments))
+        if not pending_by_variant:
+            continue
 
-            # task 044: live, second-by-second telemetry -- purely
-            # observational (never read back into result/ranking).
-            # reporter.heartbeat() is itself throttled to at most
-            # once/second; ProgressThrottle additionally keeps the
-            # per-bar call site inside simulate_market_execution cheap
-            # for a variant that scans millions of bars.
-            current_unit_index = completed + 1
-            lead_variant_id = variant_ids[pending_instruments[0]]
-            reporter.heartbeat(
-                operation="simulating_backtests", variant_id=lead_variant_id, unit_index=current_unit_index, unit_total=total_variant_runs,
-                bars_scanned=0, bars_total=len(context.bars_1m),
+        # Task 048: run the class's pending exit variants together.  Each
+        # state remains independent after its own exits, while the entry
+        # timeline and expensive target discovery are traversed once.
+        first_variant, first_instruments = pending_by_variant[0]
+        lead_variant_id = strategy_variant_id(equivalence_class.class_id, first_variant.variant_id, first_instruments[0].value)
+        current_unit_index = completed + 1
+        reporter.heartbeat(
+            operation="simulating_backtests", variant_id=lead_variant_id,
+            unit_index=current_unit_index, unit_total=total_variant_runs,
+            bars_scanned=0, bars_total=len(context.bars_1m),
+        )
+        bar_progress = ProgressThrottle(
+            lambda scanned, total, _vid=lead_variant_id, _idx=current_unit_index: reporter.heartbeat(
+                operation="simulating_backtests", variant_id=_vid, unit_index=_idx,
+                unit_total=total_variant_runs, bars_scanned=scanned, bars_total=total,
             )
-            bar_progress = ProgressThrottle(
-                lambda scanned, total, _vid=lead_variant_id, _idx=current_unit_index: reporter.heartbeat(
-                    operation="simulating_backtests", variant_id=_vid, unit_index=_idx, unit_total=total_variant_runs,
-                    bars_scanned=scanned, bars_total=total,
-                )
-            )
-            # task 045: market execution runs exactly once for this
-            # (equivalence class, exit variant), regardless of how many
-            # instruments are pending -- accounting/equity (the only
-            # genuinely instrument-dependent step) is applied separately
-            # for each below.
-            results_by_instrument = run_strategy_variant_backtest_all_instruments(
-                equivalence_class, variant, tuple(pending_instruments), context, risk_config=risk_config, equity_config=equity_config,
-                on_bar_progress=bar_progress.maybe, on_entry_progress=_entry_progress_callback(reporter, variant_id=lead_variant_id),
-                bar_range_index=bar_range_index, entry_target_cache=entry_target_cache,
-            )
+        )
+        direction = equivalence_class.representative_spec.primary.direction
+        executions_by_variant = simulate_market_execution_batched(
+            equivalence_class.observed_entries, direction,
+            tuple(variant for variant, _pending in pending_by_variant), context, equivalence_class.class_id,
+            on_bar_progress=bar_progress.maybe,
+            on_entry_progress=_entry_progress_callback(reporter, variant_id=lead_variant_id),
+            bar_range_index=bar_range_index, entry_target_cache=entry_target_cache,
+        )
 
+        for variant, pending_instruments in pending_by_variant:
+            trades, skipped = executions_by_variant[variant.variant_id]
             for instrument in pending_instruments:
-                result = results_by_instrument[instrument]
+                result = _build_variant_result_for_instrument(
+                    equivalence_class, variant, instrument, trades, skipped,
+                    risk_config=risk_config, equity_config=equity_config,
+                )
                 row = VariantSummaryRow.from_result(result)
                 journal.commit_summary(row.to_dict())  # durable, authoritative -- BEFORE anything below reports it as done
                 append_jsonl(summary_path, row.to_dict())  # plain-text export/audit mirror only, never read back for resume
