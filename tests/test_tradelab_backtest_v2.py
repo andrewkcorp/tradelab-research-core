@@ -33,22 +33,28 @@ from tradelab.backtest_v2 import (
     TPVariantKind,
     VariantSummaryRow,
     _expand_and_simulate,
+    _find_first_exit,
     _leaderboard_sort_key,
     _linked_fvg_candidate,
     _open_journal,
     _resolve_sl_candidate,
+    _simulate_market_execution_reference,
     _TopNTracker,
     _yearly_monthly_breakdown,
     build_synthetic_smoke_context,
     enumerate_exit_variants,
     main as backtest_v2_main,
     read_preflight,
+    run_execution_acceleration_benchmark,
     run_preflight_v2,
     run_production_backtest_v2,
     run_strategy_variant_backtest,
+    run_strategy_variant_backtest_all_instruments,
     simulate_market_execution,
+    simulate_variant_execution,
 )
 from tradelab.bar import Bar1m
+from tradelab.bar_range_index import BarRangeIndex
 from tradelab.entry_signal_timeline import LONG, SHORT, EntryEvent, EntryEventKind
 from tradelab.entry_strategy_universe import ObservedEntry, discover_entry_strategy_universe
 from tradelab.equity import build_equity_curve
@@ -1536,6 +1542,317 @@ class PreflightThroughputSampleProgressTests(unittest.TestCase):
             )
             preflight = read_preflight(reporter.run_dir)
             self.assertEqual(preflight["throughput_estimate"]["sample_size_measured"], 3)
+
+
+# ---------------------------------------------------------------------------
+# Task 045: execution acceleration -- exactness, instrument dedup, benchmark
+# ---------------------------------------------------------------------------
+
+
+class FindFirstExitTests(unittest.TestCase):
+    """Direct, guaranteed (not merely probable) coverage of
+    ``_find_first_exit``'s own exit-finding scenarios: TP-only, SL-only,
+    same-bar-both (SL wins, exactly as ``_check_exit`` itself decides),
+    no-hit-in-range (position survives, ``None``), and finding the exit
+    correctly on the far side of a genuine multi-bar data gap."""
+
+    def _position(self, direction, tp_price: float, sl_price: float):
+        from tradelab.backtest import _OpenPosition
+        from tradelab.sl_targets import SLSourceType, SLTargetCandidate
+        from tradelab.tp_targets import TPSourceType, TPTargetCandidate
+
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        tp = TPTargetCandidate(
+            target_id="tp1", entry_id="e1", source_type=TPSourceType.LIQUIDITY, source_id="L1", direction=direction, price=tp_price,
+            distance=abs(tp_price - 100.0), known_at=t0, rank=1, liquidity_type=None, level_id=None, lower=None, upper=None,
+            source_family=None, event_ids=None, wick_direction=None, timestamp=None,
+        )
+        sl = SLTargetCandidate(
+            sl_target_id="sl1", entry_id="e1", source_type=SLSourceType.LIQUIDITY, source_id="L2", direction=direction, price=sl_price,
+            distance=abs(sl_price - 100.0), known_at=t0, rank=1, lower=sl_price, upper=sl_price, liquidity_type=None, level_id=None,
+            source_family=None, zone_id=None, fvg_source_type=None, fvg_candidate_id=None, fvg_timeframe=None,
+        )
+        return _OpenPosition(trade_id="e1", strategy_id="s", direction=direction, signal_known_at=t0, entry_timestamp=t0, entry_price=100.0, tp_candidate=tp, sl_candidate=sl)
+
+    def _bars_and_index(self, ohlc: list[tuple[float, float, float, float]], *, gap_before_index: int | None = None):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        bars = []
+        ts = t0
+        for i, vals in enumerate(ohlc):
+            if gap_before_index is not None and i == gap_before_index:
+                ts += timedelta(hours=6)  # a genuine multi-bar data gap
+            bars.append(bar(ts, *vals))
+            ts += timedelta(minutes=1)
+        bars = tuple(bars)
+        return bars, BarRangeIndex.build(bars)
+
+    def test_tp_only(self):
+        position = self._position(LONG, tp_price=110.0, sl_price=90.0)
+        bars, index = self._bars_and_index([(100, 101, 99, 100), (100, 105, 99, 104), (100, 111, 99, 108), (100, 103, 99, 102)])
+        hit = _find_first_exit(bars, index, position, 0, len(bars))
+        self.assertIsNotNone(hit)
+        exit_index, reason, price = hit
+        self.assertEqual(exit_index, 2)
+        self.assertEqual(reason, TradeExitReason.TP_HIT)
+        self.assertEqual(price, 110.0)
+
+    def test_sl_only(self):
+        position = self._position(SHORT, tp_price=90.0, sl_price=110.0)
+        bars, index = self._bars_and_index([(100, 101, 99, 100), (100, 103, 98, 101), (100, 112, 99, 105), (100, 103, 99, 102)])
+        hit = _find_first_exit(bars, index, position, 0, len(bars))
+        self.assertIsNotNone(hit)
+        exit_index, reason, price = hit
+        self.assertEqual(exit_index, 2)
+        self.assertEqual(reason, TradeExitReason.SL_HIT)
+        self.assertEqual(price, 110.0)
+
+    def test_same_bar_tp_and_sl_sl_wins(self):
+        position = self._position(LONG, tp_price=110.0, sl_price=95.0)
+        # bar 1's own range spans BOTH 110 (TP) and 95 (SL).
+        bars, index = self._bars_and_index([(100, 101, 99, 100), (100, 112, 90, 105)])
+        hit = _find_first_exit(bars, index, position, 0, len(bars))
+        self.assertIsNotNone(hit)
+        exit_index, reason, price = hit
+        self.assertEqual(exit_index, 1)
+        self.assertEqual(reason, TradeExitReason.SL_HIT)
+        self.assertEqual(price, 95.0)
+
+    def test_no_hit_survives_the_range(self):
+        position = self._position(LONG, tp_price=200.0, sl_price=10.0)
+        bars, index = self._bars_and_index([(100, 101, 99, 100)] * 10)
+        self.assertIsNone(_find_first_exit(bars, index, position, 0, len(bars)))
+
+    def test_exit_found_correctly_beyond_a_genuine_data_gap(self):
+        position = self._position(LONG, tp_price=110.0, sl_price=90.0)
+        # no hit before the gap; the qualifying bar is the very first one after it.
+        bars, index = self._bars_and_index(
+            [(100, 101, 99, 100), (100, 102, 99, 101), (100, 111, 99, 108), (100, 103, 99, 102)], gap_before_index=2,
+        )
+        hit = _find_first_exit(bars, index, position, 0, len(bars))
+        self.assertIsNotNone(hit)
+        exit_index, reason, price = hit
+        self.assertEqual(exit_index, 2)  # the bar immediately after the gap
+        self.assertEqual(reason, TradeExitReason.TP_HIT)
+
+    def test_bounded_range_never_reports_a_hit_beyond_hi(self):
+        position = self._position(LONG, tp_price=110.0, sl_price=90.0)
+        bars, index = self._bars_and_index([(100, 101, 99, 100), (100, 102, 99, 101), (100, 111, 99, 108)])
+        # querying only [0, 2) -- the qualifying bar (index 2) is out of range.
+        self.assertIsNone(_find_first_exit(bars, index, position, 0, 2))
+
+
+def _zigzag_bars_with_gaps(rng: random.Random, *, n_bars: int, leg_length: int, base_amplitude: float, amplitude_growth: float, noise: float, gap_probability: float) -> list[Bar1m]:
+    """A randomized variant of ``build_synthetic_smoke_context``'s own
+    proven "widening zigzag" recipe (reliably forms real FVGs/swing
+    highs+lows on 1m/5m/15m in few bars) -- randomized leg length,
+    amplitude growth, per-bar noise, and occasional genuine multi-minute
+    data gaps, while staying inside one clean ~15h trading window
+    (matching that function's own maintenance-break-avoidance) so
+    randomized parameters can never accidentally produce an invalid
+    ``known_at``."""
+    start = datetime(2024, 12, 31, 23, 5, tzinfo=UTC)
+    bars: list[Bar1m] = []
+    price = 20000.0
+    minute_offset = 0
+    i = 0
+    while i < n_bars:
+        if rng.random() < gap_probability:
+            minute_offset += rng.randint(2, 10)
+        ts = start + timedelta(minutes=minute_offset)
+        cycle_bar = i % (2 * leg_length)
+        cycle_index = i // (2 * leg_length)
+        amplitude = base_amplitude + cycle_index * amplitude_growth
+        move = (amplitude if cycle_bar < leg_length else -amplitude) + rng.uniform(-noise, noise)
+        open_p = price
+        close_p = price + move
+        high_p = max(open_p, close_p) + 3.0 + rng.uniform(0, noise)
+        low_p = min(open_p, close_p) - 3.0 - rng.uniform(0, noise)
+        bars.append(Bar1m(timestamp=ts, open=open_p, high=high_p, low=low_p, close=close_p, volume=100.0, contract="RAND"))
+        price = close_p
+        minute_offset += 1
+        i += 1
+    return bars
+
+
+def _random_zigzag_context(rng: random.Random, *, n_bars: int) -> "PreparedBacktestContext":
+    bars = _zigzag_bars_with_gaps(
+        rng, n_bars=n_bars, leg_length=rng.choice([15, 20, 25, 30]), base_amplitude=rng.uniform(10.0, 30.0),
+        amplitude_growth=rng.uniform(2.0, 8.0), noise=rng.uniform(0.0, 2.0), gap_probability=rng.uniform(0.0, 0.03),
+    )
+    news_events = []
+    if rng.random() < 0.7:
+        for j in range(rng.randint(1, 4)):
+            idx = rng.randint(0, len(bars) - 1)
+            news_events.append(news(bars[idx].timestamp + timedelta(minutes=rng.randint(-15, 5)), event_id=f"N{j}-{idx}"))
+    return prepare_backtest_context(bars, news_events, tick_size=0.25, pivot_strength=2, reclaim_window_bars=3)
+
+
+class SlowReferenceVsAcceleratedEquivalenceTests(unittest.TestCase):
+    """task 045, requirement 5: the accelerated ``simulate_market_
+    execution`` must produce byte-identical ``trades``/``skipped`` to
+    the slow, unaccelerated ``_simulate_market_execution_reference``,
+    for every real (equivalence class, exit variant) a randomized zigzag
+    context discovers -- across many random trials. Randomized bar
+    counts, leg lengths, amplitudes, noise, gap probability, and news
+    placement, applied to real (not hand-picked) equivalence classes and
+    all 20 real exit variants, organically covers long/short, data gaps,
+    missing targets, news blocks, unresolved (still-open) positions,
+    one-position skipping, TP-only, SL-only, and same-bar TP+SL -- proven
+    below by asserting every one of those outcomes was actually observed
+    across the trials, not merely assumed."""
+
+    def test_accelerated_matches_reference_across_many_randomized_trials(self):
+        rng = random.Random(20450)
+        total_compared = 0
+        exit_reasons_seen = set()
+        skip_reasons_seen = set()
+        directions_seen = set()
+
+        for trial in range(20):
+            context = _random_zigzag_context(rng, n_bars=rng.choice([300, 500, 900]))
+            universe = discover_entry_strategy_universe(
+                context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=1,
+            )
+            if universe.equivalence_class_count == 0:
+                continue
+            bar_range_index = BarRangeIndex.build(context.bars_1m)
+
+            for equivalence_class in universe.equivalence_classes:
+                direction = equivalence_class.representative_spec.primary.direction
+                directions_seen.add(direction)
+                for variant in ALL_EXIT_VARIANTS:
+                    neutral_id = f"{equivalence_class.class_id}::{variant.variant_id}"
+                    ref_trades, ref_skipped = _simulate_market_execution_reference(equivalence_class.observed_entries, direction, variant, context, neutral_id)
+                    acc_trades, acc_skipped = simulate_market_execution(
+                        equivalence_class.observed_entries, direction, variant, context, neutral_id, bar_range_index=bar_range_index,
+                    )
+                    self.assertEqual(ref_trades, acc_trades, msg=f"trial={trial} class={equivalence_class.class_id} variant={variant.variant_id}")
+                    self.assertEqual(ref_skipped, acc_skipped, msg=f"trial={trial} class={equivalence_class.class_id} variant={variant.variant_id}")
+                    total_compared += 1
+                    exit_reasons_seen.update(t.exit_reason for t in ref_trades)
+                    skip_reasons_seen.update(s.reason for s in ref_skipped)
+
+        self.assertGreater(total_compared, 500)  # confirms this genuinely exercised many real combinations
+        self.assertEqual(directions_seen, {LONG, SHORT})
+        self.assertIn(TradeExitReason.TP_HIT, exit_reasons_seen)
+        self.assertIn(TradeExitReason.SL_HIT, exit_reasons_seen)
+        self.assertIn(TradeExitReason.OPEN_UNRESOLVED, exit_reasons_seen)
+        self.assertIn(ExecutionSkipReason.POSITION_ALREADY_OPEN, skip_reasons_seen)
+        self.assertIn(ExecutionSkipReason.NEWS_BLOCK, skip_reasons_seen)
+
+
+class InstrumentDedupTests(unittest.TestCase):
+    """task 045, requirement 4: market execution runs exactly once per
+    (equivalence class, exit variant), shared across every instrument --
+    ``run_strategy_variant_backtest_all_instruments`` must return exactly
+    what calling ``run_strategy_variant_backtest`` once per instrument
+    would have (same trades, P&L, ranking-relevant fields), while
+    provably running the shared execution step only once."""
+
+    def _one_real_variant(self):
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=1
+        )
+        self.assertGreater(universe.equivalence_class_count, 0)
+        return context, universe.equivalence_classes[0], ALL_EXIT_VARIANTS[0]
+
+    def test_matches_calling_run_strategy_variant_backtest_once_per_instrument(self):
+        context, equivalence_class, variant = self._one_real_variant()
+
+        individually = {
+            instrument: run_strategy_variant_backtest(equivalence_class, variant, instrument, context)
+            for instrument in DEFAULT_INSTRUMENTS
+        }
+        shared = run_strategy_variant_backtest_all_instruments(equivalence_class, variant, DEFAULT_INSTRUMENTS, context)
+
+        self.assertEqual(set(shared.keys()), set(DEFAULT_INSTRUMENTS))
+        for instrument in DEFAULT_INSTRUMENTS:
+            a, b = individually[instrument], shared[instrument]
+            self.assertEqual(a.strategy_variant_id, b.strategy_variant_id)
+            self.assertEqual(a.net_pnl_usd, b.net_pnl_usd)
+            self.assertEqual(a.trade_count, b.trade_count)
+            self.assertEqual(a.max_drawdown_usd, b.max_drawdown_usd)
+            self.assertEqual(a.win_rate, b.win_rate)
+            self.assertEqual(a.yearly, b.yearly)
+            self.assertEqual(a.monthly, b.monthly)
+            self.assertEqual(a.skipped_entries_by_reason, b.skipped_entries_by_reason)
+
+        # the two instrument results are genuinely distinct (different
+        # point value/sizing), not accidentally identical objects.
+        self.assertNotEqual(shared[Instrument.MNQ].strategy_variant_id, shared[Instrument.NQ].strategy_variant_id)
+
+    def test_market_execution_runs_exactly_once_regardless_of_instrument_count(self):
+        context, equivalence_class, variant = self._one_real_variant()
+        calls = []
+        orig = simulate_variant_execution
+
+        def spy(*args, **kwargs):
+            calls.append(1)
+            return orig(*args, **kwargs)
+
+        with patch("tradelab.backtest_v2.simulate_variant_execution", spy):
+            run_strategy_variant_backtest_all_instruments(equivalence_class, variant, DEFAULT_INSTRUMENTS, context)
+        self.assertEqual(len(calls), 1)  # never once per instrument, regardless of len(DEFAULT_INSTRUMENTS)
+
+    def test_expand_and_simulate_shares_execution_across_instruments_on_resume_too(self):
+        # If one instrument is already durably completed and the other
+        # isn't, execution must still run (exactly once) for the
+        # remaining instrument -- and must NOT re-commit the already-
+        # completed one.
+        context, equivalence_class, variant = self._one_real_variant()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=1
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={}, is_demo=True)
+            journal = _open_journal(
+                reporter, market_artifact_path=None, news_csv_path=None, parameters={}, risk_config=DEFAULT_RISK_CONFIG,
+                equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS, instruments=DEFAULT_INSTRUMENTS,
+            )
+            # pre-complete MNQ only, for the very first (class, variant) combo.
+            first_class = universe.equivalence_classes[0]
+            first_variant = ALL_EXIT_VARIANTS[0]
+            precomputed = run_strategy_variant_backtest(first_class, first_variant, Instrument.MNQ, context)
+            journal.commit_summary(VariantSummaryRow.from_result(precomputed).to_dict())
+            self.assertEqual(journal.completed_count(), 1)
+
+            completed, _leaderboard = _expand_and_simulate(
+                reporter, journal, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, context,
+                risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG, top_n_leaderboard=3, checkpoint_every=1000,
+            )
+            journal.close()
+
+        total_expected = universe.equivalence_class_count * len(ALL_EXIT_VARIANTS) * len(DEFAULT_INSTRUMENTS)
+        self.assertEqual(completed, total_expected)  # exactly total, not total+1 (no duplicate re-commit of MNQ)
+
+
+class ExecutionAccelerationBenchmarkTests(unittest.TestCase):
+    """task 045, requirement 5: the benchmark reports *measured* baseline
+    vs accelerated timings (never a claimed/projected number) and exact
+    result equality, on the deterministic synthetic representative
+    fixture."""
+
+    def test_benchmark_reports_measured_timings_and_exact_equality(self):
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=1
+        )
+        self.assertGreater(universe.equivalence_class_count, 0)
+
+        report = run_execution_acceleration_benchmark(context, universe, ALL_EXIT_VARIANTS, sample_size=25)
+
+        self.assertTrue(report["exact_result_equality"])
+        self.assertEqual(report["sample_size"], 25)
+        self.assertGreater(report["reference_elapsed_seconds"], 0.0)
+        self.assertGreater(report["accelerated_elapsed_seconds"], 0.0)
+        self.assertIsNotNone(report["reference_variants_per_second"])
+        self.assertIsNotNone(report["accelerated_variants_per_second"])
+        self.assertIsNotNone(report["speedup_factor"])
+
+    def test_benchmark_cli_runs_and_prints_a_report(self):
+        exit_code = backtest_v2_main(["benchmark", "--sample-size", "10"])
+        self.assertEqual(exit_code, 0)
 
 
 if __name__ == "__main__":

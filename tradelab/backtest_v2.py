@@ -202,6 +202,7 @@ from tradelab.backtest import (
 )
 from tradelab.backtest_v2_journal import BacktestV2Journal, JournalVariantSummary
 from tradelab.bar import Bar1m
+from tradelab.bar_range_index import BarRangeIndex
 from tradelab.entry_signal_timeline import LONG, SHORT, EntryEvent, EntryEventKind
 from tradelab.entry_strategy_universe import EntryStrategyEquivalenceClass, EntryStrategyUniverseResult, ObservedEntry, discover_entry_strategy_universe
 from tradelab.equity import EquityConfig, EquityResult, build_equity_curve
@@ -388,7 +389,7 @@ def _find_fill_bar_index(bars: tuple[Bar1m, ...], sorted_timestamps: list[dateti
     return idx if idx < len(bars) else None
 
 
-def simulate_market_execution(
+def _simulate_market_execution_reference(
     observed_entries: tuple[ObservedEntry, ...],
     direction: str,
     variant: ExitVariantSpec,
@@ -397,24 +398,21 @@ def simulate_market_execution(
     *,
     on_bar_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[list[ExecutedTrade], list[SkippedEntryV2]]:
-    """The core, new execution loop -- next-bar-open fill, same-1m-bar
-    SL-first tie-break (reused from ``tradelab.backtest``), one
-    position at a time, news-blocked at the actual fill instant. See
-    module docstring for the full rule set.
+    """**The slow, unaccelerated reference implementation (task 045).**
+    Byte-for-byte the original execution loop -- next-bar-open fill,
+    same-1m-bar SL-first tie-break (reused from ``tradelab.backtest``),
+    one position at a time, news-blocked at the actual fill instant,
+    walking every single 1m bar one at a time regardless of whether a
+    position is open. See module docstring for the full rule set.
 
-    ``on_bar_progress`` (task 044), if given, is called with
-    ``(bars_scanned, bars_total)`` as the bar cursor advances -- this is
-    the loop that can genuinely scan the *entire* dataset one bar at a
-    time for a single (equivalence class, exit variant, instrument)
-    combination whenever its own observed entries are sparse relative to
-    the bar count (the cursor still has to walk every bar in between to
-    check an open position for exit, or simply to advance to the next
-    entry's own fill bar). Purely observational: this callback's return
-    value is ignored and it can never influence ``trades``/``skipped``/
-    ``position`` in any way -- the caller is expected to pass an already
-    time-throttled callback (e.g. a ``tradelab.research_run.
-    ProgressThrottle.maybe``), since this loop may invoke it once per
-    bar, for millions of bars."""
+    Kept, unmodified, **only** as the ground truth for the randomized
+    slow-reference-vs-accelerated equivalence test -- ``simulate_market_
+    execution`` below is the real, accelerated implementation every
+    production/preflight/smoke-test call site actually uses. Never call
+    this at real-data scale: it is the exact loop that made a real
+    preflight measure 1,091,880 strategy-variant simulations at
+    0.0009323/sec (~37 years on one process) -- see ``tradelab.bar_
+    range_index``'s own module docstring."""
     bars = context.bars_1m
     total_bars = len(bars)
     sorted_timestamps = [b.timestamp for b in bars]  # already chronological by construction
@@ -521,6 +519,176 @@ def simulate_market_execution(
     return trades, skipped
 
 
+def _find_first_exit(
+    bars: tuple[Bar1m, ...], bar_range_index: BarRangeIndex, position: _OpenPosition, lo: int, hi: int
+) -> tuple[int, TradeExitReason, float] | None:
+    """The exact bar index in ``[lo, hi)`` where ``position`` first
+    exits (TP or SL), or ``None`` if it survives the whole range --
+    O(log n) via two independent first-hit range queries (one for the
+    long/short-appropriate TP condition, one for SL), reusing ``tradelab.
+    backtest._check_exit`` at the single winning bar to get the exact
+    same SL-wins-same-bar tie-break the reference implementation applies
+    bar by bar.
+
+    **Why this is exact, not approximate**: ``tp_idx``/``sl_idx`` are
+    each the true first index in ``[lo, hi)`` satisfying their own
+    condition. If they differ, the smaller one is chronologically first
+    and ``_check_exit`` at that bar sees only its own condition true
+    (if the *other* condition were also true there, the other's own
+    first-hit index could not be later -- a direct consequence of both
+    being genuine *first*-hit indices). If they're equal (both
+    conditions first become true on the identical bar), ``_check_exit``
+    applies its own, already-tested SL-first tie-break there exactly as
+    the reference bar-by-bar loop would."""
+    if position.direction == LONG:
+        tp_idx = bar_range_index.first_high_at_least(lo, hi, position.tp_candidate.price)
+        sl_idx = bar_range_index.first_low_at_most(lo, hi, position.sl_candidate.price)
+    else:
+        tp_idx = bar_range_index.first_low_at_most(lo, hi, position.tp_candidate.price)
+        sl_idx = bar_range_index.first_high_at_least(lo, hi, position.sl_candidate.price)
+
+    if tp_idx is None and sl_idx is None:
+        return None
+    if sl_idx is not None and (tp_idx is None or sl_idx <= tp_idx):
+        exit_index = sl_idx
+    else:
+        exit_index = tp_idx
+
+    outcome = _check_exit(position, bars[exit_index])
+    assert outcome is not None, "first_high_at_least/first_low_at_most found a qualifying bar, but _check_exit disagreed"
+    reason, price = outcome
+    return exit_index, reason, price
+
+
+def simulate_market_execution(
+    observed_entries: tuple[ObservedEntry, ...],
+    direction: str,
+    variant: ExitVariantSpec,
+    context: PreparedBacktestContext,
+    strategy_variant_id: str,
+    *,
+    on_bar_progress: Callable[[int, int], None] | None = None,
+    bar_range_index: BarRangeIndex | None = None,
+) -> tuple[list[ExecutedTrade], list[SkippedEntryV2]]:
+    """**The real, accelerated execution loop (task 045).** Identical
+    rules to ``_simulate_market_execution_reference`` -- same observed
+    entries, fill rules, news filter, target selection, one-position
+    rule, TP/SL entry-bar behavior, and SL-wins-same-bar rule -- proven
+    identical, not merely believed so, by ``tests/test_tradelab_
+    backtest_v2.py``'s randomized slow-reference-vs-accelerated
+    equivalence test. Two changes only, both purely mechanical:
+
+    1. **No-position gaps are skipped in O(1)**, not walked bar by bar
+       -- when no position is open, the cursor jumps directly to the
+       next observed entry's own fill index (or the end of the bar
+       sequence), since ``_check_exit`` is a guaranteed no-op with no
+       open position.
+    2. **While a position is open, its exit is found via ``tradelab.
+       bar_range_index.BarRangeIndex`` in O(log n)** instead of an
+       O(bars) per-bar scan -- see ``_find_first_exit``.
+
+    ``bar_range_index``, if given, must have been built from this exact
+    ``context.bars_1m`` (``BarRangeIndex.build(context.bars_1m)``) --
+    callers driving many simulations against the same context should
+    build it once and pass it to every call, since the O(n log n) build
+    cost is only worth paying once. If omitted, one is built on the fly
+    (fine for a single ad-hoc call; wasteful in a loop)."""
+    bars = context.bars_1m
+    total_bars = len(bars)
+    index = bar_range_index if bar_range_index is not None else BarRangeIndex.build(bars)
+    trades: list[ExecutedTrade] = []
+    skipped: list[SkippedEntryV2] = []
+    position: _OpenPosition | None = None
+    trade_seq = 0
+    bar_cursor = 0
+
+    for entry in observed_entries:
+        fill_index = index.find_bar_at_or_after(entry.known_at, bar_cursor)
+        advance_to = fill_index if fill_index is not None else len(bars)
+
+        if bar_cursor < advance_to:
+            if position is not None:
+                hit = _find_first_exit(bars, index, position, bar_cursor, advance_to)
+                if hit is not None:
+                    exit_index, reason, exit_price = hit
+                    trades.append(_finalize_trade(position, exit_timestamp=bars[exit_index].timestamp, exit_price=exit_price, reason=reason))
+                    position = None
+            bar_cursor = advance_to
+            if on_bar_progress is not None:
+                on_bar_progress(bar_cursor, total_bars)
+
+        if fill_index is None:
+            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.NO_BAR_AVAILABLE))
+            continue
+
+        fill_bar = bars[fill_index]
+
+        if position is not None:
+            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.POSITION_ALREADY_OPEN))
+            continue
+
+        blocked, _blocking = is_entry_blocked(fill_bar.timestamp, context.news_events)
+        if blocked:
+            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.NEWS_BLOCK))
+            continue
+
+        trade_seq += 1
+        trade_id = f"{strategy_variant_id}-{trade_seq:06d}-{entry.entry_id}"
+        # entry_known_at is the FILL bar's own timestamp, not the raw
+        # signal's known_at -- see _simulate_market_execution_reference's
+        # own identical comment for the full reasoning (unchanged here).
+        market_entry = MarketEntryContext(entry_id=trade_id, direction=direction, entry_price=fill_bar.open, entry_known_at=fill_bar.timestamp)
+
+        tp_candidate = _resolve_tp_candidate(variant, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results, context.data_wick_result)
+        if tp_candidate is None:
+            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.MISSING_TP_TARGET))
+            continue
+
+        sl_candidate = _resolve_sl_candidate(variant, entry, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results)
+        if sl_candidate is None:
+            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.MISSING_SL_TARGET))
+            continue
+
+        if sl_candidate.distance <= 0 or tp_candidate.distance <= 0:
+            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.NON_POSITIVE_RISK))
+            continue
+
+        position = _OpenPosition(
+            trade_id=trade_id, strategy_id=strategy_variant_id, direction=direction, signal_known_at=entry.known_at,
+            entry_timestamp=fill_bar.timestamp, entry_price=fill_bar.open, tp_candidate=tp_candidate, sl_candidate=sl_candidate,
+        )
+        # Evaluate TP/SL starting with the entry bar itself (spec) --
+        # a single-bar check, same as the reference implementation.
+        exit_outcome = _check_exit(position, fill_bar)
+        if exit_outcome is not None:
+            reason, exit_price = exit_outcome
+            trades.append(_finalize_trade(position, exit_timestamp=fill_bar.timestamp, exit_price=exit_price, reason=reason))
+            position = None
+        # Deliberately left at fill_index, not fill_index + 1 -- see
+        # _simulate_market_execution_reference's own identical comment;
+        # the next iteration's range query over [fill_index, ...) simply
+        # finds nothing new if the position already closed here.
+        bar_cursor = fill_index
+
+    # Drain any still-open position through the remaining bars.
+    if bar_cursor < len(bars) and position is not None:
+        hit = _find_first_exit(bars, index, position, bar_cursor, len(bars))
+        if hit is not None:
+            exit_index, reason, exit_price = hit
+            trades.append(_finalize_trade(position, exit_timestamp=bars[exit_index].timestamp, exit_price=exit_price, reason=reason))
+            position = None
+            bar_cursor = exit_index + 1
+        else:
+            bar_cursor = len(bars)
+        if on_bar_progress is not None:
+            on_bar_progress(bar_cursor, total_bars)
+
+    if position is not None:
+        trades.append(_finalize_trade(position, exit_timestamp=None, exit_price=None, reason=TradeExitReason.OPEN_UNRESOLVED))
+
+    return trades, skipped
+
+
 # ---------------------------------------------------------------------------
 # Per-strategy-variant result
 # ---------------------------------------------------------------------------
@@ -594,29 +762,64 @@ def strategy_variant_id(equivalence_class_id: str, variant_id: str, instrument_v
     return f"{equivalence_class_id}::{variant_id}::{instrument_value}"
 
 
-def run_strategy_variant_backtest(
+def simulate_variant_execution(
+    equivalence_class: EntryStrategyEquivalenceClass,
+    variant: ExitVariantSpec,
+    context: PreparedBacktestContext,
+    *,
+    on_bar_progress: Callable[[int, int], None] | None = None,
+    bar_range_index: BarRangeIndex | None = None,
+) -> tuple[list[ExecutedTrade], list[SkippedEntryV2]]:
+    """The **instrument-independent** market execution for one
+    (equivalence class, exit variant) -- task 045, requirement 4.
+    Observed entries, fill rules, target selection, and exits are all a
+    function of price and time alone; MNQ/NQ only ever differ at the
+    *accounting* stage (point value, contract sizing) via ``tradelab.
+    accounting.apply_accounting`` -- never here. This is what makes it
+    safe, and correct, to call this exactly once per (equivalence class,
+    exit variant) and reuse its ``(trades, skipped)`` result for every
+    instrument, rather than re-running the identical simulation once per
+    instrument (``_build_variant_result_for_instrument`` is the cheap,
+    O(trade_count) per-instrument step that follows).
+
+    The ``strategy_variant_id`` fed into ``simulate_market_execution``
+    (and, from it, into every ``ExecutedTrade.trade_id``/``tp_source_id``/
+    ``sl_source_id``) is deliberately the *instrument-neutral*
+    ``f"{class_id}::{variant_id}"`` -- those are audit-trail labels, never
+    used as lookup keys anywhere downstream (verified: ``tradelab.
+    accounting``/``tradelab.equity`` only ever copy ``strategy_id``
+    through, never branch on it). The authoritative, instrument-specific
+    identifier is ``StrategyVariantResult.strategy_variant_id``, computed
+    separately, per instrument, in ``_build_variant_result_for_
+    instrument`` below -- unchanged from before this task."""
+    direction = equivalence_class.representative_spec.primary.direction
+    neutral_id = f"{equivalence_class.class_id}::{variant.variant_id}"
+    return simulate_market_execution(
+        equivalence_class.observed_entries, direction, variant, context, neutral_id,
+        on_bar_progress=on_bar_progress, bar_range_index=bar_range_index,
+    )
+
+
+def _build_variant_result_for_instrument(
     equivalence_class: EntryStrategyEquivalenceClass,
     variant: ExitVariantSpec,
     instrument: Instrument,
-    context: PreparedBacktestContext,
+    trades: list[ExecutedTrade],
+    skipped: list[SkippedEntryV2],
     *,
-    risk_config: RiskConfig = DEFAULT_RISK_CONFIG,
-    equity_config: EquityConfig = DEFAULT_EQUITY_CONFIG,
-    on_bar_progress: Callable[[int, int], None] | None = None,
+    risk_config: RiskConfig,
+    equity_config: EquityConfig,
 ) -> StrategyVariantResult:
-    """Simulate one full (equivalence class, exit variant, instrument)
-    strategy backtest -- market execution (this module), then sizing/
-    P&L (``tradelab.accounting.apply_accounting``, unmodified), then
-    equity/drawdown (``tradelab.equity.build_equity_curve``,
-    unmodified).
-
-    ``on_bar_progress`` (task 044) is forwarded, unmodified, straight
-    through to ``simulate_market_execution`` -- purely observational,
-    never read back into anything this function returns."""
+    """Sizing/P&L (``tradelab.accounting.apply_accounting``, unmodified)
+    then equity/drawdown (``tradelab.equity.build_equity_curve``,
+    unmodified) for one instrument, from an already-simulated, shared
+    ``(trades, skipped)`` pair -- O(trade_count), never re-running
+    market execution. ``strategy_variant_id`` here (unlike the neutral
+    one fed into the shared simulation) is the real, instrument-specific
+    identifier used everywhere downstream (journal, leaderboard,
+    ranking) -- unchanged from before this task."""
     direction = equivalence_class.representative_spec.primary.direction
     variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value)
-
-    trades, skipped = simulate_market_execution(equivalence_class.observed_entries, direction, variant, context, variant_id, on_bar_progress=on_bar_progress)
 
     backtest_result = BacktestResult(
         strategy_id=variant_id, trades=trades, skipped_signals=[], trade_count=len(trades),
@@ -644,6 +847,61 @@ def run_strategy_variant_backtest(
         max_drawdown_usd=equity_result.max_drawdown_usd, drawdowns_over_2000_count=equity_result.drawdown_over_threshold_episode_count,
         skipped_entries_by_reason=skipped_by_reason, yearly=yearly, monthly=monthly,
     )
+
+
+def run_strategy_variant_backtest(
+    equivalence_class: EntryStrategyEquivalenceClass,
+    variant: ExitVariantSpec,
+    instrument: Instrument,
+    context: PreparedBacktestContext,
+    *,
+    risk_config: RiskConfig = DEFAULT_RISK_CONFIG,
+    equity_config: EquityConfig = DEFAULT_EQUITY_CONFIG,
+    on_bar_progress: Callable[[int, int], None] | None = None,
+    bar_range_index: BarRangeIndex | None = None,
+) -> StrategyVariantResult:
+    """Simulate one full (equivalence class, exit variant, instrument)
+    strategy backtest -- a thin, single-instrument convenience wrapper
+    around ``simulate_variant_execution`` + ``_build_variant_result_
+    for_instrument`` (task 045), preserving this function's own
+    pre-existing signature and behavior exactly. Callers evaluating
+    *both* MNQ and NQ for the same (equivalence class, exit variant)
+    should prefer ``run_strategy_variant_backtest_all_instruments``
+    instead, to avoid running market execution twice for an identical
+    result.
+
+    ``on_bar_progress``/``bar_range_index`` (task 044/045) are forwarded,
+    unmodified, straight through to ``simulate_market_execution`` --
+    purely observational/accelerating, never read back into anything
+    this function returns."""
+    trades, skipped = simulate_variant_execution(equivalence_class, variant, context, on_bar_progress=on_bar_progress, bar_range_index=bar_range_index)
+    return _build_variant_result_for_instrument(equivalence_class, variant, instrument, trades, skipped, risk_config=risk_config, equity_config=equity_config)
+
+
+def run_strategy_variant_backtest_all_instruments(
+    equivalence_class: EntryStrategyEquivalenceClass,
+    variant: ExitVariantSpec,
+    instruments: tuple[Instrument, ...],
+    context: PreparedBacktestContext,
+    *,
+    risk_config: RiskConfig = DEFAULT_RISK_CONFIG,
+    equity_config: EquityConfig = DEFAULT_EQUITY_CONFIG,
+    on_bar_progress: Callable[[int, int], None] | None = None,
+    bar_range_index: BarRangeIndex | None = None,
+) -> dict[Instrument, StrategyVariantResult]:
+    """Simulate market execution for this (equivalence class, exit
+    variant) **exactly once** and apply accounting/equity separately for
+    every instrument in ``instruments`` -- task 045, requirement 4. Every
+    returned ``StrategyVariantResult`` is exactly what ``run_strategy_
+    variant_backtest`` would have returned for that one instrument,
+    called individually -- proven by ``tests/test_tradelab_backtest_v2.
+    py``'s own equivalence test -- just without repeating the O(entries +
+    exits) simulation work per instrument."""
+    trades, skipped = simulate_variant_execution(equivalence_class, variant, context, on_bar_progress=on_bar_progress, bar_range_index=bar_range_index)
+    return {
+        instrument: _build_variant_result_for_instrument(equivalence_class, variant, instrument, trades, skipped, risk_config=risk_config, equity_config=equity_config)
+        for instrument in instruments
+    }
 
 
 def _to_leaderboard_entry(result: StrategyVariantResult, rank: int) -> LeaderboardEntry:
@@ -859,6 +1117,23 @@ def _expand_and_simulate(
     logged as its own durable event (see that method's own docstring).
     This is purely observational: it never affects ``result``, the
     journal, the leaderboard, or which variant is simulated next.
+
+    **Execution acceleration (task 045).** A single ``tradelab.bar_
+    range_index.BarRangeIndex`` is built once, here, from ``context.
+    bars_1m`` and reused for every simulation this function runs -- see
+    that module's own docstring for why this alone turns an O(bars)
+    per-variant scan into O(log bars). Market execution itself is run
+    **once per (equivalence class, exit variant)**, never once per
+    instrument: ``run_strategy_variant_backtest_all_instruments`` shares
+    the identical ``(trades, skipped)`` result across every instrument
+    in ``instruments``, applying accounting/equity (the only genuinely
+    instrument-dependent step) separately for each -- see that
+    function's own docstring. Resume correctness is preserved exactly:
+    an instrument already durably completed in a previous process is
+    still individually skipped (never re-committed to the journal), and
+    market execution for a given (equivalence class, exit variant) is
+    only ever (re-)run when at least one of its instruments is still
+    pending.
     """
     total_variant_runs = universe.equivalence_class_count * len(exit_variants) * len(instruments)
     reporter.phase_started(RunPhase.EXPANDING_EXIT_VARIANTS, items_total=max(total_variant_runs, 1))
@@ -866,6 +1141,7 @@ def _expand_and_simulate(
 
     reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=max(total_variant_runs, 1))
     summary_path = reporter.run_dir / "variant_summaries.jsonl"
+    bar_range_index = BarRangeIndex.build(context.bars_1m)
 
     completed = journal.completed_count()
     durable_top_n = [_leaderboard_entry_from_journal_summary(s) for s in journal.top_n_summaries(top_n_leaderboard)]
@@ -877,32 +1153,41 @@ def _expand_and_simulate(
 
     for equivalence_class in universe.equivalence_classes:
         for variant in exit_variants:
-            for instrument in instruments:
-                variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value)
-                if journal.is_completed(variant_id):
-                    continue  # durably completed in a previous process -- never recomputed
+            variant_ids = {instrument: strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value) for instrument in instruments}
+            pending_instruments = [instrument for instrument in instruments if not journal.is_completed(variant_ids[instrument])]
+            if not pending_instruments:
+                continue  # every instrument for this (class, variant) already durably completed
 
-                # task 044: live, second-by-second telemetry -- purely
-                # observational (never read back into result/ranking).
-                # reporter.heartbeat() is itself throttled to at most
-                # once/second; ProgressThrottle additionally keeps the
-                # per-bar call site inside simulate_market_execution cheap
-                # for a variant that scans millions of bars.
-                current_unit_index = completed + 1
-                reporter.heartbeat(
-                    operation="simulating_backtests", variant_id=variant_id, unit_index=current_unit_index, unit_total=total_variant_runs,
-                    bars_scanned=0, bars_total=len(context.bars_1m),
+            # task 044: live, second-by-second telemetry -- purely
+            # observational (never read back into result/ranking).
+            # reporter.heartbeat() is itself throttled to at most
+            # once/second; ProgressThrottle additionally keeps the
+            # per-bar call site inside simulate_market_execution cheap
+            # for a variant that scans millions of bars.
+            current_unit_index = completed + 1
+            lead_variant_id = variant_ids[pending_instruments[0]]
+            reporter.heartbeat(
+                operation="simulating_backtests", variant_id=lead_variant_id, unit_index=current_unit_index, unit_total=total_variant_runs,
+                bars_scanned=0, bars_total=len(context.bars_1m),
+            )
+            bar_progress = ProgressThrottle(
+                lambda scanned, total, _vid=lead_variant_id, _idx=current_unit_index: reporter.heartbeat(
+                    operation="simulating_backtests", variant_id=_vid, unit_index=_idx, unit_total=total_variant_runs,
+                    bars_scanned=scanned, bars_total=total,
                 )
-                bar_progress = ProgressThrottle(
-                    lambda scanned, total, _vid=variant_id, _idx=current_unit_index: reporter.heartbeat(
-                        operation="simulating_backtests", variant_id=_vid, unit_index=_idx, unit_total=total_variant_runs,
-                        bars_scanned=scanned, bars_total=total,
-                    )
-                )
-                result = run_strategy_variant_backtest(
-                    equivalence_class, variant, instrument, context, risk_config=risk_config, equity_config=equity_config,
-                    on_bar_progress=bar_progress.maybe,
-                )
+            )
+            # task 045: market execution runs exactly once for this
+            # (equivalence class, exit variant), regardless of how many
+            # instruments are pending -- accounting/equity (the only
+            # genuinely instrument-dependent step) is applied separately
+            # for each below.
+            results_by_instrument = run_strategy_variant_backtest_all_instruments(
+                equivalence_class, variant, tuple(pending_instruments), context, risk_config=risk_config, equity_config=equity_config,
+                on_bar_progress=bar_progress.maybe, bar_range_index=bar_range_index,
+            )
+
+            for instrument in pending_instruments:
+                result = results_by_instrument[instrument]
                 row = VariantSummaryRow.from_result(result)
                 journal.commit_summary(row.to_dict())  # durable, authoritative -- BEFORE anything below reports it as done
                 append_jsonl(summary_path, row.to_dict())  # plain-text export/audit mirror only, never read back for resume
@@ -1250,36 +1535,57 @@ def _measure_sample_throughput(
     memory, so the final sample's own completion is always visible in
     ``preflight.json``'s neighboring ``live_status.json`` immediately
     after this function returns, even if its own heartbeat call was
-    itself throttled away."""
+    itself throttled away.
+
+    **Execution acceleration (task 045).** Builds one ``tradelab.bar_
+    range_index.BarRangeIndex`` and reuses it for every sample, and
+    groups consecutive combos sharing the same (equivalence class, exit
+    variant) -- which, since ``_iter_variant_combinations`` enumerates
+    instruments innermost, means every instrument the sample includes
+    for a given (equivalence class, exit variant) -- to run market
+    execution exactly once per group via ``run_strategy_variant_
+    backtest_all_instruments``, exactly mirroring ``_expand_and_
+    simulate``'s own dedup. This makes the measured throughput honestly
+    reflect production's real, deduplicated cost, not an inflated
+    per-instrument-redone estimate."""
     combos = list(itertools.islice(_iter_variant_combinations(universe, exit_variants, instruments), sample_size))
     row_byte_sizes: list[int] = []
+    bar_range_index = BarRangeIndex.build(context.bars_1m)
+    completed = 0
     start = time.perf_counter()
-    for i, (equivalence_class, variant, instrument) in enumerate(combos):
-        variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value)
+    for (_class_id, _variant_id), group in itertools.groupby(combos, key=lambda c: (c[0].class_id, c[1].variant_id)):
+        group = list(group)
+        equivalence_class, variant = group[0][0], group[0][1]
+        group_instruments = tuple(c[2] for c in group)
+        lead_variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, group_instruments[0].value)
         on_bar_progress = None
         if reporter is not None:
             reporter.heartbeat(
-                operation="sampling_throughput", variant_id=variant_id, unit_index=i + 1, unit_total=len(combos),
+                operation="sampling_throughput", variant_id=lead_variant_id, unit_index=completed + 1, unit_total=len(combos),
                 bars_scanned=0, bars_total=len(context.bars_1m),
             )
             bar_progress = ProgressThrottle(
-                lambda scanned, total, _vid=variant_id, _idx=i + 1: reporter.heartbeat(
+                lambda scanned, total, _vid=lead_variant_id, _idx=completed + 1: reporter.heartbeat(
                     operation="sampling_throughput", variant_id=_vid, unit_index=_idx, unit_total=len(combos),
                     bars_scanned=scanned, bars_total=total,
                 )
             )
             on_bar_progress = bar_progress.maybe
-        result = run_strategy_variant_backtest(
-            equivalence_class, variant, instrument, context, risk_config=risk_config, equity_config=equity_config,
-            on_bar_progress=on_bar_progress,
+        results_by_instrument = run_strategy_variant_backtest_all_instruments(
+            equivalence_class, variant, group_instruments, context, risk_config=risk_config, equity_config=equity_config,
+            on_bar_progress=on_bar_progress, bar_range_index=bar_range_index,
         )
-        row = VariantSummaryRow.from_result(result)
-        row_byte_sizes.append(len(json.dumps(row.to_dict()).encode("utf-8")))
-        if reporter is not None:
-            reporter.heartbeat(
-                operation="sampling_throughput", variant_id=variant_id, unit_index=i + 1, unit_total=len(combos),
-                bars_scanned=len(context.bars_1m), bars_total=len(context.bars_1m),
-            )
+        for instrument in group_instruments:
+            result = results_by_instrument[instrument]
+            row = VariantSummaryRow.from_result(result)
+            row_byte_sizes.append(len(json.dumps(row.to_dict()).encode("utf-8")))
+            completed += 1
+            if reporter is not None:
+                variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value)
+                reporter.heartbeat(
+                    operation="sampling_throughput", variant_id=variant_id, unit_index=completed, unit_total=len(combos),
+                    bars_scanned=len(context.bars_1m), bars_total=len(context.bars_1m),
+                )
     elapsed_seconds = time.perf_counter() - start
     variants_per_second = (len(combos) / elapsed_seconds) if elapsed_seconds > 0 else None
     return {
@@ -1501,6 +1807,71 @@ def build_synthetic_smoke_context() -> PreparedBacktestContext:
     return prepare_backtest_context(bars, [], tick_size=0.25, pivot_strength=2, reclaim_window_bars=3)
 
 
+def run_execution_acceleration_benchmark(
+    context: PreparedBacktestContext,
+    universe: EntryStrategyUniverseResult,
+    exit_variants: tuple[ExitVariantSpec, ...],
+    *,
+    sample_size: int,
+) -> dict[str, Any]:
+    """Benchmarks ``_simulate_market_execution_reference`` (slow,
+    unaccelerated) against ``simulate_market_execution`` (accelerated)
+    over an identical, bounded sample of up to ``sample_size`` real
+    (equivalence class, exit variant) combinations from ``universe`` --
+    task 045, requirement 5. Reports *measured* wall-clock timings for
+    both and confirms exact result equality on the sample; never claims
+    a throughput number without measuring it here (the sample is real
+    execution, not a projection).
+
+    ``context`` may be the deterministic synthetic smoke fixture
+    (``build_synthetic_smoke_context()``) or a real market artifact's
+    own prepared context (optionally truncated to a bar prefix) -- see
+    ``main(["benchmark", ...])``."""
+    combos: list[tuple[EntryStrategyEquivalenceClass, ExitVariantSpec]] = []
+    for equivalence_class in universe.equivalence_classes:
+        for variant in exit_variants:
+            combos.append((equivalence_class, variant))
+            if len(combos) >= sample_size:
+                break
+        if len(combos) >= sample_size:
+            break
+
+    bar_range_index = BarRangeIndex.build(context.bars_1m)
+
+    reference_start = time.perf_counter()
+    reference_results = [
+        _simulate_market_execution_reference(
+            equivalence_class.observed_entries, equivalence_class.representative_spec.primary.direction, variant, context,
+            f"{equivalence_class.class_id}::{variant.variant_id}",
+        )
+        for equivalence_class, variant in combos
+    ]
+    reference_elapsed_seconds = time.perf_counter() - reference_start
+
+    accelerated_start = time.perf_counter()
+    accelerated_results = [
+        simulate_market_execution(
+            equivalence_class.observed_entries, equivalence_class.representative_spec.primary.direction, variant, context,
+            f"{equivalence_class.class_id}::{variant.variant_id}", bar_range_index=bar_range_index,
+        )
+        for equivalence_class, variant in combos
+    ]
+    accelerated_elapsed_seconds = time.perf_counter() - accelerated_start
+
+    return {
+        "sample_size": len(combos),
+        "bar_count": len(context.bars_1m),
+        "equivalence_class_count": universe.equivalence_class_count,
+        "exit_variant_count": len(exit_variants),
+        "reference_elapsed_seconds": reference_elapsed_seconds,
+        "accelerated_elapsed_seconds": accelerated_elapsed_seconds,
+        "reference_variants_per_second": (len(combos) / reference_elapsed_seconds) if reference_elapsed_seconds > 0 else None,
+        "accelerated_variants_per_second": (len(combos) / accelerated_elapsed_seconds) if accelerated_elapsed_seconds > 0 else None,
+        "speedup_factor": (reference_elapsed_seconds / accelerated_elapsed_seconds) if accelerated_elapsed_seconds > 0 else None,
+        "exact_result_equality": reference_results == accelerated_results,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -1543,6 +1914,20 @@ def main(argv: list[str] | None = None) -> int:
     smoke.add_argument("--runs-dir", default="runs")
     smoke.add_argument("--min-entries-per-year", type=int, default=1)
 
+    benchmark = sub.add_parser(
+        "benchmark",
+        help="Benchmark the accelerated execution loop (task 045) against the slow reference implementation, on the "
+        "deterministic synthetic fixture by default, or a real market artifact (optionally truncated to a bar prefix) "
+        "-- reports measured baseline/accelerated timings, variants/sec, speedup, and exact-result equality.",
+    )
+    benchmark.add_argument("--market-artifact", type=Path, default=None, help="Optional real market artifact manifest; omit to use the deterministic synthetic fixture.")
+    benchmark.add_argument("--news-csv", type=Path, default=None)
+    benchmark.add_argument("--prefix-bars", type=int, default=None, help="Truncate the loaded real artifact to this many leading bars (ignored without --market-artifact).")
+    benchmark.add_argument("--pivot-strength", type=int, default=2)
+    benchmark.add_argument("--reclaim-window-bars", type=int, default=3)
+    benchmark.add_argument("--min-entries-per-year", type=int, default=1)
+    benchmark.add_argument("--sample-size", type=int, default=200, help="Number of (equivalence class, exit variant) combinations to benchmark.")
+
     args = parser.parse_args(argv)
 
     if args.mode == "run":
@@ -1557,6 +1942,27 @@ def main(argv: list[str] | None = None) -> int:
             pivot_strength=args.pivot_strength, reclaim_window_bars=args.reclaim_window_bars, min_entries_per_year=args.min_entries_per_year,
             throughput_sample_size=args.throughput_sample_size, command="python3 -m tradelab.backtest_v2 preflight",
         )
+    elif args.mode == "benchmark":
+        if args.market_artifact is not None:
+            from tradelab.backtest import prepare_backtest_context
+            from tradelab.market_data_artifact import load_market_data_artifact, load_market_data_series
+            from tradelab.news_loaders import read_news_events_csv
+
+            artifact = load_market_data_artifact(args.market_artifact)
+            series_result = load_market_data_series(artifact, base_dir=args.market_artifact.parent)
+            bars = list(series_result.bars)
+            if args.prefix_bars is not None:
+                bars = bars[: args.prefix_bars]
+            news_events = list(read_news_events_csv(args.news_csv)) if args.news_csv is not None else []
+            context = prepare_backtest_context(bars, news_events, pivot_strength=args.pivot_strength, reclaim_window_bars=args.reclaim_window_bars)
+        else:
+            context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=args.min_entries_per_year
+        )
+        report = run_execution_acceleration_benchmark(context, universe, ALL_EXIT_VARIANTS, sample_size=args.sample_size)
+        print(json.dumps(report, indent=2))
+        return 0
     else:
         context = build_synthetic_smoke_context()
         reporter = create_run(
