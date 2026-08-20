@@ -225,6 +225,7 @@ _DIRECTIONS = (LONG, SHORT)
 DEFAULT_RISK_CONFIG = RiskConfig()
 DEFAULT_EQUITY_CONFIG = EquityConfig()
 DEFAULT_INSTRUMENTS: tuple[Instrument, ...] = (Instrument.MNQ, Instrument.NQ)
+_PRODUCTION_TARGET_CACHE_MAX_ENTRIES = 100_000
 
 
 # ---------------------------------------------------------------------------
@@ -1483,16 +1484,12 @@ def _expand_and_simulate(
         reporter.progress(items_completed=completed, backtests_completed=completed)
         reporter.update_leaderboard(_merged_leaderboard(durable_top_n, top_n, top_n_leaderboard))
 
+    entry_target_cache = EntryTargetCache(max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES)
     for equivalence_class in universe.equivalence_classes:
-        # task 047: one EntryTargetCache per equivalence class, built
-        # fresh here and shared across every exit variant below -- each
-        # observed entry's TP/SL candidates are computed at most once
-        # per class rather than once per (class, variant) pair, since
-        # they are provably identical for the same observed entry
-        # regardless of which exit variant is asking (see tradelab.
-        # entry_target_cache module docstring). Discarded when this
-        # class's own variant loop ends -- never shared across classes.
-        entry_target_cache = EntryTargetCache()
+        # One bounded cache survives the whole prepared run. Multiple
+        # equivalence classes often share the exact same observed event, so
+        # this avoids resolving its TP/SL candidates again. LRU eviction only
+        # causes an exact recomputation and never affects trade results.
         pending_by_variant: list[tuple[ExitVariantSpec, tuple[Instrument, ...]]] = []
         for variant in exit_variants:
             pending_instruments = tuple(

@@ -49,13 +49,13 @@ by, the reference (uncached) simulation at the exact same point in its
 own execution -- see ``tests/test_tradelab_backtest_v2.py``'s randomized
 cached-vs-uncached equivalence test for the proof.
 
-**Scope and memory.** One ``EntryTargetCache`` is built fresh per
-equivalence class (its own ``observed_entries`` are, by construction,
-disjoint in identity from any other class's), threaded through every
-exit variant's own simulation for that one class, and discarded once
-that class's last variant finishes -- never shared across classes,
-never grows without bound. See ``tradelab.backtest_v2``'s own docstring
-for the measured real-data memory estimate.
+**Scope and memory.** Production builds one cache for one prepared run,
+not one cache per equivalence class. Equivalence classes regularly reuse
+the same observed event id, and a result is wholly determined by that id's
+fill context plus the immutable prepared detectors, so cross-class reuse is
+exact. The production cache has a 100,000-entry LRU bound; eviction merely
+causes the ordinary detector call to be repeated and never changes a target.
+Direct callers retain the unbounded default for simple unit use.
 
 Only ever used by ``tradelab.backtest_v2``'s own ``_resolve_tp_
 candidate``/``_resolve_sl_candidate`` -- this module has no dependency
@@ -64,6 +64,8 @@ on ``tradelab.backtest_v2`` itself, only on ``tradelab.tp_targets``/
 small, independently testable primitives.
 """
 from __future__ import annotations
+
+from collections import OrderedDict
 
 from tradelab.sl_targets import SelectedFVGConfluence, SLTargetCandidateResult, detect_sl_target_candidates
 from tradelab.tp_targets import MarketEntryContext, TPTargetCandidateResult, detect_tp_target_candidates
@@ -83,9 +85,27 @@ class EntryTargetCache:
     loop, on one thread, exactly like ``tradelab.bar_range_index.
     BarRangeIndex`` is built once and reused, but never concurrently)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_entries: int | None = None) -> None:
+        if max_entries is not None and max_entries <= 0:
+            raise ValueError("EntryTargetCache.max_entries must be positive or None")
+        self._max_entries = max_entries
         self._tp: dict[str, TPTargetCandidateResult] = {}
         self._sl: dict[tuple[str, str | None], SLTargetCandidateResult] = {}
+        # One LRU order across both namespaces. Eviction is strictly a
+        # performance/memory decision: a missing item is recomputed by the
+        # same exact detector, never approximated.
+        self._recency: OrderedDict[tuple[str, object], None] = OrderedDict()
+
+    def _touch(self, key: tuple[str, object]) -> None:
+        self._recency.pop(key, None)
+        self._recency[key] = None
+        if self._max_entries is not None:
+            while len(self._recency) > self._max_entries:
+                namespace, evicted_key = self._recency.popitem(last=False)[0]
+                if namespace == "tp":
+                    self._tp.pop(evicted_key, None)
+                else:
+                    self._sl.pop(evicted_key, None)
 
     def tp_candidates(
         self,
@@ -96,9 +116,11 @@ class EntryTargetCache:
     ) -> TPTargetCandidateResult:
         cached = self._tp.get(market_entry.entry_id)
         if cached is not None:
+            self._touch(("tp", market_entry.entry_id))
             return cached
         result = detect_tp_target_candidates(market_entry, swing_equal_results, session_results, data_wick_result)
         self._tp[market_entry.entry_id] = result
+        self._touch(("tp", market_entry.entry_id))
         return result
 
     def sl_candidates(
@@ -112,9 +134,11 @@ class EntryTargetCache:
         key = (market_entry.entry_id, confluence_key)
         cached = self._sl.get(key)
         if cached is not None:
+            self._touch(("sl", key))
             return cached
         result = detect_sl_target_candidates(market_entry, confluence, swing_equal_results, session_results)
         self._sl[key] = result
+        self._touch(("sl", key))
         return result
 
     def __len__(self) -> int:
