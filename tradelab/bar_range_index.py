@@ -48,14 +48,44 @@ from datetime import datetime
 from typing import Callable, Sequence
 
 
-def _build_sparse_table(values: Sequence[float], combine: Callable[[float, float], float]) -> tuple[tuple[float, ...], ...]:
+def _sparse_table_cell_count(n: int) -> int:
+    """The exact total number of cells a sparse table over ``n`` values
+    will hold, summed across every level -- level 0 has ``n`` cells,
+    level ``j`` (``j >= 1``) has ``n - 2**j + 1`` -- computed in O(log n)
+    (simulating the level sizes, never materializing them) so real
+    "cells built / cells total" progress (task 046) can be reported
+    honestly, with a real, known denominator, before construction even
+    starts."""
+    if n == 0:
+        return 0
+    total = n
+    j = 1
+    while (1 << j) <= n:
+        total += n - (1 << j) + 1
+        j += 1
+    return total
+
+
+def _build_sparse_table(
+    values: Sequence[float], combine: Callable[[float, float], float], *, on_progress: Callable[[int, int], None] | None = None
+) -> tuple[tuple[float, ...], ...]:
     """Level 0 is ``values`` itself; level ``j`` (for ``j >= 1``) holds,
     at index ``i``, ``combine`` over the window ``[i, i + 2**j)`` --
     computed from two overlapping level-``(j-1)`` windows, exactly the
     standard sparse-table construction. Valid because ``max``/``min``
-    are idempotent (overlap never double-counts, unlike e.g. sum)."""
+    are idempotent (overlap never double-counts, unlike e.g. sum).
+
+    ``on_progress`` (task 046), if given, is called with ``(level,
+    cells_built_so_far)`` once per level as it completes -- real,
+    already-happened progress (every level really did just finish being
+    built), never a fabricated estimate. Each level costs close to
+    O(n), so this gives roughly evenly-spaced progress across the whole
+    O(n log n) build, not just a single callback at the start or end."""
     n = len(values)
     levels: list[tuple[float, ...]] = [tuple(values)]
+    cells_built = n
+    if on_progress is not None:
+        on_progress(0, cells_built)
     if n == 0:
         return tuple(levels)
     j = 1
@@ -64,6 +94,9 @@ def _build_sparse_table(values: Sequence[float], combine: Callable[[float, float
         half = 1 << (j - 1)
         length = n - (1 << j) + 1
         levels.append(tuple(combine(prev[i], prev[i + half]) for i in range(length)))
+        cells_built += length
+        if on_progress is not None:
+            on_progress(j, cells_built)
         j += 1
     return tuple(levels)
 
@@ -92,20 +125,40 @@ class BarRangeIndex:
     _lows_min: tuple[tuple[float, ...], ...]
 
     @staticmethod
-    def build(bars: Sequence) -> "BarRangeIndex":
+    def build(bars: Sequence, *, on_progress: Callable[[str, int, int, int], None] | None = None) -> "BarRangeIndex":
         """``bars`` is any sequence of objects with ``.timestamp``/
         ``.high``/``.low`` (i.e. ``Bar1m``) -- typically ``context.
         bars_1m``. O(n log n) time and O(n log n) space; call this
-        exactly once per bar sequence and reuse the result."""
+        exactly once per bar sequence and reuse the result.
+
+        ``on_progress`` (task 046), if given, is called with ``(stage,
+        level, cells_built, cells_total)`` as construction proceeds --
+        ``stage`` is ``"highs"`` while the range-max table is being
+        built, then ``"lows"`` for the range-min table; ``level`` is the
+        current sparse-table level just completed; ``cells_built``/
+        ``cells_total`` are real, exact counts (summed across *both*
+        tables, so ``cells_built == cells_total`` only on the very last
+        call) -- never an estimate. This exists precisely because
+        building the index is itself real, sometimes multi-second work
+        with no other progress signal (task 046's own root problem: a
+        dashboard polling every second would otherwise see nothing
+        change here at all)."""
         timestamps = tuple(b.timestamp for b in bars)
         highs = [b.high for b in bars]
         lows = [b.low for b in bars]
-        return BarRangeIndex(
-            bar_count=len(bars),
-            timestamps=timestamps,
-            _highs_max=_build_sparse_table(highs, max),
-            _lows_min=_build_sparse_table(lows, min),
-        )
+
+        per_table_cells = _sparse_table_cell_count(len(bars))
+        cells_total = per_table_cells * 2
+
+        highs_progress = None
+        lows_progress = None
+        if on_progress is not None:
+            highs_progress = lambda level, cells_built: on_progress("highs", level, cells_built, cells_total)  # noqa: E731
+            lows_progress = lambda level, cells_built: on_progress("lows", level, per_table_cells + cells_built, cells_total)  # noqa: E731
+
+        highs_max = _build_sparse_table(highs, max, on_progress=highs_progress)
+        lows_min = _build_sparse_table(lows, min, on_progress=lows_progress)
+        return BarRangeIndex(bar_count=len(bars), timestamps=timestamps, _highs_max=highs_max, _lows_min=lows_min)
 
     def find_bar_at_or_after(self, known_at: datetime, start_from: int = 0) -> int | None:
         """Index of the first bar at or after ``known_at``, searching

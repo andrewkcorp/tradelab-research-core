@@ -202,6 +202,9 @@ DASHBOARD_HTML = r"""<!doctype html>
   .badge-completed { background: rgba(52,211,153,0.15); color: var(--good); }
   .badge-failed { background: rgba(248,113,113,0.15); color: var(--bad); }
   .badge-demo { background: rgba(168,85,247,0.18); color: var(--demo); }
+  .badge-mode-indexing { background: rgba(251,191,36,0.15); color: var(--warn); }
+  .badge-mode-resolving { background: rgba(168,85,247,0.15); color: var(--demo); }
+  .badge-mode-simulating { background: rgba(52,211,153,0.15); color: var(--good); }
   .spacer { flex: 1; }
   main { padding: 20px; max-width: 1400px; margin: 0 auto; }
   .demo-banner { background: linear-gradient(90deg, rgba(168,85,247,0.18), rgba(168,85,247,0.05)); border: 1px solid rgba(168,85,247,0.4); color: var(--demo); padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; font-weight: 600; font-size: 13px; display: none; }
@@ -277,12 +280,15 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div id="active-work-empty" class="empty-state">No live activity yet.</div>
     <div id="active-work-content" style="display:none">
       <div class="progress-row">
-        <span class="stat">Operation: <b id="stat-operation">-</b></span>
+        <span id="active-work-mode-badge" class="badge badge-phase">-</span>
         <span class="stat">Strategy variant: <b id="stat-variant-id">-</b></span>
         <span class="stat">Updated: <b id="stat-active-work-updated">-</b></span>
       </div>
+      <div class="progress-row">
+        <span class="stat" id="stat-operation-detail">-</span>
+      </div>
       <div class="progress-row" id="active-work-unit-row">
-        <span class="stat" style="min-width:170px">Variant/sample: <b id="stat-unit-progress">-</b></span>
+        <span class="stat" style="min-width:170px" id="stat-unit-progress-label">Progress: <b id="stat-unit-progress">-</b></span>
         <div class="progress-bar-track"><div id="unit-progress-bar-fill" class="progress-bar-fill" style="width:0%"></div></div>
       </div>
       <div class="progress-row" id="active-work-bars-row">
@@ -411,6 +417,26 @@ function renderCards(status) {
   `).join("");
 }
 
+// task 046: active_work.operation is a free-form string, optionally with
+// ":"-separated detail (e.g. "building_range_index:highs:level_3") -- this
+// maps the *prefix* to one of the four modes the dashboard must clearly
+// distinguish, falling back to the raw operation string (still shown, never
+// hidden) for anything unrecognized so a future/unmapped operation degrades
+// gracefully instead of disappearing.
+const ACTIVE_WORK_MODES = [
+  { prefix: "preparing_data", label: "Preparing data", badgeClass: "badge-phase", unitLabel: "Progress" },
+  { prefix: "discovering_entries", label: "Discovering entries", badgeClass: "badge-phase", unitLabel: "Primaries processed" },
+  { prefix: "building_range_index", label: "Building range index", badgeClass: "badge-mode-indexing", unitLabel: "Cells built" },
+  { prefix: "resolving_entry_targets", label: "Resolving entry targets", badgeClass: "badge-mode-resolving", unitLabel: "Entries resolved" },
+  { prefix: "simulating_backtests", label: "Simulating trade exits", badgeClass: "badge-mode-simulating", unitLabel: "Variant" },
+  { prefix: "sampling_throughput", label: "Simulating trade exits", badgeClass: "badge-mode-simulating", unitLabel: "Sample" },
+];
+function activeWorkMode(operation) {
+  const op = operation || "";
+  const found = ACTIVE_WORK_MODES.find(m => op === m.prefix || op.startsWith(m.prefix + ":"));
+  return found || { label: op || "-", badgeClass: "badge-phase", unitLabel: "Progress" };
+}
+
 // task 044: live_status.active_work is optional -- absent entirely on
 // older run folders written before this field existed, and null on any
 // run (old or new) that isn't currently between heartbeats. Both cases
@@ -427,7 +453,13 @@ function renderActiveWork(status) {
   empty.style.display = "none";
   content.style.display = "block";
 
-  document.getElementById("stat-operation").textContent = work.operation || "-";
+  const mode = activeWorkMode(work.operation);
+  const modeBadge = document.getElementById("active-work-mode-badge");
+  modeBadge.textContent = mode.label;
+  modeBadge.className = "badge " + mode.badgeClass;
+  // the raw operation string carries detail the mode label alone doesn't
+  // (e.g. which sparse-table stage/level) -- shown, not discarded.
+  document.getElementById("stat-operation-detail").textContent = work.operation && work.operation !== mode.prefix ? work.operation : "";
   document.getElementById("stat-variant-id").textContent = work.variant_id || "-";
   document.getElementById("stat-active-work-updated").textContent = fmtAgo(work.updated_at);
 
@@ -436,11 +468,16 @@ function renderActiveWork(status) {
     unitRow.style.display = "none";
   } else {
     unitRow.style.display = "flex";
+    document.getElementById("stat-unit-progress-label").firstChild.textContent = mode.unitLabel + ": ";
     document.getElementById("stat-unit-progress").textContent = fmtNum(work.unit_index) + " / " + (work.unit_total === null || work.unit_total === undefined ? "?" : fmtNum(work.unit_total));
     const unitPct = (work.unit_total && work.unit_total > 0) ? Math.min(100, (work.unit_index / work.unit_total) * 100) : 0;
     document.getElementById("unit-progress-bar-fill").style.width = unitPct + "%";
   }
 
+  // task 046: bars_scanned/bars_total are only ever populated while a bar
+  // is genuinely being scanned (simulating_backtests/sampling_throughput)
+  // -- every other mode leaves them unset, so this row simply doesn't
+  // render rather than showing a stale or fabricated bar count.
   const barsRow = document.getElementById("active-work-bars-row");
   if (work.bars_scanned === null || work.bars_scanned === undefined) {
     barsRow.style.display = "none";

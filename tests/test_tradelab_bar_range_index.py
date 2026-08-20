@@ -130,5 +130,54 @@ class EdgeCaseTests(unittest.TestCase):
         self.assertIsNone(index.find_bar_at_or_after(t0 + timedelta(days=1)))
 
 
+class BuildProgressCallbackTests(unittest.TestCase):
+    """task 046: BarRangeIndex.build's own on_progress callback reports
+    real, exact sparse-table construction progress (stage, level, cells
+    built, cells total) -- never a fabricated estimate -- so a dashboard
+    watching this genuinely multi-step build sees real movement rather
+    than sitting at bars_scanned: 0 for its whole duration."""
+
+    def test_reports_real_monotonic_progress_across_both_stages(self):
+        rng = random.Random(7)
+        bars = _random_bars(rng, 5000)
+        calls = []
+        BarRangeIndex.build(bars, on_progress=lambda stage, level, built, total: calls.append((stage, level, built, total)))
+
+        self.assertGreater(len(calls), 10)  # genuinely multiple levels reported, not just once
+
+        stages_in_order = [c[0] for c in calls]
+        self.assertEqual(set(stages_in_order), {"highs", "lows"})
+        # "highs" entirely completes before "lows" starts -- never interleaved.
+        first_lows_index = stages_in_order.index("lows")
+        self.assertTrue(all(s == "highs" for s in stages_in_order[:first_lows_index]))
+        self.assertTrue(all(s == "lows" for s in stages_in_order[first_lows_index:]))
+
+        built_values = [c[2] for c in calls]
+        self.assertEqual(built_values, sorted(built_values))  # monotonically non-decreasing
+        self.assertEqual(len(set(built_values)), len(built_values))  # strictly increasing -- every call reports genuinely new progress
+
+        totals = {c[3] for c in calls}
+        self.assertEqual(len(totals), 1)  # cells_total never changes mid-build
+        total = totals.pop()
+        self.assertEqual(calls[-1][2], total)  # the very last call reaches exactly 100%
+        self.assertGreater(total, 5000)  # more cells than just the base level -- genuinely counts every sparse-table level
+
+    def test_no_callback_means_no_overhead_and_identical_result(self):
+        rng = random.Random(8)
+        bars = _random_bars(rng, 500)
+        without_callback = BarRangeIndex.build(bars)
+        with_callback = BarRangeIndex.build(bars, on_progress=lambda *a: None)
+        self.assertEqual(without_callback, with_callback)
+
+    def test_empty_bars_reports_nothing_and_never_crashes(self):
+        calls = []
+        index = BarRangeIndex.build([], on_progress=lambda *a: calls.append(a))
+        self.assertEqual(index.bar_count, 0)
+        # never claims nonzero progress for an empty sequence -- whether
+        # that means zero calls or calls reporting 0/0 is an
+        # implementation detail; what matters is honesty.
+        self.assertTrue(all(built <= total for _stage, _level, built, total in calls))
+
+
 if __name__ == "__main__":
     unittest.main()

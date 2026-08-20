@@ -568,6 +568,7 @@ def simulate_market_execution(
     strategy_variant_id: str,
     *,
     on_bar_progress: Callable[[int, int], None] | None = None,
+    on_entry_progress: Callable[[int, int], None] | None = None,
     bar_range_index: BarRangeIndex | None = None,
 ) -> tuple[list[ExecutedTrade], list[SkippedEntryV2]]:
     """**The real, accelerated execution loop (task 045).** Identical
@@ -592,9 +593,25 @@ def simulate_market_execution(
     callers driving many simulations against the same context should
     build it once and pass it to every call, since the O(n log n) build
     cost is only worth paying once. If omitted, one is built on the fly
-    (fine for a single ad-hoc call; wasteful in a loop)."""
+    (fine for a single ad-hoc call; wasteful in a loop).
+
+    ``on_entry_progress`` (task 046), if given, is called with ``(entry_
+    index, total_entries)`` -- 1-based -- at the start of processing each
+    observed entry, *before* that entry's own (possibly non-trivial)
+    news/target-resolution work. This exists specifically for the case
+    ``on_bar_progress`` cannot cover: many observed entries clustered
+    within a small bar range (so ``bar_cursor`` barely advances) each
+    still costing real work to resolve -- without this, the dashboard
+    would see ``bars_scanned`` frozen for a long stretch with no signal
+    that anything is happening at all. Never fabricates a bar count for
+    this: a caller reporting entry-resolution progress should leave
+    ``bars_scanned``/``bars_total`` unset (see ``_expand_and_simulate``'s
+    own wiring) -- showing a stale or invented bar figure while entries,
+    not bars, are actually the unit of work would violate task 046's own
+    "do not fake progress" requirement."""
     bars = context.bars_1m
     total_bars = len(bars)
+    total_entries = len(observed_entries)
     index = bar_range_index if bar_range_index is not None else BarRangeIndex.build(bars)
     trades: list[ExecutedTrade] = []
     skipped: list[SkippedEntryV2] = []
@@ -602,7 +619,9 @@ def simulate_market_execution(
     trade_seq = 0
     bar_cursor = 0
 
-    for entry in observed_entries:
+    for entry_index, entry in enumerate(observed_entries, start=1):
+        if on_entry_progress is not None:
+            on_entry_progress(entry_index, total_entries)
         fill_index = index.find_bar_at_or_after(entry.known_at, bar_cursor)
         advance_to = fill_index if fill_index is not None else len(bars)
 
@@ -768,6 +787,7 @@ def simulate_variant_execution(
     context: PreparedBacktestContext,
     *,
     on_bar_progress: Callable[[int, int], None] | None = None,
+    on_entry_progress: Callable[[int, int], None] | None = None,
     bar_range_index: BarRangeIndex | None = None,
 ) -> tuple[list[ExecutedTrade], list[SkippedEntryV2]]:
     """The **instrument-independent** market execution for one
@@ -796,7 +816,7 @@ def simulate_variant_execution(
     neutral_id = f"{equivalence_class.class_id}::{variant.variant_id}"
     return simulate_market_execution(
         equivalence_class.observed_entries, direction, variant, context, neutral_id,
-        on_bar_progress=on_bar_progress, bar_range_index=bar_range_index,
+        on_bar_progress=on_bar_progress, on_entry_progress=on_entry_progress, bar_range_index=bar_range_index,
     )
 
 
@@ -858,6 +878,7 @@ def run_strategy_variant_backtest(
     risk_config: RiskConfig = DEFAULT_RISK_CONFIG,
     equity_config: EquityConfig = DEFAULT_EQUITY_CONFIG,
     on_bar_progress: Callable[[int, int], None] | None = None,
+    on_entry_progress: Callable[[int, int], None] | None = None,
     bar_range_index: BarRangeIndex | None = None,
 ) -> StrategyVariantResult:
     """Simulate one full (equivalence class, exit variant, instrument)
@@ -874,7 +895,9 @@ def run_strategy_variant_backtest(
     unmodified, straight through to ``simulate_market_execution`` --
     purely observational/accelerating, never read back into anything
     this function returns."""
-    trades, skipped = simulate_variant_execution(equivalence_class, variant, context, on_bar_progress=on_bar_progress, bar_range_index=bar_range_index)
+    trades, skipped = simulate_variant_execution(
+        equivalence_class, variant, context, on_bar_progress=on_bar_progress, on_entry_progress=on_entry_progress, bar_range_index=bar_range_index,
+    )
     return _build_variant_result_for_instrument(equivalence_class, variant, instrument, trades, skipped, risk_config=risk_config, equity_config=equity_config)
 
 
@@ -887,6 +910,7 @@ def run_strategy_variant_backtest_all_instruments(
     risk_config: RiskConfig = DEFAULT_RISK_CONFIG,
     equity_config: EquityConfig = DEFAULT_EQUITY_CONFIG,
     on_bar_progress: Callable[[int, int], None] | None = None,
+    on_entry_progress: Callable[[int, int], None] | None = None,
     bar_range_index: BarRangeIndex | None = None,
 ) -> dict[Instrument, StrategyVariantResult]:
     """Simulate market execution for this (equivalence class, exit
@@ -897,7 +921,9 @@ def run_strategy_variant_backtest_all_instruments(
     called individually -- proven by ``tests/test_tradelab_backtest_v2.
     py``'s own equivalence test -- just without repeating the O(entries +
     exits) simulation work per instrument."""
-    trades, skipped = simulate_variant_execution(equivalence_class, variant, context, on_bar_progress=on_bar_progress, bar_range_index=bar_range_index)
+    trades, skipped = simulate_variant_execution(
+        equivalence_class, variant, context, on_bar_progress=on_bar_progress, on_entry_progress=on_entry_progress, bar_range_index=bar_range_index,
+    )
     return {
         instrument: _build_variant_result_for_instrument(equivalence_class, variant, instrument, trades, skipped, risk_config=risk_config, equity_config=equity_config)
         for instrument in instruments
@@ -1134,6 +1160,21 @@ def _expand_and_simulate(
     market execution for a given (equivalence class, exit variant) is
     only ever (re-)run when at least one of its instruments is still
     pending.
+
+    **True granular liveness (task 046).** Building ``bar_range_index``
+    itself is real, sometimes multi-second work -- ``_build_bar_range_
+    index_with_heartbeat`` reports its own real progress (sparse-table
+    cells built/total) rather than leaving the dashboard frozen at
+    ``bars_scanned: 0`` for its whole duration. Inside the simulation
+    loop, ``on_entry_progress`` (via ``_entry_progress_callback``)
+    reports real entry index/total whenever many observed entries are
+    clustered in a small bar range (so bars barely advance but real
+    per-entry work is still happening) -- never a fabricated bar count.
+    The caller of this function is expected to have already called
+    ``reporter.start_liveness_heartbeat()`` (see ``run_production_
+    backtest_v2``), which independently guarantees ``live_status.json``
+    keeps refreshing at least once a second even through any remaining
+    stretch with no progress callback available at all.
     """
     total_variant_runs = universe.equivalence_class_count * len(exit_variants) * len(instruments)
     reporter.phase_started(RunPhase.EXPANDING_EXIT_VARIANTS, items_total=max(total_variant_runs, 1))
@@ -1141,7 +1182,7 @@ def _expand_and_simulate(
 
     reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=max(total_variant_runs, 1))
     summary_path = reporter.run_dir / "variant_summaries.jsonl"
-    bar_range_index = BarRangeIndex.build(context.bars_1m)
+    bar_range_index = _build_bar_range_index_with_heartbeat(reporter, context.bars_1m)
 
     completed = journal.completed_count()
     durable_top_n = [_leaderboard_entry_from_journal_summary(s) for s in journal.top_n_summaries(top_n_leaderboard)]
@@ -1183,7 +1224,8 @@ def _expand_and_simulate(
             # for each below.
             results_by_instrument = run_strategy_variant_backtest_all_instruments(
                 equivalence_class, variant, tuple(pending_instruments), context, risk_config=risk_config, equity_config=equity_config,
-                on_bar_progress=bar_progress.maybe, bar_range_index=bar_range_index,
+                on_bar_progress=bar_progress.maybe, on_entry_progress=_entry_progress_callback(reporter, variant_id=lead_variant_id),
+                bar_range_index=bar_range_index,
             )
 
             for instrument in pending_instruments:
@@ -1283,6 +1325,48 @@ def _discovery_progress_callback(reporter: RunReporter) -> Callable[[int, int], 
     loop, and this keeps the per-primary call site cheap."""
     throttle = ProgressThrottle(
         lambda processed, total: reporter.heartbeat(operation="discovering_entries", unit_index=processed, unit_total=total)
+    )
+    return throttle.maybe
+
+
+def _build_bar_range_index_with_heartbeat(reporter: RunReporter, bars: tuple[Bar1m, ...]) -> BarRangeIndex:
+    """Builds a ``tradelab.bar_range_index.BarRangeIndex`` while
+    reporting *real* build progress via ``reporter.heartbeat()`` --
+    task 046. Building the index is itself real, sometimes multi-second
+    work (an O(n log n) sparse-table construction) with no other
+    progress signal at all; without this, a dashboard polling every
+    second would see nothing change here, even though real work is
+    genuinely happening. Reports ``operation="building_range_index:
+    {stage}:level_{level}"`` (``stage`` is ``highs`` then ``lows``) with
+    ``unit_index``/``unit_total`` as real, exact sparse-table cell
+    counts -- never bars, since no bar is being "scanned" at this point
+    (task 046's own "do not fake progress" requirement: ``bars_scanned``/
+    ``bars_total`` are deliberately left unset here)."""
+    throttle = ProgressThrottle(
+        lambda stage, level, cells_built, cells_total: reporter.heartbeat(
+            operation=f"building_range_index:{stage}:level_{level}", unit_index=cells_built, unit_total=cells_total,
+        )
+    )
+    return BarRangeIndex.build(bars, on_progress=throttle.maybe)
+
+
+def _entry_progress_callback(reporter: RunReporter, *, variant_id: str) -> Callable[[int, int], None]:
+    """A ``ProgressThrottle``-wrapped adapter reporting real entry-
+    resolution progress (task 046) -- ``operation="resolving_entry_
+    targets"``, with the *entry* index/total (not the variant's own
+    position among the full sweep) as ``unit_index``/``unit_total``,
+    exactly mirroring ``_discovery_progress_callback``'s own convention.
+    This exists for observed entries clustered within a small bar range
+    (so ``bars_scanned`` barely advances) that still cost real work to
+    resolve one at a time -- without it, the dashboard would see
+    ``bars_scanned`` frozen with no signal anything is happening.
+    ``bars_scanned``/``bars_total`` are deliberately never set here: no
+    bar is being scanned while entries are being resolved, and reporting
+    one anyway would fabricate progress task 046 explicitly forbids."""
+    throttle = ProgressThrottle(
+        lambda entry_index, total_entries: reporter.heartbeat(
+            operation="resolving_entry_targets", variant_id=variant_id, unit_index=entry_index, unit_total=total_entries,
+        )
     )
     return throttle.maybe
 
@@ -1406,6 +1490,7 @@ def run_production_backtest_v2(
         reporter, market_artifact_path=market_artifact_path, news_csv_path=news_csv_path, parameters=parameters,
         risk_config=risk_config, equity_config=equity_config, exit_variants=exit_variants, instruments=instruments,
     )
+    reporter.start_liveness_heartbeat()  # task 046 -- guarantees live_status keeps refreshing at least once/sec through every phase, even ones with no finer progress hook
     try:
         from tradelab.backtest import prepare_backtest_context
         from tradelab.market_data_artifact import load_market_data_artifact, load_market_data_series
@@ -1461,6 +1546,7 @@ def run_production_backtest_v2(
         reporter.failed(error=f"{type(exc).__name__}: {exc}", traceback_text=traceback.format_exc())
         raise
     finally:
+        reporter.stop_liveness_heartbeat()
         journal.close()
     return reporter
 
@@ -1550,7 +1636,7 @@ def _measure_sample_throughput(
     per-instrument-redone estimate."""
     combos = list(itertools.islice(_iter_variant_combinations(universe, exit_variants, instruments), sample_size))
     row_byte_sizes: list[int] = []
-    bar_range_index = BarRangeIndex.build(context.bars_1m)
+    bar_range_index = _build_bar_range_index_with_heartbeat(reporter, context.bars_1m) if reporter is not None else BarRangeIndex.build(context.bars_1m)
     completed = 0
     start = time.perf_counter()
     for (_class_id, _variant_id), group in itertools.groupby(combos, key=lambda c: (c[0].class_id, c[1].variant_id)):
@@ -1559,6 +1645,7 @@ def _measure_sample_throughput(
         group_instruments = tuple(c[2] for c in group)
         lead_variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, group_instruments[0].value)
         on_bar_progress = None
+        on_entry_progress = None
         if reporter is not None:
             reporter.heartbeat(
                 operation="sampling_throughput", variant_id=lead_variant_id, unit_index=completed + 1, unit_total=len(combos),
@@ -1571,9 +1658,10 @@ def _measure_sample_throughput(
                 )
             )
             on_bar_progress = bar_progress.maybe
+            on_entry_progress = _entry_progress_callback(reporter, variant_id=lead_variant_id)
         results_by_instrument = run_strategy_variant_backtest_all_instruments(
             equivalence_class, variant, group_instruments, context, risk_config=risk_config, equity_config=equity_config,
-            on_bar_progress=on_bar_progress, bar_range_index=bar_range_index,
+            on_bar_progress=on_bar_progress, on_entry_progress=on_entry_progress, bar_range_index=bar_range_index,
         )
         for instrument in group_instruments:
             result = results_by_instrument[instrument]
@@ -1672,6 +1760,7 @@ def run_preflight_v2(
         },
         run_id=run_id, command=command, is_demo=is_demo,
     )
+    reporter.start_liveness_heartbeat()  # task 046 -- guarantees live_status keeps refreshing at least once/sec through every phase, even ones with no finer progress hook
     try:
         reporter.phase_started(RunPhase.PREPARING_DATA, items_total=4)
         artifact_path = Path(market_artifact_path)
@@ -1748,6 +1837,8 @@ def run_preflight_v2(
     except Exception as exc:  # noqa: BLE001 -- deliberately broad: any failure must be reported, never silently crash the run directory into an inconsistent state
         reporter.failed(error=f"{type(exc).__name__}: {exc}", traceback_text=traceback.format_exc())
         raise
+    finally:
+        reporter.stop_liveness_heartbeat()
     return reporter
 
 
@@ -1982,6 +2073,7 @@ def _run_smoke_pipeline(reporter: RunReporter, context: PreparedBacktestContext,
     production runner uses -- the smoke test's own scale is tiny, but
     it exercises exactly the same durable-summary-stream + bounded-top-N
     orchestration path, not a separate, divergent implementation."""
+    reporter.start_liveness_heartbeat()  # task 046 -- exercises the same liveness machinery a production/preflight run uses
     try:
         reporter.phase_started(RunPhase.PREPARING_DATA, items_total=1)
         reporter.progress(items_completed=1)
@@ -2014,6 +2106,8 @@ def _run_smoke_pipeline(reporter: RunReporter, context: PreparedBacktestContext,
     except Exception as exc:  # noqa: BLE001
         reporter.failed(error=f"{type(exc).__name__}: {exc}", traceback_text=traceback.format_exc())
         raise
+    finally:
+        reporter.stop_liveness_heartbeat()
 
 
 if __name__ == "__main__":

@@ -225,5 +225,89 @@ class LiveActivityBackwardCompatibilityTests(_ServerTestCase):
         self.assertEqual(data["phase"], "preparing_data")  # every other field is still served correctly
 
 
+class GranularOperationModeTests(_ServerTestCase):
+    """task 046: the /status endpoint correctly round-trips each of the
+    new granular operation strings (with their real, per-mode progress
+    fields, and no fabricated bars_scanned) -- this is the server-side
+    half of "dashboard rendering of all new operation modes"; the
+    client-side label mapping itself (ACTIVE_WORK_MODES/
+    activeWorkMode/renderActiveWork in DASHBOARD_HTML) is asserted to be
+    present and correctly labelled below in DashboardHtmlModeLabelTests,
+    and was additionally verified visually in a real browser against
+    each of these four exact payloads."""
+
+    def test_building_range_index_mode_round_trips_with_no_fake_bars(self):
+        reporter = create_run(runs_dir=self.runs_dir, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="run-idx")
+        reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=1)
+        reporter.heartbeat(operation="building_range_index:highs:level_5", unit_index=45000, unit_total=113644)
+        status, body = self._get("/api/runs/run-idx/status")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["active_work"]["operation"], "building_range_index:highs:level_5")
+        self.assertEqual(data["active_work"]["unit_index"], 45000)
+        self.assertEqual(data["active_work"]["unit_total"], 113644)
+        self.assertIsNone(data["active_work"]["bars_scanned"])
+        self.assertIsNone(data["active_work"]["bars_total"])
+
+    def test_resolving_entry_targets_mode_round_trips_with_no_fake_bars(self):
+        reporter = create_run(runs_dir=self.runs_dir, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="run-entries")
+        reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=200)
+        reporter.heartbeat(operation="resolving_entry_targets", variant_id="CLASS_A::v1::MNQ", unit_index=37, unit_total=420)
+        status, body = self._get("/api/runs/run-entries/status")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["active_work"]["operation"], "resolving_entry_targets")
+        self.assertEqual(data["active_work"]["variant_id"], "CLASS_A::v1::MNQ")
+        self.assertEqual(data["active_work"]["unit_index"], 37)
+        self.assertEqual(data["active_work"]["unit_total"], 420)
+        self.assertIsNone(data["active_work"]["bars_scanned"])
+
+    def test_preparing_data_substep_mode_round_trips(self):
+        reporter = create_run(runs_dir=self.runs_dir, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="run-prep")
+        reporter.phase_started(RunPhase.PREPARING_DATA, items_total=1)
+        reporter.heartbeat(operation="preparing_data:fvg_detection:5m")
+        status, body = self._get("/api/runs/run-prep/status")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["active_work"]["operation"], "preparing_data:fvg_detection:5m")
+
+    def test_simulating_backtests_mode_still_carries_real_bars(self):
+        reporter = create_run(runs_dir=self.runs_dir, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="run-sim")
+        reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=200)
+        reporter.heartbeat(
+            operation="simulating_backtests", variant_id="CLASS_A::v1::MNQ", unit_index=121, unit_total=200,
+            bars_scanned=734211, bars_total=1057182,
+        )
+        status, body = self._get("/api/runs/run-sim/status")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["active_work"]["bars_scanned"], 734211)
+        self.assertEqual(data["active_work"]["bars_total"], 1057182)
+
+
+class DashboardHtmlModeLabelTests(_ServerTestCase):
+    """task 046: the shipped dashboard page must contain the client-side
+    mode-mapping logic and all four required, clearly-distinguishable
+    mode labels -- a lightweight, always-run substitute for a JS test
+    runner (which this project deliberately has none of, matching its
+    own no-external-frontend-dependencies constraint); the actual
+    rendering was verified visually in a real browser for every mode."""
+
+    def test_all_four_required_mode_labels_are_present(self):
+        for label in ("Preparing data", "Building range index", "Resolving entry targets", "Simulating trade exits"):
+            self.assertIn(label, DASHBOARD_HTML, msg=f"missing mode label: {label!r}")
+
+    def test_operation_prefix_mapping_covers_the_new_operations(self):
+        for prefix in ("preparing_data", "building_range_index", "resolving_entry_targets", "simulating_backtests", "sampling_throughput"):
+            self.assertIn(f'"{prefix}"', DASHBOARD_HTML, msg=f"missing operation prefix mapping: {prefix!r}")
+
+    def test_bars_row_stays_conditionally_hidden_logic_is_present(self):
+        # the existing (task 044) "hide the bars row when bars_scanned is
+        # unset" guard must still be present -- this is precisely what
+        # keeps building_range_index/resolving_entry_targets from ever
+        # rendering a stale/fake bar count.
+        self.assertIn("work.bars_scanned === null", DASHBOARD_HTML)
+
+
 if __name__ == "__main__":
     unittest.main()

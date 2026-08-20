@@ -1182,6 +1182,149 @@ class DirtyWorkingTreeRejectionTests(unittest.TestCase):
             self.assertFalse((runs_dir / "dirty-before-anything-run").exists())
 
 
+class LivenessHeartbeatWiringTests(unittest.TestCase):
+    """task 046: run_production_backtest_v2, run_preflight_v2, and the
+    CLI smoke test all start the background liveness thread before doing
+    any real work and stop it exactly once the run reaches a terminal
+    state -- proven via a call-count spy (never relying on timing), plus
+    a genuine failure case proving the thread is stopped even when the
+    run itself raises."""
+
+    def test_production_run_starts_and_stops_liveness_heartbeat_exactly_once(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
+            runs_dir = tmp / "runs"
+
+            starts, stops = [], []
+            orig_start, orig_stop = RunReporter.start_liveness_heartbeat, RunReporter.stop_liveness_heartbeat
+
+            def spy_start(self, **kwargs):
+                starts.append(1)
+                return orig_start(self, **kwargs)
+
+            def spy_stop(self, **kwargs):
+                stops.append(1)
+                return orig_stop(self, **kwargs)
+
+            with patch.object(RunReporter, "start_liveness_heartbeat", spy_start), patch.object(RunReporter, "stop_liveness_heartbeat", spy_stop):
+                with patch("tradelab.backtest_v2._current_git_provenance", return_value=("test-commit", False)):
+                    run_production_backtest_v2(
+                        market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                        pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1, command="test",
+                    )
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(len(stops), 1)
+
+    def test_preflight_starts_and_stops_liveness_heartbeat_exactly_once(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
+            runs_dir = tmp / "runs"
+
+            starts, stops = [], []
+            orig_start, orig_stop = RunReporter.start_liveness_heartbeat, RunReporter.stop_liveness_heartbeat
+
+            def spy_start(self, **kwargs):
+                starts.append(1)
+                return orig_start(self, **kwargs)
+
+            def spy_stop(self, **kwargs):
+                stops.append(1)
+                return orig_stop(self, **kwargs)
+
+            with patch.object(RunReporter, "start_liveness_heartbeat", spy_start), patch.object(RunReporter, "stop_liveness_heartbeat", spy_stop):
+                run_preflight_v2(
+                    market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                    pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1, command="test",
+                )
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(len(stops), 1)
+
+    def test_smoke_test_starts_and_stops_liveness_heartbeat_exactly_once(self):
+        starts, stops = [], []
+        orig_start, orig_stop = RunReporter.start_liveness_heartbeat, RunReporter.stop_liveness_heartbeat
+
+        def spy_start(self, **kwargs):
+            starts.append(1)
+            return orig_start(self, **kwargs)
+
+        def spy_stop(self, **kwargs):
+            stops.append(1)
+            return orig_stop(self, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(RunReporter, "start_liveness_heartbeat", spy_start), patch.object(RunReporter, "stop_liveness_heartbeat", spy_stop):
+                exit_code = backtest_v2_main(["smoke-test", "--runs-dir", tmp, "--min-entries-per-year", "1"])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(len(stops), 1)
+
+    def test_liveness_heartbeat_is_stopped_even_when_the_run_fails(self):
+        # a real failure (an incompatible resume, refused before any
+        # simulation) must still stop the thread it started -- a thread
+        # leaked on the failure path would be a real bug, not cosmetic.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
+            runs_dir = tmp / "runs"
+
+            stops = []
+            orig_stop = RunReporter.stop_liveness_heartbeat
+
+            def spy_stop(self, **kwargs):
+                stops.append(1)
+                return orig_stop(self, **kwargs)
+
+            with patch.object(RunReporter, "stop_liveness_heartbeat", spy_stop):
+                with patch("tradelab.backtest_v2._current_git_provenance", return_value=("test-commit", False)):
+                    run_production_backtest_v2(
+                        market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                        pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                        run_id="fail-liveness-run", command="test",
+                    )
+                    with self.assertRaises(ValueError):
+                        run_production_backtest_v2(
+                            market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                            pivot_strength=3, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                            run_id="fail-liveness-run", command="test",
+                        )
+            # the second call's own journal-mismatch ValueError is raised
+            # before _open_journal (and thus before start_liveness_
+            # heartbeat) is ever reached -- so only the first, successful
+            # call's own start/stop pair happened. This proves the
+            # *successful* run's thread was cleanly stopped, not leaked;
+            # see DirtyWorkingTreeRejectionTests for a case that fails
+            # after start_liveness_heartbeat has already run.
+            self.assertEqual(len(stops), 1)
+
+    def test_liveness_heartbeat_stopped_after_a_failure_that_occurs_after_starting_it(self):
+        # unlike the mismatch case above, a failure *inside* the try block
+        # (after start_liveness_heartbeat has already run) must still
+        # reach stop_liveness_heartbeat via the finally clause.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
+            runs_dir = tmp / "runs"
+
+            stops = []
+            orig_stop = RunReporter.stop_liveness_heartbeat
+
+            def spy_stop(self, **kwargs):
+                stops.append(1)
+                return orig_stop(self, **kwargs)
+
+            with patch.object(RunReporter, "stop_liveness_heartbeat", spy_stop):
+                with patch("tradelab.backtest_v2._current_git_provenance", return_value=("test-commit", False)):
+                    with patch("tradelab.backtest_v2.discover_entry_strategy_universe", side_effect=RuntimeError("boom")):
+                        with self.assertRaises(RuntimeError):
+                            run_production_backtest_v2(
+                                market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                                pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1, command="test",
+                            )
+            self.assertEqual(len(stops), 1)
+
+
 class PreflightTests(unittest.TestCase):
     """Preflight correctness (task 043 requirement 2): the artifact's
     counts must exactly match an independent, direct call to ``discover_
@@ -1316,6 +1459,61 @@ class BarProgressCallbackTests(unittest.TestCase):
         self.assertLess(len(fired), len(context.bars_1m))
 
 
+class EntryProgressCallbackTests(unittest.TestCase):
+    """task 046: on_entry_progress reports real (entry_index, total_
+    entries) -- 1-based -- as simulate_market_execution processes each
+    observed entry, purely observationally (never changes trades,
+    skipped entries, or any other result field), and independently of
+    on_bar_progress (many entries can be resolved while bars barely
+    advance)."""
+
+    def _one_real_variant(self):
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=1
+        )
+        self.assertGreater(universe.equivalence_class_count, 0)
+        equivalence_class = max(universe.equivalence_classes, key=lambda c: len(c.observed_entries))
+        self.assertGreater(len(equivalence_class.observed_entries), 10)  # a genuinely multi-entry scenario
+        return context, equivalence_class, ALL_EXIT_VARIANTS[0], DEFAULT_INSTRUMENTS[0]
+
+    def test_callback_reports_every_entry_in_order_starting_at_one(self):
+        context, equivalence_class, variant, instrument = self._one_real_variant()
+        calls = []
+        run_strategy_variant_backtest(
+            equivalence_class, variant, instrument, context, on_entry_progress=lambda idx, total: calls.append((idx, total))
+        )
+        total_entries = len(equivalence_class.observed_entries)
+        self.assertEqual(calls, [(i, total_entries) for i in range(1, total_entries + 1)])  # exactly once per entry, in order, no gaps/dupes
+
+    def test_callback_never_changes_the_simulated_result(self):
+        context, equivalence_class, variant, instrument = self._one_real_variant()
+        without_callback = run_strategy_variant_backtest(equivalence_class, variant, instrument, context)
+        calls = []
+        with_callback = run_strategy_variant_backtest(
+            equivalence_class, variant, instrument, context, on_entry_progress=lambda i, t: calls.append((i, t))
+        )
+        self.assertGreater(len(calls), 0)
+        self.assertEqual(without_callback.trades, with_callback.trades)
+        self.assertEqual(without_callback.trade_count, with_callback.trade_count)
+        self.assertEqual(without_callback.net_pnl_usd, with_callback.net_pnl_usd)
+        self.assertEqual(without_callback.skipped_entries_by_reason, with_callback.skipped_entries_by_reason)
+        self.assertEqual(without_callback.strategy_variant_id, with_callback.strategy_variant_id)
+
+    def test_entry_progress_and_bar_progress_are_independent_signals(self):
+        # both callbacks fire during the same simulation -- entry progress
+        # doesn't suppress bar progress or vice versa.
+        context, equivalence_class, variant, instrument = self._one_real_variant()
+        entry_calls = []
+        bar_calls = []
+        run_strategy_variant_backtest(
+            equivalence_class, variant, instrument, context,
+            on_entry_progress=lambda i, t: entry_calls.append((i, t)), on_bar_progress=lambda s, t: bar_calls.append((s, t)),
+        )
+        self.assertGreater(len(entry_calls), 0)
+        self.assertGreater(len(bar_calls), 0)
+
+
 class ExpandAndSimulateHeartbeatTests(unittest.TestCase):
     """task 044: _expand_and_simulate reports a live heartbeat (current
     strategy_variant_id, 1-based position among total_variant_runs) for
@@ -1377,6 +1575,40 @@ class ExpandAndSimulateHeartbeatTests(unittest.TestCase):
         # same completed count and the exact same final leaderboard.
         self.assertEqual(completed_observed, completed_baseline)
         self.assertEqual([e.to_dict() for e in leaderboard_observed], [e.to_dict() for e in leaderboard_baseline])
+
+    def test_building_range_index_and_entry_resolution_progress_are_reported_without_faking_bars(self):
+        # task 046: the two operations that previously left live_status
+        # frozen (BarRangeIndex construction, and target resolution for
+        # entries clustered in a small bar range) must both actually
+        # report real progress, and neither may ever claim a bars_scanned
+        # value -- no bar is genuinely being scanned during either.
+        context, universe = self._universe_and_context()
+
+        calls = []
+        orig = RunReporter.heartbeat
+
+        def spy(self, **kwargs):
+            calls.append(dict(kwargs))
+            return orig(self, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run(tmp, "observed", universe, context, spy=spy)
+
+        index_calls = [c for c in calls if c["operation"].startswith("building_range_index")]
+        entry_calls = [c for c in calls if c["operation"] == "resolving_entry_targets"]
+
+        self.assertGreater(len(index_calls), 0)  # the build genuinely got observed at least once
+        self.assertGreater(len(entry_calls), 0)
+
+        # real, exact sparse-table cell progress -- never bars.
+        self.assertTrue(all(c.get("unit_index") is not None and c.get("unit_total") is not None for c in index_calls))
+        self.assertTrue(all(c.get("bars_scanned") is None for c in index_calls))
+
+        # real entry index/total -- never bars, and every call carries a
+        # real strategy_variant_id so the dashboard knows which variant.
+        self.assertTrue(all(c.get("unit_index") is not None and c.get("unit_total") is not None for c in entry_calls))
+        self.assertTrue(all(c.get("bars_scanned") is None for c in entry_calls))
+        self.assertTrue(all(c.get("variant_id") for c in entry_calls))
 
     def test_rate_limit_is_never_violated_even_when_every_variant_completes_within_the_same_instant(self):
         # The production analogue of the preflight adversarial test below:

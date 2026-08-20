@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -529,6 +530,185 @@ class HeartbeatTests(unittest.TestCase):
             reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=10)
             with self.assertRaises(ValueError):
                 reporter.heartbeat(operation="")
+
+
+class LivenessHeartbeatThreadTests(unittest.TestCase):
+    """task 046: RunReporter.start_liveness_heartbeat/stop_liveness_
+    heartbeat -- a background thread that keeps live_status.json
+    refreshing (updated_at, elapsed_seconds, fresh CPU/RAM) at least
+    once a second even during a long operation that never itself calls
+    heartbeat() or any other reporter method; thread-safe with respect
+    to heartbeat()'s own once-per-second write cap (the two share it,
+    never exceeding one write/second combined); never appends to
+    progress_events.jsonl."""
+
+    def test_refreshes_repeatedly_during_a_long_callback_free_operation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.PREPARING_DATA, items_total=1)
+            reporter.heartbeat(operation="building_range_index", unit_index=1, unit_total=1000)
+
+            # a small, patched throttle + a fast polling interval keeps this
+            # test fast and still genuinely exercises real, un-mocked
+            # threading and real (short) wall-clock sleeps -- deterministic
+            # in the sense that the assertion is a generous lower bound, not
+            # a fragile exact count.
+            seen_timestamps = set()
+            with patch("tradelab.research_run._HEARTBEAT_MIN_INTERVAL_SECONDS", 0.02):
+                reporter.start_liveness_heartbeat(interval_seconds=0.01)
+                try:
+                    # simulates "a long operation with no completed
+                    # high-level milestone" -- the main thread does nothing
+                    # else here, exactly like being deep inside a single
+                    # expensive call with no progress hook.
+                    for _ in range(8):
+                        time.sleep(0.04)
+                        seen_timestamps.add(read_live_status(reporter.run_dir).active_work["updated_at"])
+                finally:
+                    reporter.stop_liveness_heartbeat()
+
+            self.assertGreater(len(seen_timestamps), 3)  # genuinely refreshed multiple times, not stuck on one value
+
+    def test_operation_and_progress_are_never_fabricated_by_the_liveness_tick(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.PREPARING_DATA, items_total=1)
+            reporter.heartbeat(operation="building_range_index", unit_index=42, unit_total=1000)
+
+            with patch("tradelab.research_run._HEARTBEAT_MIN_INTERVAL_SECONDS", 0.02):
+                reporter.start_liveness_heartbeat(interval_seconds=0.01)
+                try:
+                    time.sleep(0.15)
+                finally:
+                    reporter.stop_liveness_heartbeat()
+
+            status = read_live_status(reporter.run_dir)
+            # the tick refreshed updated_at (proving it genuinely ran) but
+            # never touched the real operation/progress fields -- exactly
+            # "still working on X, no fresher position info yet", never a
+            # fabricated bar/unit count.
+            self.assertEqual(status.active_work["operation"], "building_range_index")
+            self.assertEqual(status.active_work["unit_index"], 42)
+            self.assertEqual(status.active_work["unit_total"], 1000)
+
+    def test_never_appends_a_progress_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.PREPARING_DATA, items_total=1)
+            events_before = read_progress_events(reporter.run_dir)
+
+            with patch("tradelab.research_run._HEARTBEAT_MIN_INTERVAL_SECONDS", 0.02):
+                reporter.start_liveness_heartbeat(interval_seconds=0.01)
+                try:
+                    time.sleep(0.15)
+                finally:
+                    reporter.stop_liveness_heartbeat()
+
+            self.assertEqual(read_progress_events(reporter.run_dir), events_before)
+
+    def test_thread_safe_combined_with_explicit_heartbeat_calls_never_exceeds_the_cap(self):
+        # A second thread hammering heartbeat() concurrently with the
+        # liveness thread's own ticking -- proves the write-throttle
+        # decision is genuinely shared (locked), not just "usually fine".
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.PREPARING_DATA, items_total=1)
+
+            write_count = 0
+            write_count_lock = threading.Lock()
+            orig = type(reporter).heartbeat
+
+            def counting_heartbeat(self, **kwargs):
+                nonlocal write_count
+                wrote = orig(self, **kwargs)
+                if wrote:
+                    with write_count_lock:
+                        write_count += 1
+                return wrote
+
+            stop_hammering = threading.Event()
+
+            def _hammer():
+                i = 0
+                while not stop_hammering.is_set():
+                    counting_heartbeat(reporter, operation="resolving_entry_targets", unit_index=i, unit_total=100000)
+                    i += 1
+
+            with patch("tradelab.research_run._HEARTBEAT_MIN_INTERVAL_SECONDS", 0.05):
+                reporter.start_liveness_heartbeat(interval_seconds=0.01)
+                hammer_thread = threading.Thread(target=_hammer)
+                hammer_thread.start()
+                try:
+                    time.sleep(0.22)
+                finally:
+                    stop_hammering.set()
+                    hammer_thread.join(timeout=2)
+                    reporter.stop_liveness_heartbeat()
+
+            # ~0.22s at a 0.05s cap -> at most ~5-6 writes total from BOTH
+            # sources combined -- nowhere close to the thousands of
+            # hammer() calls actually made.
+            self.assertLessEqual(write_count, 8)
+
+    def test_idempotent_start_and_safe_stop_without_ever_starting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.PREPARING_DATA, items_total=1)
+
+            reporter.stop_liveness_heartbeat()  # never started -- must not raise
+
+            reporter.start_liveness_heartbeat(interval_seconds=0.01)
+            first_thread = reporter._liveness_thread
+            reporter.start_liveness_heartbeat(interval_seconds=0.01)  # second call is a no-op
+            self.assertIs(reporter._liveness_thread, first_thread)
+
+            reporter.stop_liveness_heartbeat()
+            self.assertIsNone(reporter._liveness_thread)
+            self.assertFalse(first_thread.is_alive())
+
+    def test_concurrent_writes_from_the_main_thread_and_the_liveness_thread_never_race(self):
+        # Regression test: atomic_write_json's own temp file was
+        # originally named from the process id alone, shared by every
+        # thread -- the liveness thread and the main thread flushing
+        # live_status.json at the same instant could each grab the
+        # *same* temp path, and whichever thread's os.replace() ran
+        # second would raise FileNotFoundError (the first thread's
+        # os.replace already consumed/renamed the shared temp file out
+        # from under it). Hammers both sides concurrently, with the
+        # throttle patched wide open so both are writing constantly, and
+        # asserts no exception ever escapes either thread.
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=1000)
+
+            errors: list[BaseException] = []
+            stop = threading.Event()
+
+            def _main_thread_writer():
+                i = 0
+                while not stop.is_set():
+                    try:
+                        reporter.progress(items_completed=i % 1000, backtests_completed=i)
+                        reporter.update_leaderboard([])
+                    except BaseException as exc:  # noqa: BLE001 -- must catch everything to prove none occurred
+                        errors.append(exc)
+                        return
+                    i += 1
+
+            with patch("tradelab.research_run._HEARTBEAT_MIN_INTERVAL_SECONDS", 0.0):
+                reporter.start_liveness_heartbeat(interval_seconds=0.001)
+                writer_thread = threading.Thread(target=_main_thread_writer)
+                writer_thread.start()
+                try:
+                    time.sleep(0.3)
+                finally:
+                    stop.set()
+                    writer_thread.join(timeout=5)
+                    reporter.stop_liveness_heartbeat()
+
+            self.assertEqual(errors, [])
+            # the run directory is still left in a fully coherent state.
+            self.assertEqual(read_live_status(reporter.run_dir).phase, "simulating_backtests")
 
 
 class LiveStatusBackwardCompatibilityTests(unittest.TestCase):

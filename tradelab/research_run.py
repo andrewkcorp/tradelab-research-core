@@ -69,9 +69,10 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dataclasses_replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -208,10 +209,22 @@ def atomic_write_json(path: Path | str, payload: Mapping[str, Any]) -> None:
     directory, ``fsync``'d, then ``os.replace`` -- see module docstring.
     On any failure the temp file is removed and the exception
     propagates; ``path`` itself is left untouched (either its previous
-    content, or never created at all)."""
+    content, or never created at all).
+
+    The temp filename includes both the PID *and* the calling thread's
+    own identity (task 046) -- two threads in the same process racing to
+    write the *same* path (e.g. ``RunReporter``'s own liveness thread
+    and its main thread both flushing ``live_status.json``) each get
+    their own temp file, so neither's ``os.replace`` can ever race
+    against a temp file the other has already consumed. This is a
+    file-level safety net; ``RunReporter`` itself additionally
+    serializes *which* thread's write actually happens via its own lock
+    (see ``RunReporter._flush_status``) -- this just guarantees that
+    even an unsynchronized concurrent caller can never crash with a
+    ``FileNotFoundError`` racing on a shared temp path."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, sort_keys=True)
@@ -609,6 +622,13 @@ class RunReporter:
         self._errors: list[str] = []
         self._active_work: ActiveWork | None = None
         self._last_heartbeat_monotonic: float | None = None
+        # task 046: an RLock (not a plain Lock) -- _flush_status() itself
+        # acquires this too (see its own docstring), and heartbeat()/
+        # _tick_liveness() already hold it when they call _flush_status(),
+        # so a plain Lock would deadlock on that reentrant acquisition.
+        self._heartbeat_lock = threading.RLock()
+        self._liveness_thread: threading.Thread | None = None
+        self._liveness_stop_event: threading.Event | None = None
 
     @property
     def run_dir(self) -> Path:
@@ -632,8 +652,9 @@ class RunReporter:
         self._items_total = items_total
         self._items_completed = 0 if items_total is not None else None
         self._progress_samples = []
-        self._active_work = None  # stale in-flight status from the previous phase must not linger
-        self._last_heartbeat_monotonic = None
+        with self._heartbeat_lock:  # task 046 -- the liveness thread must never read a torn active_work mid-transition
+            self._active_work = None  # stale in-flight status from the previous phase must not linger
+            self._last_heartbeat_monotonic = None
         self._append_event("phase_started", {"items_total": items_total})
         self._flush_status()
 
@@ -750,12 +771,27 @@ class RunReporter:
         refreshes ``resource_usage`` with a fresh, un-logged CPU/RSS
         sample -- so CPU/RAM stay visibly live during long work without
         needing their own separate once-a-second event either.
+
+        **Thread-safe (task 046)**: the write-throttle decision is made
+        under the same lock ``start_liveness_heartbeat()``'s background
+        thread uses for its own tick, so the two together still never
+        write more than once per second combined -- see that method's
+        own docstring.
         """
         _require(bool(operation), "heartbeat(operation=...) must be non-empty")
-        self._active_work = ActiveWork(
+        active_work = ActiveWork(
             operation=operation, variant_id=variant_id, unit_index=unit_index, unit_total=unit_total,
             bars_scanned=bars_scanned, bars_total=bars_total, updated_at=_utc_now_iso(),
         )
+        with self._heartbeat_lock:
+            self._active_work = active_work
+            return self._maybe_write_heartbeat_locked()
+
+    def _maybe_write_heartbeat_locked(self) -> bool:
+        """The shared, once-per-second-throttled write decision behind
+        both ``heartbeat()`` (new operation/progress data) and
+        ``_tick_liveness()`` (no new data -- a bare liveness refresh) --
+        task 046. Caller must already hold ``self._heartbeat_lock``."""
         now = time.monotonic()
         if self._last_heartbeat_monotonic is not None and (now - self._last_heartbeat_monotonic) < _HEARTBEAT_MIN_INTERVAL_SECONDS:
             return False
@@ -765,6 +801,75 @@ class RunReporter:
             self._resource_usage = ResourceUsage(rss_bytes=rss_bytes, cpu_seconds=cpu_seconds)
         self._flush_status()
         return True
+
+    def _tick_liveness(self) -> bool:
+        """task 046: called only by the background liveness thread,
+        roughly once per ``interval_seconds`` (see ``start_liveness_
+        heartbeat``) -- refreshes ``live_status.json`` (``updated_at``,
+        ``elapsed_seconds``, a fresh CPU/RAM sample) using whatever
+        ``active_work`` is already recorded, **without inventing any new
+        operation or progress data**. This is what guarantees ``live_
+        status`` keeps refreshing at least once a second even while the
+        main thread is deep inside a single long, callback-free
+        operation (e.g. building a ``tradelab.bar_range_index.
+        BarRangeIndex``, or a detector phase with no intra-phase
+        progress hook) -- "still working on X, N seconds elapsed" is
+        genuinely true and worth showing, never a fabricated bar count
+        or fake sub-progress. Shares ``heartbeat()``'s own once-per-
+        second write cap via the same lock -- see ``_maybe_write_
+        heartbeat_locked``."""
+        with self._heartbeat_lock:
+            if self._active_work is not None:
+                # bump updated_at on the *existing* snapshot so "updated
+                # Ns ago" reflects this genuine tick, not a stale
+                # timestamp from whenever the operation last changed.
+                self._active_work = _dataclasses_replace(self._active_work, updated_at=_utc_now_iso())
+            return self._maybe_write_heartbeat_locked()
+
+    def start_liveness_heartbeat(self, *, interval_seconds: float = 1.0) -> None:
+        """task 046: starts a daemon background thread that calls
+        ``_tick_liveness()`` roughly every ``interval_seconds``, for as
+        long as this reporter's run is active. Guarantees ``live_status.
+        json`` keeps refreshing at least once a second even during a
+        long, single operation with no completed high-level milestone
+        and no finer progress callback available -- never fabricates
+        new operation/progress data, only confirms the process is still
+        alive and current on whatever it last genuinely reported.
+
+        Idempotent: calling this twice on an already-started reporter is
+        a no-op. Always pair with ``stop_liveness_heartbeat()`` (ideally
+        in a ``try``/``finally``) once the run reaches a terminal state
+        -- the thread itself is a daemon (never blocks process exit on
+        its own), but leaving it running past a run's own lifetime
+        wastes a thread and keeps sampling resource usage for no
+        reason."""
+        if self._liveness_thread is not None:
+            return
+        stop_event = threading.Event()
+
+        def _loop() -> None:
+            while not stop_event.wait(interval_seconds):
+                try:
+                    self._tick_liveness()
+                except Exception:  # noqa: BLE001 -- a liveness thread must never crash the run it's monitoring
+                    pass
+
+        thread = threading.Thread(target=_loop, name=f"RunReporter-liveness-{self.run_id}", daemon=True)
+        self._liveness_stop_event = stop_event
+        self._liveness_thread = thread
+        thread.start()
+
+    def stop_liveness_heartbeat(self, *, timeout: float = 5.0) -> None:
+        """Stops the background liveness thread started by ``start_
+        liveness_heartbeat()``, if any, and waits (bounded by
+        ``timeout``) for it to actually exit. A no-op if no thread is
+        running."""
+        if self._liveness_thread is None:
+            return
+        self._liveness_stop_event.set()
+        self._liveness_thread.join(timeout=timeout)
+        self._liveness_thread = None
+        self._liveness_stop_event = None
 
     def update_leaderboard(self, entries: Sequence[LeaderboardEntry]) -> None:
         for entry in entries:
@@ -849,22 +954,38 @@ class RunReporter:
         )
 
     def _flush_status(self) -> None:
-        eta_seconds, eta_basis = self._compute_eta()
-        status = LiveStatus(
-            schema_version=RUN_ARTIFACT_SCHEMA_VERSION, run_id=self.run_id, updated_at=_utc_now_iso(),
-            phase=(self._phase.value if self._phase is not None else RunPhase.PREPARING_DATA.value),
-            is_demo=self._manifest.is_demo, items_completed=self._items_completed, items_total=self._items_total,
-            elapsed_seconds=self._elapsed_seconds(), throughput_per_second=self._compute_throughput(),
-            eta_seconds=eta_seconds, eta_basis=eta_basis,
-            latest_checkpoint=(self._latest_checkpoint.to_dict() if self._latest_checkpoint is not None else None),
-            resource_usage=(self._resource_usage.to_dict() if self._resource_usage is not None else None),
-            discovered_specs=self._discovered_specs, rejected_specs=self._rejected_specs, eligible_specs=self._eligible_specs,
-            unique_entry_classes=self._unique_entry_classes, exit_variants_generated=self._exit_variants_generated,
-            backtests_completed=self._backtests_completed, top_strategies=self._top_strategies,
-            warnings=tuple(self._warnings), errors=tuple(self._errors),
-            active_work=(self._active_work.to_dict() if self._active_work is not None else None),
-        )
-        atomic_write_json(self._run_dir / "live_status.json", status.to_dict())
+        """Writes ``live_status.json`` -- task 046: guarded by the same
+        ``self._heartbeat_lock`` ``heartbeat()``/``_tick_liveness()`` use
+        for their own throttle decision (an ``RLock``, so their own
+        already-held lock reenters here without deadlocking). Every
+        *other* caller (``progress()``, ``phase_started()``, ``checkpoint_
+        written()``, ``update_leaderboard()``, ``completed()``,
+        ``failed()``, ...) runs only on the main thread in normal use,
+        but the background liveness thread can call ``_tick_liveness()``
+        at literally any moment -- without this lock, two threads
+        writing ``live_status.json`` at the same instant could race on
+        ``atomic_write_json``'s own temp-file rename (``os.replace``)
+        and raise ``FileNotFoundError``. Serializing every write here
+        closes that race at its root, rather than only papering over the
+        file-level symptom (``atomic_write_json`` also gives each thread
+        its own temp filename as a second, independent safety net)."""
+        with self._heartbeat_lock:
+            eta_seconds, eta_basis = self._compute_eta()
+            status = LiveStatus(
+                schema_version=RUN_ARTIFACT_SCHEMA_VERSION, run_id=self.run_id, updated_at=_utc_now_iso(),
+                phase=(self._phase.value if self._phase is not None else RunPhase.PREPARING_DATA.value),
+                is_demo=self._manifest.is_demo, items_completed=self._items_completed, items_total=self._items_total,
+                elapsed_seconds=self._elapsed_seconds(), throughput_per_second=self._compute_throughput(),
+                eta_seconds=eta_seconds, eta_basis=eta_basis,
+                latest_checkpoint=(self._latest_checkpoint.to_dict() if self._latest_checkpoint is not None else None),
+                resource_usage=(self._resource_usage.to_dict() if self._resource_usage is not None else None),
+                discovered_specs=self._discovered_specs, rejected_specs=self._rejected_specs, eligible_specs=self._eligible_specs,
+                unique_entry_classes=self._unique_entry_classes, exit_variants_generated=self._exit_variants_generated,
+                backtests_completed=self._backtests_completed, top_strategies=self._top_strategies,
+                warnings=tuple(self._warnings), errors=tuple(self._errors),
+                active_work=(self._active_work.to_dict() if self._active_work is not None else None),
+            )
+            atomic_write_json(self._run_dir / "live_status.json", status.to_dict())
 
 
 def create_run(
