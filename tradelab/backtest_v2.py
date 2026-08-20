@@ -2284,6 +2284,70 @@ def run_execution_acceleration_benchmark(
     }
 
 
+def run_batched_exit_benchmark(
+    context: PreparedBacktestContext,
+    universe: EntryStrategyUniverseResult,
+    exit_variants: tuple[ExitVariantSpec, ...],
+    *,
+    sample_size: int,
+) -> dict[str, Any]:
+    """Measure task 048's exact batched-exit optimisation on a bounded
+    set of equivalence classes.
+
+    The baseline is the production behaviour immediately before task 048:
+    one chronological execution pass per exit variant, with one shared
+    :class:`EntryTargetCache` per class. The candidate walks each class's
+    observed entries once while retaining independent variant state. Both
+    runs use the same range index and must produce exactly the same trades
+    and skips; this is a measurement, never a full-run projection.
+    """
+    classes = list(universe.equivalence_classes[:sample_size])
+    bar_range_index = BarRangeIndex.build(context.bars_1m)
+
+    sequential_start = time.perf_counter()
+    sequential_results: dict[str, dict[str, tuple[list[ExecutedTrade], list[SkippedEntryV2]]]] = {}
+    for equivalence_class in classes:
+        cache = EntryTargetCache()
+        direction = equivalence_class.representative_spec.primary.direction
+        sequential_results[equivalence_class.class_id] = {
+            variant.variant_id: simulate_market_execution(
+                equivalence_class.observed_entries, direction, variant, context,
+                f"{equivalence_class.class_id}::{variant.variant_id}",
+                bar_range_index=bar_range_index, entry_target_cache=cache,
+            )
+            for variant in exit_variants
+        }
+    sequential_elapsed_seconds = time.perf_counter() - sequential_start
+
+    batched_start = time.perf_counter()
+    batched_results: dict[str, dict[str, tuple[list[ExecutedTrade], list[SkippedEntryV2]]]] = {}
+    for equivalence_class in classes:
+        batched_results[equivalence_class.class_id] = simulate_market_execution_batched(
+            equivalence_class.observed_entries,
+            equivalence_class.representative_spec.primary.direction,
+            exit_variants,
+            context,
+            equivalence_class.class_id,
+            bar_range_index=bar_range_index,
+            entry_target_cache=EntryTargetCache(),
+        )
+    batched_elapsed_seconds = time.perf_counter() - batched_start
+
+    variant_count = len(classes) * len(exit_variants)
+    return {
+        "sample_size": len(classes),
+        "variants_measured": variant_count,
+        "bar_count": len(context.bars_1m),
+        "exit_variant_count": len(exit_variants),
+        "sequential_cached_elapsed_seconds": sequential_elapsed_seconds,
+        "batched_elapsed_seconds": batched_elapsed_seconds,
+        "sequential_cached_variants_per_second": (variant_count / sequential_elapsed_seconds) if sequential_elapsed_seconds > 0 else None,
+        "batched_variants_per_second": (variant_count / batched_elapsed_seconds) if batched_elapsed_seconds > 0 else None,
+        "speedup_factor": (sequential_elapsed_seconds / batched_elapsed_seconds) if batched_elapsed_seconds > 0 else None,
+        "exact_result_equality": sequential_results == batched_results,
+    }
+
+
 def _run_stage_diagnostic_pass(
     context: PreparedBacktestContext,
     universe: EntryStrategyUniverseResult,
@@ -2481,6 +2545,18 @@ def main(argv: list[str] | None = None) -> int:
     benchmark.add_argument("--min-entries-per-year", type=int, default=1)
     benchmark.add_argument("--sample-size", type=int, default=200, help="Number of (equivalence class, exit variant) combinations to benchmark.")
 
+    batch_benchmark = sub.add_parser(
+        "batch-benchmark",
+        help="Task 048: measure cached sequential execution against exact batched execution for a small, bounded set of classes.",
+    )
+    batch_benchmark.add_argument("--market-artifact", type=Path, default=None, help="Optional real market artifact manifest; omit to use the deterministic synthetic fixture.")
+    batch_benchmark.add_argument("--news-csv", type=Path, default=None)
+    batch_benchmark.add_argument("--prefix-bars", type=int, default=None, help="Truncate the loaded real artifact to this many leading bars (ignored without --market-artifact).")
+    batch_benchmark.add_argument("--pivot-strength", type=int, default=2)
+    batch_benchmark.add_argument("--reclaim-window-bars", type=int, default=3)
+    batch_benchmark.add_argument("--min-entries-per-year", type=int, default=1)
+    batch_benchmark.add_argument("--sample-size", type=int, default=1, help="Number of equivalence classes to measure; all exit variants are included for every class.")
+
     stage_diag = sub.add_parser(
         "stage-diagnostic",
         help="Task 047: run a small, bounded real-data sample twice (entry-target cache off, then on) and report "
@@ -2531,7 +2607,7 @@ def main(argv: list[str] | None = None) -> int:
         report = run_execution_acceleration_benchmark(context, universe, ALL_EXIT_VARIANTS, sample_size=args.sample_size)
         print(json.dumps(report, indent=2))
         return 0
-    elif args.mode == "stage-diagnostic":
+    elif args.mode in {"stage-diagnostic", "batch-benchmark"}:
         if args.market_artifact is not None:
             from tradelab.backtest import prepare_backtest_context
             from tradelab.market_data_artifact import load_market_data_artifact, load_market_data_series
@@ -2549,7 +2625,10 @@ def main(argv: list[str] | None = None) -> int:
         universe = discover_entry_strategy_universe(
             context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=args.min_entries_per_year
         )
-        report = run_stage_diagnostic(context, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, sample_size=args.sample_size)
+        if args.mode == "stage-diagnostic":
+            report = run_stage_diagnostic(context, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, sample_size=args.sample_size)
+        else:
+            report = run_batched_exit_benchmark(context, universe, ALL_EXIT_VARIANTS, sample_size=args.sample_size)
         print(json.dumps(report, indent=2))
         return 0
     else:

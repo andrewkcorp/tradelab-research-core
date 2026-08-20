@@ -47,6 +47,7 @@ from tradelab.backtest_v2 import (
     main as backtest_v2_main,
     read_preflight,
     run_execution_acceleration_benchmark,
+    run_batched_exit_benchmark,
     run_preflight_v2,
     run_production_backtest_v2,
     run_strategy_variant_backtest,
@@ -2264,6 +2265,26 @@ class ExecutionAccelerationBenchmarkTests(unittest.TestCase):
 
     def test_benchmark_cli_runs_and_prints_a_report(self):
         exit_code = backtest_v2_main(["benchmark", "--sample-size", "10"])
+        self.assertEqual(exit_code, 0)
+
+
+class BatchedExitBenchmarkTests(unittest.TestCase):
+    def test_reports_measured_timings_and_exact_equality(self):
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=1
+        )
+        report = run_batched_exit_benchmark(context, universe, ALL_EXIT_VARIANTS, sample_size=2)
+
+        self.assertEqual(report["sample_size"], 2)
+        self.assertEqual(report["variants_measured"], 2 * len(ALL_EXIT_VARIANTS))
+        self.assertTrue(report["exact_result_equality"])
+        self.assertGreater(report["sequential_cached_elapsed_seconds"], 0.0)
+        self.assertGreater(report["batched_elapsed_seconds"], 0.0)
+        self.assertIsNotNone(report["speedup_factor"])
+
+    def test_benchmark_cli_runs_and_prints_a_report(self):
+        exit_code = backtest_v2_main(["batch-benchmark", "--sample-size", "1"])
         self.assertEqual(exit_code, 0)
 
 
