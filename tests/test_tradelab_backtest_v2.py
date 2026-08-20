@@ -1372,16 +1372,60 @@ class ExpandAndSimulateHeartbeatTests(unittest.TestCase):
         self.assertEqual(completed_observed, completed_baseline)
         self.assertEqual([e.to_dict() for e in leaderboard_observed], [e.to_dict() for e in leaderboard_baseline])
 
+    def test_rate_limit_is_never_violated_even_when_every_variant_completes_within_the_same_instant(self):
+        # The production analogue of the preflight adversarial test below:
+        # freeze the heartbeat-relevant clock entirely so every one of
+        # this small synthetic universe's variants (and every bar-scan
+        # callback inside each) genuinely happens at the exact same
+        # monotonic instant, and prove the number of actual live_status.
+        # json writes heartbeat() causes stays small and bounded --
+        # nowhere close to one per variant, no matter how many variants
+        # exist.
+        context, universe = self._universe_and_context()
+        total_expected = universe.equivalence_class_count * len(ALL_EXIT_VARIANTS) * len(DEFAULT_INSTRUMENTS)
+        self.assertGreater(total_expected, 20)  # confirms this is a genuine many-variant scenario
+
+        write_count = 0
+        orig = RunReporter.heartbeat
+
+        def spy(self, **kwargs):
+            nonlocal write_count
+            wrote = orig(self, **kwargs)
+            if wrote:
+                write_count += 1
+            return wrote
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tradelab.research_run.time.monotonic", return_value=100.0):
+                completed, _leaderboard = self._run(tmp, "frozen-clock", universe, context, spy=spy)
+
+        self.assertEqual(completed, total_expected)
+        # exactly one successful heartbeat write for the entire
+        # simulating_backtests phase (its own first call) -- the frozen
+        # clock means nothing after it can ever write again, regardless
+        # of how many dozens of variants (and many more bar-scan callback
+        # attempts within each) were actually simulated.
+        self.assertLessEqual(write_count, 1)
+
 
 class PreflightThroughputSampleProgressTests(unittest.TestCase):
-    """task 044: --throughput-sample-size N must visibly advance 0/N ->
-    1/N -> ... -> N/N (never jump straight from 0 to N at the very end),
-    with intra-sample bar progress too -- proven deterministically via a
-    forced (never-throttled) heartbeat per completed sample, since the
-    sample size is always a small, caller-chosen, explicitly bounded
-    budget (never the full universe)."""
+    """task 044 (amended): --throughput-sample-size N must visibly
+    advance 0/N -> 1/N -> ... -> N/N over time (never jump straight from
+    0 to N at the very end), with intra-sample bar progress too -- while
+    RunReporter.heartbeat()'s own hard, non-bypassable once-per-second
+    write cap is never violated, no matter how many samples complete
+    within the same second. There is no longer a "force" escape hatch:
+    fast-completing samples are coalesced (only the latest state is
+    written once a write is actually due), never all individually
+    written."""
 
-    def test_sample_progress_advances_one_at_a_time_with_forced_flushes(self):
+    def test_sample_completion_is_attempted_in_order_with_advancing_unit_index(self):
+        # Proves the call-site orchestration itself is correct -- each
+        # completed sample is reported with the right, advancing state --
+        # independent of whether RunReporter.heartbeat() actually writes
+        # every single one of those attempts (that write-rate guarantee
+        # is proven separately, deterministically, below and in
+        # tests/test_tradelab_research_run.py's own HeartbeatTests).
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
             manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
@@ -1407,16 +1451,74 @@ class PreflightThroughputSampleProgressTests(unittest.TestCase):
             sample_calls = [c for c in calls if c.get("operation") == "sampling_throughput"]
             self.assertGreater(len(sample_calls), 0)
 
-            # the forced, per-sample-completion calls (bars_scanned ==
-            # bars_total) are the ones that must show unit_index advancing
-            # 1, 2, 3, 4, 5 in order -- unconditionally, never throttled.
-            forced_completions = [c["unit_index"] for c in sample_calls if c.get("bars_scanned") == c.get("bars_total") and c.get("force")]
-            self.assertEqual(forced_completions, [1, 2, 3, 4, 5])
+            # the per-sample-completion attempts (bars_scanned ==
+            # bars_total) must show unit_index advancing 1, 2, 3, 4, 5 in
+            # order -- whether or not each one actually earns a write.
+            completions = [c["unit_index"] for c in sample_calls if c.get("bars_scanned") == c.get("bars_total")]
+            self.assertEqual(completions, [1, 2, 3, 4, 5])
 
             # every sample carried a real strategy_variant_id and the
             # correct, fixed unit_total throughout.
             self.assertTrue(all(c.get("variant_id") for c in sample_calls))
             self.assertTrue(all(c.get("unit_total") == 5 for c in sample_calls))
+
+    def test_rate_limit_is_never_violated_even_when_every_sample_completes_within_the_same_instant(self):
+        # The most adversarial case this bug report described: freeze the
+        # heartbeat-relevant clock entirely (every sample, and every
+        # bar-scan callback within it, genuinely happens at the exact
+        # same monotonic instant) and prove the number of actual
+        # live_status.json writes heartbeat() causes stays small and
+        # bounded -- never anywhere close to one per sample.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
+            runs_dir = tmp / "runs"
+
+            write_count = 0
+            last_active_work_by_operation = {}
+            orig = RunReporter.heartbeat
+
+            def spy(self, **kwargs):
+                nonlocal write_count
+                wrote = orig(self, **kwargs)
+                if wrote:
+                    write_count += 1
+                # captured regardless of whether this particular call
+                # earned a write -- proves the in-memory snapshot itself
+                # (what a later, unrelated flush would pick up) really
+                # does hold the latest state, not just whatever happened
+                # to land on-disk.
+                last_active_work_by_operation[kwargs["operation"]] = self._active_work.to_dict()
+                return wrote
+
+            with patch("tradelab.research_run.time.monotonic", return_value=100.0):
+                with patch.object(RunReporter, "heartbeat", spy):
+                    reporter = run_preflight_v2(
+                        market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
+                        pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
+                        throughput_sample_size=25, command="test",
+                    )
+
+            preflight = read_preflight(reporter.run_dir)
+            self.assertEqual(preflight["throughput_estimate"]["sample_size_measured"], 25)
+
+            # exactly one successful heartbeat write per distinct phase
+            # that ever calls heartbeat at all (preparing_data,
+            # discovering_entries, sampling_throughput) -- the frozen
+            # clock means nothing beyond each phase's own first call can
+            # ever write again. Nowhere close to 25 (one per sample) or
+            # 50 (one per sample start + completion).
+            self.assertLessEqual(write_count, 5)
+            self.assertLess(write_count, 25)
+
+            # the milestone was never lost, only rate-limited: the very
+            # last heartbeat attempt (sample 25's own completion) is
+            # exactly what the in-memory snapshot held, ready for the
+            # next reporter call (progress(), right after the sampling
+            # loop) to flush -- even though heartbeat() itself never got
+            # to write most of these 25 samples' own completions.
+            self.assertEqual(last_active_work_by_operation["sampling_throughput"]["unit_index"], 25)
+            self.assertEqual(last_active_work_by_operation["sampling_throughput"]["bars_scanned"], last_active_work_by_operation["sampling_throughput"]["bars_total"])
 
     def test_throughput_sample_reporter_none_path_is_unaffected(self):
         # reporter=None (no telemetry wired) must still work identically

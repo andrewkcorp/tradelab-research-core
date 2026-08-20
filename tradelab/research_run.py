@@ -697,7 +697,6 @@ class RunReporter:
         unit_total: int | None = None,
         bars_scanned: int | None = None,
         bars_total: int | None = None,
-        force: bool = False,
     ) -> bool:
         """A live, in-flight status update for the dashboard -- task 044.
 
@@ -710,38 +709,57 @@ class RunReporter:
         durable event log without bound. ``live_status.json`` (via
         ``_flush_status``) is the only artifact this writes to.
 
-        **Throttled to at most once per second** (``_HEARTBEAT_MIN_
-        INTERVAL_SECONDS``, monotonic-clock based), regardless of how
-        often the caller invokes this method -- satisfies the "write an
-        updated live status at most once per second" requirement even if
-        a caller forgets to throttle its own call site (callers inside a
-        genuinely per-bar loop should still wrap their own callback in a
-        :class:`ProgressThrottle` first, purely to avoid paying the
-        function-call/monotonic-check cost of *this* method on every
-        single bar -- see that class's own docstring). Pass ``force=True``
-        to bypass the throttle for a single, guaranteed-to-land update
-        (e.g. "this bounded unit of work just finished") -- only
-        appropriate for a caller that itself controls how often it forces
-        (never once per bar).
+        **Hard cap: at most one actual write per second -- no exceptions,
+        no bypass.** This is a strict contract, not a best-effort default:
+        every call updates the in-memory ``active_work`` snapshot
+        immediately (so no milestone is ever silently lost), but the
+        write to ``live_status.json`` itself only happens on the first
+        call since the current phase started, or once at least ``_
+        HEARTBEAT_MIN_INTERVAL_SECONDS`` (monotonic-clock based) has
+        elapsed since this method's own last write -- whichever a given
+        call satisfies. There used to be a ``force=True`` escape hatch
+        for "this bounded unit of work just finished" callers (e.g. one
+        completed preflight throughput sample); it was removed because it
+        let several such calls, each individually reasonable, land inside
+        the same second and blow the one-write-per-second budget in
+        aggregate. **Coalescing, not forcing, is the fix**: a caller that
+        reports several milestones faster than once a second no longer
+        gets every single one written -- it gets the *latest* one written
+        as soon as the next write is actually due, because the in-memory
+        snapshot this method updates unconditionally is exactly what
+        every other flushing method (``progress()``, ``checkpoint_
+        written()``, ``phase_started()``, ...) also serializes into
+        ``live_status.json`` on its own next call. A caller that wants a
+        milestone to become visible sooner than the throttle would
+        otherwise allow should call one of those methods (each already
+        milestone-triggered by design, not subject to this cap) rather
+        than reach for a bypass here.
 
-        Returns ``True`` if this call actually flushed a new status,
-        ``False`` if it was throttled away (purely informational, useful
-        for tests).
+        Callers inside a genuinely per-bar loop should still wrap their
+        own callback in a :class:`ProgressThrottle` first, purely to
+        avoid paying this method's own function-call/monotonic-check cost
+        on every single bar -- see that class's own docstring; this
+        method's cap is the final, authoritative guarantee regardless of
+        how disciplined (or not) the caller's own wrapping is.
 
-        As a side effect (only when it actually flushes), this also
+        Returns ``True`` if this call actually wrote a new status,
+        ``False`` if only the in-memory snapshot was updated (purely
+        informational, useful for tests).
+
+        As a side effect, only when it actually writes, this also
         refreshes ``resource_usage`` with a fresh, un-logged CPU/RSS
         sample -- so CPU/RAM stay visibly live during long work without
         needing their own separate once-a-second event either.
         """
         _require(bool(operation), "heartbeat(operation=...) must be non-empty")
-        now = time.monotonic()
-        if not force and self._last_heartbeat_monotonic is not None and (now - self._last_heartbeat_monotonic) < _HEARTBEAT_MIN_INTERVAL_SECONDS:
-            return False
-        self._last_heartbeat_monotonic = now
         self._active_work = ActiveWork(
             operation=operation, variant_id=variant_id, unit_index=unit_index, unit_total=unit_total,
             bars_scanned=bars_scanned, bars_total=bars_total, updated_at=_utc_now_iso(),
         )
+        now = time.monotonic()
+        if self._last_heartbeat_monotonic is not None and (now - self._last_heartbeat_monotonic) < _HEARTBEAT_MIN_INTERVAL_SECONDS:
+            return False
+        self._last_heartbeat_monotonic = now
         rss_bytes, cpu_seconds = _sample_resource_usage()
         if rss_bytes is not None or cpu_seconds is not None:
             self._resource_usage = ResourceUsage(rss_bytes=rss_bytes, cpu_seconds=cpu_seconds)

@@ -395,10 +395,15 @@ class ProgressThrottleTests(unittest.TestCase):
 
 
 class HeartbeatTests(unittest.TestCase):
-    """task 044: RunReporter.heartbeat -- throttled to at most once per
-    second, never appends a progress_events.jsonl entry (so a long-running
-    loop calling it far more often never grows the durable event log
-    without bound), populates ActiveWork in live_status.json, and is
+    """task 044 (amended): RunReporter.heartbeat -- a hard, non-bypassable
+    cap of at most one actual write per second, no exceptions; every call
+    still updates the in-memory active_work snapshot immediately, so a
+    "milestone" reported faster than once a second is never lost -- it
+    is coalesced into whichever write next becomes due (either this
+    method's own next permitted call, or any other reporter method's own
+    flush picking up the same in-memory snapshot). Never appends a
+    progress_events.jsonl entry (so a long-running loop calling it far
+    more often never grows the durable event log without bound), and is
     cleared by the next phase_started()."""
 
     def test_throttled_to_at_most_once_per_second(self):
@@ -414,14 +419,48 @@ class HeartbeatTests(unittest.TestCase):
             # last flush reflects the most recent call that actually fired.
             self.assertEqual(status.active_work["unit_index"], 3)
 
-    def test_force_bypasses_the_throttle(self):
+    def test_no_call_pattern_can_produce_more_than_one_write_per_second(self):
+        # Five distinct "this milestone just finished" heartbeats, all
+        # landing inside the same simulated second -- proves there is no
+        # remaining bypass (no force=, no argument combination) that lets
+        # more than one of them actually write.
         with tempfile.TemporaryDirectory() as tmp:
             reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
             reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=10)
-            self.assertTrue(reporter.heartbeat(operation="sim", unit_index=1, unit_total=10))
-            self.assertTrue(reporter.heartbeat(operation="sim", unit_index=2, unit_total=10, force=True))
+            with patch("tradelab.research_run.time.monotonic", side_effect=[100.0, 100.1, 100.2, 100.3, 100.4]):
+                results = [reporter.heartbeat(operation="sim", unit_index=i, unit_total=5) for i in range(1, 6)]
+            self.assertEqual(results, [True, False, False, False, False])
+            # the on-disk write reflects only the one call that earned it.
             status = read_live_status(reporter.run_dir)
-            self.assertEqual(status.active_work["unit_index"], 2)
+            self.assertEqual(status.active_work["unit_index"], 1)
+
+    def test_coalesced_milestones_become_visible_on_the_next_permitted_heartbeat_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=10)
+            with patch("tradelab.research_run.time.monotonic", side_effect=[100.0, 100.1, 100.2, 101.3]):
+                self.assertTrue(reporter.heartbeat(operation="sim", unit_index=1, unit_total=5))  # writes -- first call
+                self.assertFalse(reporter.heartbeat(operation="sim", unit_index=2, unit_total=5))  # coalesced
+                self.assertFalse(reporter.heartbeat(operation="sim", unit_index=3, unit_total=5))  # coalesced -- overwrites #2 in memory
+                self.assertTrue(reporter.heartbeat(operation="sim", unit_index=4, unit_total=5))  # >=1s later -- writes the LATEST coalesced state
+            status = read_live_status(reporter.run_dir)
+            self.assertEqual(status.active_work["unit_index"], 4)  # never 2 or 3 -- only ever the latest, once due
+
+    def test_coalesced_milestone_becomes_visible_immediately_via_any_other_reporter_method(self):
+        # A caller that finishes its loop and never calls heartbeat()
+        # again still doesn't lose the milestone: the very next flush
+        # from ANY reporter method (progress(), here) serializes whatever
+        # heartbeat() last recorded in memory, even though heartbeat()
+        # itself never got to write it on its own.
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=10)
+            with patch("tradelab.research_run.time.monotonic", side_effect=[100.0, 100.1]):
+                self.assertTrue(reporter.heartbeat(operation="sim", unit_index=1, unit_total=5))
+                self.assertFalse(reporter.heartbeat(operation="sim", unit_index=5, unit_total=5))  # coalesced, never written by heartbeat itself
+            reporter.progress(items_completed=5)
+            status = read_live_status(reporter.run_dir)
+            self.assertEqual(status.active_work["unit_index"], 5)  # visible now, without waiting on heartbeat's own throttle
 
     def test_never_appends_a_progress_event_even_across_a_long_simulated_loop(self):
         with tempfile.TemporaryDirectory() as tmp:

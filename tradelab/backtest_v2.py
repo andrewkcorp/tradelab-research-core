@@ -1234,16 +1234,23 @@ def _measure_sample_throughput(
     **Live telemetry (task 044).** When ``reporter`` is given, this
     reports a heartbeat before and during each sample (current sample
     number of ``len(combos)``, current strategy_variant_id, and bars-
-    scanned/bars-total from inside that sample's own simulation), and a
-    forced (never-throttled) heartbeat the instant each sample finishes
-    -- so, e.g., ``--throughput-sample-size 25`` visibly advances 0/25 ->
-    1/25 -> 2/25 -> ... rather than jumping straight from 0 to 25 at the
-    very end. Forcing one flush per *completed sample* (never per bar)
-    is safe precisely because ``sample_size`` is a small, caller-chosen,
-    explicitly bounded budget -- never the full, potentially millions-
-    strong variant universe (see ``_expand_and_simulate``, which
-    deliberately never forces, relying purely on the throttle, since it
-    has no such bound)."""
+    scanned/bars-total from inside that sample's own simulation), and
+    once more the instant each sample finishes -- so, e.g., ``--
+    throughput-sample-size 25`` visibly advances 0/25 -> 1/25 -> 2/25 ->
+    ... rather than jumping straight from 0 to 25 at the very end.
+    ``RunReporter.heartbeat()`` itself enforces a hard, non-bypassable
+    cap of at most one actual write to ``live_status.json`` per second
+    (see that method's own docstring): several samples completing within
+    the same second still only ever produce one write for that second,
+    carrying whichever sample's state was most recent when the write
+    became due -- coalesced, never a burst of writes proportional to
+    however many samples happened to finish quickly. The very next
+    reporter call after this loop (``run_preflight_v2``'s own ``
+    progress()``) flushes whatever the last heartbeat call updated in
+    memory, so the final sample's own completion is always visible in
+    ``preflight.json``'s neighboring ``live_status.json`` immediately
+    after this function returns, even if its own heartbeat call was
+    itself throttled away."""
     combos = list(itertools.islice(_iter_variant_combinations(universe, exit_variants, instruments), sample_size))
     row_byte_sizes: list[int] = []
     start = time.perf_counter()
@@ -1271,7 +1278,7 @@ def _measure_sample_throughput(
         if reporter is not None:
             reporter.heartbeat(
                 operation="sampling_throughput", variant_id=variant_id, unit_index=i + 1, unit_total=len(combos),
-                bars_scanned=len(context.bars_1m), bars_total=len(context.bars_1m), force=True,
+                bars_scanned=len(context.bars_1m), bars_total=len(context.bars_1m),
             )
     elapsed_seconds = time.perf_counter() - start
     variants_per_second = (len(combos) / elapsed_seconds) if elapsed_seconds > 0 else None
