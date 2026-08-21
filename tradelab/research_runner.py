@@ -34,12 +34,10 @@ end_utc)``. "Accounted" means ``tradelab.accounting.AccountBacktestResult
 already exceeds ``max_stop_risk_usd`` at a single contract, sizing
 rejected it before any position ever opened) never counts, while an
 ``OPEN_UNRESOLVED`` trade (data ran out with the position still open)
-does count, since a position genuinely opened either way. NQ and MNQ
-are evaluated completely independently (contract sizing differs by
-instrument, so the very same ``BacktestResult`` can pass the frequency
-bar for one instrument and fail it for the other) -- one
-``ResearchEvaluation`` per instrument per strategy, from a single
-shared ``BacktestResult`` computed only once per strategy.
+does count, since a position genuinely opened either way. Production
+defaults to MNQ only. A caller may explicitly supply a different instrument
+tuple for an isolated comparison; one ``ResearchEvaluation`` is emitted per
+requested instrument from a single shared ``BacktestResult``.
 
 **Non-qualifying strategies are never candidates for a later ranking
 pass, but are never silently dropped either.** Every ``StrategySpec``
@@ -84,7 +82,10 @@ from tradelab.backtest import BacktestResult, PreparedBacktestContext, backtest_
 from tradelab.equity import EquityConfig, EquityResult, build_equity_curve
 from tradelab.strategy_spec import StrategySpec
 
-DEFAULT_INSTRUMENTS: tuple[Instrument, ...] = (Instrument.NQ, Instrument.MNQ)
+# Production research is MNQ-only. ``Instrument.NQ`` remains available to
+# isolated accounting fixtures, but must be passed explicitly for any
+# historical comparison.
+DEFAULT_INSTRUMENTS: tuple[Instrument, ...] = (Instrument.MNQ,)
 
 
 @dataclass(frozen=True)

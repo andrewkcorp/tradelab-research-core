@@ -135,6 +135,24 @@ class CommitSummaryAndUniquenessTests(unittest.TestCase):
             self.assertEqual(j2.completed_count(), 1)
             j2.close()
 
+    def test_persists_apex_audit_summary_without_requiring_it_on_legacy_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _open(Path(tmp) / "journal.sqlite3")
+            row = _summary_row("breached")
+            row["apex_eod_audit"] = {
+                "has_breach": True, "breach_count": 2,
+                "breached_trading_day_count": 1, "max_daily_loss_usd": 1200.0,
+                "largest_eod_drawdown_breach_usd": 50.0,
+            }
+            j.commit_summary(row)
+            stored = j.top_n_summaries(1)[0]
+            self.assertTrue(stored.apex_has_breach)
+            self.assertEqual(stored.apex_breach_count, 2)
+            self.assertEqual(stored.apex_breached_trading_day_count, 1)
+            self.assertEqual(stored.apex_max_daily_loss_usd, 1200.0)
+            self.assertEqual(stored.apex_largest_eod_drawdown_breach_usd, 50.0)
+            j.close()
+
     def test_duplicate_strategy_variant_id_raises_rather_than_silently_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "journal.sqlite3"

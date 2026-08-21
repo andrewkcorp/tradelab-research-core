@@ -17,6 +17,15 @@ from tradelab.accounting import (
     instrument_tick_size,
     point_value_usd,
 )
+from tradelab.apex_eod import (
+    ApexBreach,
+    ApexEODAudit,
+    ApexEODConfig,
+    ApexLimit,
+    ApexTradingDayAudit,
+    audit_apex_eod,
+    trading_day_id,
+)
 from tradelab.backtest import (
     BacktestResult,
     ExecutedTrade,
@@ -36,6 +45,12 @@ from tradelab.bias import (
     TimeframeBiasChange,
     bias_at,
     compute_htf_bias,
+)
+from tradelab.both_direction_universe import (
+    BothDirectionEquivalenceClass,
+    BothDirectionSpec,
+    BothDirectionUniverseResult,
+    discover_both_direction_universe,
 )
 from tradelab.continuous_futures import (
     ContinuousSeriesResult,
@@ -99,6 +114,7 @@ from tradelab.market_data_artifact import (
 )
 from tradelab.news import NewsEvent, is_entry_blocked, validate_news_events
 from tradelab.news_loaders import read_news_events_csv, read_news_events_parquet
+from tradelab.outlier_audit import AuditedTrade, OutlierAudit, audit_trade_outliers
 from tradelab.observed_strategy_universe import (
     ALL_BIAS_POLICIES,
     ALL_TP_CHOICES,
@@ -135,6 +151,7 @@ from tradelab.selector_catalog import (
     CANONICAL_FVG_SELECTORS,
     CANONICAL_LIQUIDITY_SELECTORS,
     is_canonical_selector,
+    opposite_liquidity_selector,
 )
 from tradelab.session_calendar import expected_open_minutes, is_regular_session_open
 from tradelab.session_liquidity import detect_session_liquidity
@@ -170,6 +187,7 @@ from tradelab.trade_execution import (
     TradeStatus,
     simulate_trade,
 )
+from tradelab.trade_path_audit import AccountMarkToMarketAudit, TradePathAudit, audit_account_mark_to_market, audit_trade_paths
 from tradelab.validation import MissingMinutesGap, ValidationResult, validate_bars
 from tradelab.volume_roll_continuous import (
     RollTransition,
@@ -194,6 +212,13 @@ __all__ = [
     "UntradeableTrade",
     "AccountBacktestResult",
     "apply_accounting",
+    "ApexLimit",
+    "ApexEODConfig",
+    "ApexBreach",
+    "ApexTradingDayAudit",
+    "ApexEODAudit",
+    "trading_day_id",
+    "audit_apex_eod",
     "BacktestResult",
     "ExecutedTrade",
     "PreparedBacktestContext",
@@ -215,6 +240,9 @@ __all__ = [
     "is_entry_blocked",
     "read_news_events_csv",
     "read_news_events_parquet",
+    "AuditedTrade",
+    "OutlierAudit",
+    "audit_trade_outliers",
     "Candle",
     "FVGZone",
     "FVGEvent",
@@ -242,6 +270,10 @@ __all__ = [
     "HTFBiasResult",
     "BiasSnapshot",
     "compute_htf_bias",
+    "BothDirectionSpec",
+    "BothDirectionEquivalenceClass",
+    "BothDirectionUniverseResult",
+    "discover_both_direction_universe",
     "bias_at",
     "FVGContactType",
     "FVGTouchEvent",
@@ -282,6 +314,7 @@ __all__ = [
     "CANONICAL_LIQUIDITY_SELECTORS",
     "ALL_CANONICAL_ENTRY_SELECTORS",
     "is_canonical_selector",
+    "opposite_liquidity_selector",
     "BiasPolicy",
     "TPChoice",
     "SLChoice",
@@ -294,6 +327,10 @@ __all__ = [
     "TradeStatus",
     "TradeExecutionResult",
     "simulate_trade",
+    "TradePathAudit",
+    "audit_trade_paths",
+    "AccountMarkToMarketAudit",
+    "audit_account_mark_to_market",
     "EquityConfig",
     "EquityEventType",
     "EquityPoint",

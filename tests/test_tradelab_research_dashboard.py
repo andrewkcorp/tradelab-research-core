@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -103,6 +104,27 @@ class IndexPageTests(_ServerTestCase):
         self.assertNotIn("<script src=", DASHBOARD_HTML)
         self.assertNotIn("cdn.", DASHBOARD_HTML.lower())
 
+    def test_dashboard_has_interactive_top_five_and_labelled_chart_primitives(self):
+        """The dashboard's research view must not silently regress to a
+        static top-25 table or unlabelled canvas plots."""
+        self.assertIn("Completed strategies", DASHBOARD_HTML)
+        self.assertIn("selectedStrategyId", DASHBOARD_HTML)
+        self.assertIn("Click to inspect this strategy", DASHBOARD_HTML)
+        self.assertIn("Y: account equity (USD)", DASHBOARD_HTML)
+        self.assertIn("drawAxisLine", DASHBOARD_HTML)
+        self.assertIn("chart-tooltip", DASHBOARD_HTML)
+
+    def test_dashboard_exposes_sorting_and_selected_strategy_quality_metrics(self):
+        """Ranking must remain inspectable on both return and risk metrics."""
+        self.assertIn('data-sort-key="pnl"', DASHBOARD_HTML)
+        self.assertIn('data-sort-key="max_drawdown"', DASHBOARD_HTML)
+        self.assertIn('data-sort-key="win_rate"', DASHBOARD_HTML)
+        self.assertIn("leaderboardSort", DASHBOARD_HTML)
+        self.assertIn("Profit factor", DASHBOARD_HTML)
+        self.assertIn("Largest win", DASHBOARD_HTML)
+        self.assertIn('id="chart-trade-pnl"', DASHBOARD_HTML)
+        self.assertIn('id="chart-drawdown"', DASHBOARD_HTML)
+
 
 class EmptyRunsDirTests(_ServerTestCase):
     def test_list_runs_is_empty_before_any_run_exists(self):
@@ -116,6 +138,24 @@ class EmptyRunsDirTests(_ServerTestCase):
 
 
 class ArtifactParsingTests(_ServerTestCase):
+    def _write_variant_journal(self, run_id: str, rows: list[tuple]):
+        """Minimal read-only journal fixture for global dashboard ranking."""
+        db_path = f"{self.runs_dir}/{run_id}/backtest_v2_journal.sqlite3"
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute("""
+                CREATE TABLE variant_summaries (
+                    strategy_variant_id TEXT PRIMARY KEY,
+                    net_pnl_usd REAL NOT NULL, roi REAL NOT NULL, win_rate REAL,
+                    trade_count INTEGER NOT NULL, max_drawdown_usd REAL NOT NULL,
+                    drawdowns_over_2000_count INTEGER NOT NULL, monthly_json TEXT NOT NULL
+                )
+            """)
+            connection.executemany("INSERT INTO variant_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            connection.commit()
+        finally:
+            connection.close()
+
     def test_list_runs_reflects_created_runs(self):
         create_run(runs_dir=self.runs_dir, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="run-a")
         create_run(runs_dir=self.runs_dir, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="run-b", is_demo=True)
@@ -162,6 +202,23 @@ class ArtifactParsingTests(_ServerTestCase):
         data = json.loads(body)
         self.assertEqual(len(data["entries"]), 1)
         self.assertEqual(data["entries"][0]["strategy_id"], "s1")
+
+    def test_all_completed_leaderboard_sorts_the_journal_not_only_pnl_top_list(self):
+        create_run(runs_dir=self.runs_dir, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="run-universe")
+        self._write_variant_journal("run-universe", [
+            ("profit-high-dd", 800.0, 0.016, 0.55, 140, 950.0, 1, '{"2024-01":{"net_pnl_usd":800,"trade_count":140}}'),
+            ("loss-low-dd", -25.0, -0.0005, 0.40, 120, 7.0, 0, '{"2024-01":{"net_pnl_usd":-25,"trade_count":120}}'),
+            ("profit-mid-dd", 300.0, 0.006, 0.60, 130, 300.0, 0, '{"2024-01":{"net_pnl_usd":300,"trade_count":130}}'),
+        ])
+        status, body = self._get("/api/runs/run-universe/leaderboard?scope=all&sort=max_drawdown&dir=asc")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["universe_scope"], "all_completed_variants")
+        self.assertEqual([entry["strategy_id"] for entry in data["entries"]], ["loss-low-dd", "profit-mid-dd", "profit-high-dd"])
+        self.assertEqual(data["entries"][0]["equity_curve"][0]["equity"], 49_975.0)
+        status, body = self._get("/api/runs/run-universe/leaderboard?scope=all&sort=win_rate&dir=desc")
+        self.assertEqual(status, 200)
+        self.assertEqual([entry["strategy_id"] for entry in json.loads(body)["entries"]], ["profit-mid-dd", "profit-high-dd", "loss-low-dd"])
 
     def test_events_endpoint_respects_limit(self):
         reporter = create_run(runs_dir=self.runs_dir, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="run-g")

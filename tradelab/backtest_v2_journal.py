@@ -92,6 +92,11 @@ CREATE TABLE IF NOT EXISTS variant_summaries (
     trade_count INTEGER NOT NULL,
     max_drawdown_usd REAL NOT NULL,
     drawdowns_over_2000_count INTEGER NOT NULL,
+    apex_has_breach INTEGER NOT NULL DEFAULT 0,
+    apex_breach_count INTEGER NOT NULL DEFAULT 0,
+    apex_breached_trading_day_count INTEGER NOT NULL DEFAULT 0,
+    apex_max_daily_loss_usd REAL NOT NULL DEFAULT 0,
+    apex_largest_eod_drawdown_breach_usd REAL NOT NULL DEFAULT 0,
     skipped_entries_by_reason_json TEXT NOT NULL,
     yearly_json TEXT NOT NULL,
     monthly_json TEXT NOT NULL,
@@ -107,7 +112,8 @@ _MANIFEST_COLUMNS = (
 _SUMMARY_COLUMNS = (
     "strategy_variant_id", "equivalence_class_id", "direction", "instrument", "exit_variant_id", "tp_kind", "tp_rank",
     "sl_kind", "sl_rank", "sl_fvg_timeframe", "net_pnl_usd", "roi", "win_rate", "trade_count", "max_drawdown_usd",
-    "drawdowns_over_2000_count", "skipped_entries_by_reason_json", "yearly_json", "monthly_json",
+    "drawdowns_over_2000_count", "apex_has_breach", "apex_breach_count", "apex_breached_trading_day_count",
+    "apex_max_daily_loss_usd", "apex_largest_eod_drawdown_breach_usd", "skipped_entries_by_reason_json", "yearly_json", "monthly_json",
 )
 
 
@@ -140,6 +146,11 @@ class JournalVariantSummary:
     trade_count: int
     max_drawdown_usd: float
     drawdowns_over_2000_count: int
+    apex_has_breach: bool
+    apex_breach_count: int
+    apex_breached_trading_day_count: int
+    apex_max_daily_loss_usd: float
+    apex_largest_eod_drawdown_breach_usd: float
     skipped_entries_by_reason: Mapping[str, int]
     yearly: Mapping[str, Mapping[str, float | int]]
     monthly: Mapping[str, Mapping[str, float | int]]
@@ -149,13 +160,18 @@ class JournalVariantSummary:
         (
             strategy_variant_id, equivalence_class_id, direction, instrument, exit_variant_id, tp_kind, tp_rank, sl_kind,
             sl_rank, sl_fvg_timeframe, net_pnl_usd, roi, win_rate, trade_count, max_drawdown_usd, drawdowns_over_2000_count,
-            skipped_json, yearly_json, monthly_json,
+            apex_has_breach, apex_breach_count, apex_breached_trading_day_count, apex_max_daily_loss_usd,
+            apex_largest_eod_drawdown_breach_usd, skipped_json, yearly_json, monthly_json,
         ) = row
         return JournalVariantSummary(
             strategy_variant_id=strategy_variant_id, equivalence_class_id=equivalence_class_id, direction=direction,
             instrument=instrument, exit_variant_id=exit_variant_id, tp_kind=tp_kind, tp_rank=tp_rank, sl_kind=sl_kind,
             sl_rank=sl_rank, sl_fvg_timeframe=sl_fvg_timeframe, net_pnl_usd=net_pnl_usd, roi=roi, win_rate=win_rate,
             trade_count=trade_count, max_drawdown_usd=max_drawdown_usd, drawdowns_over_2000_count=drawdowns_over_2000_count,
+            apex_has_breach=bool(apex_has_breach), apex_breach_count=apex_breach_count,
+            apex_breached_trading_day_count=apex_breached_trading_day_count,
+            apex_max_daily_loss_usd=apex_max_daily_loss_usd,
+            apex_largest_eod_drawdown_breach_usd=apex_largest_eod_drawdown_breach_usd,
             skipped_entries_by_reason=json.loads(skipped_json), yearly=json.loads(yearly_json), monthly=json.loads(monthly_json),
         )
 
@@ -189,6 +205,7 @@ class BacktestV2Journal:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._db_path))
         self._conn.executescript(_SCHEMA_SQL)
+        _migrate_summary_schema(self._conn)
         self._conn.commit()
         self._run_id = run_id
 
@@ -299,6 +316,11 @@ class BacktestV2Journal:
                     row["exit_variant_id"], row["tp_kind"], row["tp_rank"], row["sl_kind"], row["sl_rank"],
                     row["sl_fvg_timeframe"], row["net_pnl_usd"], row["roi"], row["win_rate"], row["trade_count"],
                     row["max_drawdown_usd"], row["drawdowns_over_2000_count"],
+                    int(bool((row.get("apex_eod_audit") or {}).get("has_breach", False))),
+                    int((row.get("apex_eod_audit") or {}).get("breach_count", 0)),
+                    int((row.get("apex_eod_audit") or {}).get("breached_trading_day_count", 0)),
+                    float((row.get("apex_eod_audit") or {}).get("max_daily_loss_usd", 0.0)),
+                    float((row.get("apex_eod_audit") or {}).get("largest_eod_drawdown_breach_usd", 0.0)),
                     json.dumps(dict(row["skipped_entries_by_reason"]), sort_keys=True),
                     json.dumps(dict(row["yearly"]), sort_keys=True), json.dumps(dict(row["monthly"]), sort_keys=True),
                     _utc_now_iso(),
@@ -328,3 +350,20 @@ class BacktestV2Journal:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+
+_SUMMARY_MIGRATION_COLUMNS = {
+    "apex_has_breach": "INTEGER NOT NULL DEFAULT 0",
+    "apex_breach_count": "INTEGER NOT NULL DEFAULT 0",
+    "apex_breached_trading_day_count": "INTEGER NOT NULL DEFAULT 0",
+    "apex_max_daily_loss_usd": "REAL NOT NULL DEFAULT 0",
+    "apex_largest_eod_drawdown_breach_usd": "REAL NOT NULL DEFAULT 0",
+}
+
+
+def _migrate_summary_schema(conn: sqlite3.Connection) -> None:
+    """Add read-only audit columns to pre-existing local journals safely."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(variant_summaries)")}
+    for name, definition in _SUMMARY_MIGRATION_COLUMNS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE variant_summaries ADD COLUMN {name} {definition}")

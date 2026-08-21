@@ -97,6 +97,9 @@ class DataWickEvent:
     candle_range: float
     baseline_median: float
     wick_length: float
+    # First later candle that reaches/passes the wick extreme. ``None`` means
+    # it remained uncollected in the supplied history.
+    taken_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -194,4 +197,23 @@ def detect_data_wicks(
                 )
             )
 
-    return DataWickDetectionResult(events=wick_events)
+    # A data wick is a target only until price later revisits its extreme.
+    # The forming candle cannot consume itself: it becomes knowable only at
+    # ``known_at`` (its close), so scanning starts strictly later.
+    resolved: list[DataWickEvent] = []
+    for event in wick_events:
+        taken_at = None
+        for candle in candles:
+            if candle.timestamp < event.known_at:
+                continue
+            if event.direction == DataWickDirection.UPPER and candle.high >= event.level:
+                taken_at = candle.timestamp
+                break
+            if event.direction == DataWickDirection.LOWER and candle.low <= event.level:
+                taken_at = candle.timestamp
+                break
+        resolved.append(DataWickEvent(
+            event.event_ids, event.direction, event.timestamp, event.known_at,
+            event.level, event.candle_range, event.baseline_median, event.wick_length, taken_at,
+        ))
+    return DataWickDetectionResult(events=resolved)

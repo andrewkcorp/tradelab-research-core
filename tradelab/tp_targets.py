@@ -81,6 +81,11 @@ _EQUAL_TYPES = frozenset({LiquidityType.EQUAL_HIGHS, LiquidityType.EQUAL_LOWS})
 _SESSION_TYPES = frozenset(lt for lt in LiquidityType if lt.value.startswith("session_"))
 
 MAX_LIQUIDITY_TARGETS = 3
+# 500 points = 2,000 MNQ ticks. This is deliberately a single research
+# constraint, not a grid parameter: a data wick further away is not a
+# plausible execution target for this intraday strategy and was responsible
+# for the pathological outlier P&L seen in the diagnostic run.
+MAX_DATA_WICK_TARGET_DISTANCE_POINTS = 500.0
 
 
 class TPSourceType(str, Enum):
@@ -336,12 +341,16 @@ def _data_wick_candidates(entry: MarketEntryContext, result: DataWickDetectionRe
             continue  # wrong side of price for this entry's direction
         if event.known_at > entry.entry_known_at:
             continue  # not yet known at entry time
+        if event.taken_at is not None and event.taken_at <= entry.entry_known_at:
+            continue  # level was already collected before this entry
 
         if event.level <= 0:
             raise ValueError(f"DataWickEvent at {event.known_at!r} has non-positive level {event.level!r}")
         if entry.direction == LONG and event.level <= entry.entry_price:
             continue
         if entry.direction == SHORT and event.level >= entry.entry_price:
+            continue
+        if abs(event.level - entry.entry_price) > MAX_DATA_WICK_TARGET_DISTANCE_POINTS:
             continue
 
         source_id = f"{event.known_at.isoformat()}-{event.direction.value}"

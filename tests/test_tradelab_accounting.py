@@ -101,11 +101,12 @@ class InstrumentTests(unittest.TestCase):
 
 
 class RiskConfigTests(unittest.TestCase):
-    def test_defaults_are_500_550_20(self):
+    def test_defaults_are_500_550_20_and_30_contract_cap(self):
         config = RiskConfig()
         self.assertEqual(config.target_risk_usd, 500.0)
         self.assertEqual(config.max_stop_risk_usd, 550.0)
         self.assertEqual(config.entry_cost_usd, 20.0)
+        self.assertEqual(config.max_contracts, 30)
 
     def test_non_positive_target_risk_rejected(self):
         with self.assertRaises(ValueError):
@@ -122,6 +123,11 @@ class RiskConfigTests(unittest.TestCase):
             RiskConfig(entry_cost_usd=0)
         with self.assertRaises(ValueError):
             RiskConfig(entry_cost_usd=-20)
+
+    def test_non_positive_or_non_integer_contract_cap_rejected(self):
+        for cap in (0, -1, 1.5, True):
+            with self.assertRaises(ValueError):
+                RiskConfig(max_contracts=cap)
 
     def test_target_risk_above_max_stop_risk_rejected(self):
         with self.assertRaises(ValueError):
@@ -167,6 +173,15 @@ class QuantitySelectionTests(unittest.TestCase):
             trade = executed_trade(entry_price=100.0, sl_price=93.12)
             result = apply_accounting(bt_result(trade), Instrument.NQ, DEFAULT_RISK_CONFIG)
             self.assertLessEqual(result.accounted_trades[0].planned_risk_usd, 550.0)
+
+    def test_mnq_position_is_capped_at_30_instead_of_being_skipped(self):
+        # A 1pt MNQ stop risks $2/contract: $500 target would need 250
+        # contracts. The setup remains tradeable at the explicit 30-MNQ cap.
+        trade = executed_trade(entry_price=100.0, sl_price=99.0)
+        result = apply_accounting(bt_result(trade), Instrument.MNQ, DEFAULT_RISK_CONFIG)
+        accounted = result.accounted_trades[0]
+        self.assertEqual(accounted.quantity, 30)
+        self.assertEqual(accounted.planned_risk_usd, 60.0)
 
 
 class UntradeableTests(unittest.TestCase):

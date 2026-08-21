@@ -45,9 +45,11 @@ from tradelab.backtest_v2 import (
     build_synthetic_smoke_context,
     enumerate_exit_variants,
     main as backtest_v2_main,
+    merge_both_direction_entries,
     read_preflight,
     run_execution_acceleration_benchmark,
     run_batched_exit_benchmark,
+    run_both_direction_variant_backtest,
     run_preflight_v2,
     run_production_backtest_v2,
     run_strategy_variant_backtest,
@@ -70,6 +72,53 @@ from tradelab.research_run import ProgressThrottle, RunReporter, create_run, rea
 from tradelab.sweep_fvg_setup import SweepFVGSetupEvent
 
 UTC = timezone.utc
+
+
+class BothDirectionEntryMergeTests(unittest.TestCase):
+    @staticmethod
+    def _entry(entry_id: str, timestamp: datetime, direction: str) -> ObservedEntry:
+        # The merge layer only needs stable id/time/direction; execution
+        # provenance is deliberately resolved later by the normal engine.
+        return ObservedEntry(entry_id=entry_id, known_at=timestamp, direction=direction, source=object())
+
+    def test_merges_chronologically_and_keeps_both_sides(self):
+        t0 = datetime(2026, 1, 5, 15, tzinfo=UTC)
+        entries, conflicts = merge_both_direction_entries(
+            (self._entry("long-later", t0 + timedelta(minutes=2), LONG),),
+            (self._entry("short-first", t0, SHORT),),
+        )
+        self.assertEqual([entry.entry_id for entry in entries], ["short-first", "long-later"])
+        self.assertEqual(conflicts, ())
+
+    def test_simultaneous_opposing_signals_are_explicitly_skipped(self):
+        t0 = datetime(2026, 1, 5, 15, tzinfo=UTC)
+        entries, conflicts = merge_both_direction_entries(
+            (self._entry("long", t0, LONG),), (self._entry("short", t0, SHORT),),
+        )
+        self.assertEqual(entries, ())
+        self.assertEqual([skip.entry_id for skip in conflicts], ["long", "short"])
+        self.assertTrue(all(skip.reason == ExecutionSkipReason.OPPOSING_SIGNALS_SAME_INSTANT for skip in conflicts))
+
+    def test_both_runner_reports_one_combined_direction_result(self):
+        from tradelab.both_direction_universe import BothDirectionEquivalenceClass
+        context = build_synthetic_smoke_context()
+        empty_class = BothDirectionEquivalenceClass("both-empty", (), (), (), (), object(), 0, 0)
+        result = run_both_direction_variant_backtest(empty_class, ALL_EXIT_VARIANTS[0], Instrument.MNQ, context)
+        self.assertEqual(result.direction, "both")
+        self.assertEqual(result.trade_count, 0)
+
+    def test_both_runner_audits_same_instant_opposing_conflict(self):
+        from tradelab.both_direction_universe import BothDirectionEquivalenceClass
+        context = build_synthetic_smoke_context()
+        t0 = context.bars_1m[0].timestamp
+        long = self._entry("long-conflict", t0, LONG)
+        short = self._entry("short-conflict", t0, SHORT)
+        equivalence_class = BothDirectionEquivalenceClass(
+            "both-conflict", (), (long,), (short,), (), object(), 0, 0,
+        )
+        result = run_both_direction_variant_backtest(equivalence_class, ALL_EXIT_VARIANTS[0], Instrument.MNQ, context)
+        self.assertEqual(result.trade_count, 0)
+        self.assertEqual(result.skipped_entries_by_reason[ExecutionSkipReason.OPPOSING_SIGNALS_SAME_INSTANT.value], 2)
 
 
 def _write_smoke_market_artifact(tmp: Path) -> tuple[Path, Path]:
@@ -691,6 +740,8 @@ class VariantSummaryRowTests(unittest.TestCase):
         self.assertEqual(d["strategy_variant_id"], result.strategy_variant_id)
         self.assertEqual(d["net_pnl_usd"], result.net_pnl_usd)
         self.assertEqual(d["exit_variant_id"], result.exit_variant.variant_id)
+        self.assertIsNotNone(d["apex_eod_audit"])
+        self.assertIn("has_breach", d["apex_eod_audit"])
         self.assertNotIn("trades", d)  # deliberately lean -- no trade-level detail
         self.assertNotIn("equity_curve", d)
 

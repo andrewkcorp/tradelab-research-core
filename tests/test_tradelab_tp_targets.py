@@ -71,6 +71,7 @@ def wick_event(
     level_price: float = 106.0,
     known_at: datetime = T0 - timedelta(minutes=30),
     event_ids: tuple[str, ...] = ("EVT-1",),
+    taken_at: datetime | None = None,
 ) -> DataWickEvent:
     return DataWickEvent(
         event_ids=event_ids,
@@ -81,6 +82,7 @@ def wick_event(
         candle_range=10.0,
         baseline_median=2.0,
         wick_length=6.0,
+        taken_at=taken_at,
     )
 
 
@@ -120,6 +122,14 @@ class LongShortSymmetryTests(unittest.TestCase):
         result = detect_tp_target_candidates(e, EMPTY_LIQ, EMPTY_LIQ, wick_result(w))
         self.assertEqual(len(result.data_wick_targets), 1)
         self.assertEqual(result.data_wick_targets[0].price, 94.0)
+
+    def test_data_wick_taken_before_entry_is_not_a_target(self):
+        w = wick_event(taken_at=T0 - timedelta(minutes=1))
+        self.assertEqual(detect_tp_target_candidates(entry(), EMPTY_LIQ, EMPTY_LIQ, wick_result(w)).data_wick_targets, [])
+
+    def test_data_wick_beyond_conservative_distance_cap_is_not_a_target(self):
+        w = wick_event(level_price=601.0)
+        self.assertEqual(detect_tp_target_candidates(entry(), EMPTY_LIQ, EMPTY_LIQ, wick_result(w)).data_wick_targets, [])
 
 
 class WrongSideAndAtEntryTests(unittest.TestCase):

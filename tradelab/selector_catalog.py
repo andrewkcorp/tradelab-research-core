@@ -128,6 +128,27 @@ _TYPE_SIDE: dict[LiquidityType, str] = {
     LiquidityType.SESSION_OVERNIGHT_LOW: LOW,
 }
 
+_OPPOSITE_LIQUIDITY_TYPE: dict[LiquidityType, LiquidityType] = {
+    LiquidityType.SWING_HIGH: LiquidityType.SWING_LOW,
+    LiquidityType.SWING_LOW: LiquidityType.SWING_HIGH,
+    LiquidityType.EQUAL_HIGHS: LiquidityType.EQUAL_LOWS,
+    LiquidityType.EQUAL_LOWS: LiquidityType.EQUAL_HIGHS,
+    LiquidityType.SESSION_ASIA_HIGH: LiquidityType.SESSION_ASIA_LOW,
+    LiquidityType.SESSION_ASIA_LOW: LiquidityType.SESSION_ASIA_HIGH,
+    LiquidityType.SESSION_LONDON_HIGH: LiquidityType.SESSION_LONDON_LOW,
+    LiquidityType.SESSION_LONDON_LOW: LiquidityType.SESSION_LONDON_HIGH,
+    LiquidityType.SESSION_PRE_NY_HIGH: LiquidityType.SESSION_PRE_NY_LOW,
+    LiquidityType.SESSION_PRE_NY_LOW: LiquidityType.SESSION_PRE_NY_HIGH,
+    LiquidityType.SESSION_NY_AM_HIGH: LiquidityType.SESSION_NY_AM_LOW,
+    LiquidityType.SESSION_NY_AM_LOW: LiquidityType.SESSION_NY_AM_HIGH,
+    LiquidityType.SESSION_NY_LUNCH_HIGH: LiquidityType.SESSION_NY_LUNCH_LOW,
+    LiquidityType.SESSION_NY_LUNCH_LOW: LiquidityType.SESSION_NY_LUNCH_HIGH,
+    LiquidityType.SESSION_NY_PM_HIGH: LiquidityType.SESSION_NY_PM_LOW,
+    LiquidityType.SESSION_NY_PM_LOW: LiquidityType.SESSION_NY_PM_HIGH,
+    LiquidityType.SESSION_OVERNIGHT_HIGH: LiquidityType.SESSION_OVERNIGHT_LOW,
+    LiquidityType.SESSION_OVERNIGHT_LOW: LiquidityType.SESSION_OVERNIGHT_HIGH,
+}
+
 
 def _side_of(liquidity_type: LiquidityType) -> str:
     try:
@@ -174,6 +195,16 @@ _LIQUIDITY_SELECTOR_DIRECTION: dict[str, str] = {
     for entry_mode in EntryMode
 }
 
+_OPPOSITE_LIQUIDITY_SELECTOR: dict[str, str] = {
+    _liquidity_selector(timeframe, source_family, liquidity_type, trigger_phase, entry_mode): _liquidity_selector(
+        timeframe, source_family, _OPPOSITE_LIQUIDITY_TYPE[liquidity_type], trigger_phase, entry_mode
+    )
+    for timeframe in _TIMEFRAMES
+    for source_family, liquidity_type in _FAMILY_TYPE_PAIRS
+    for trigger_phase in CandidatePhase
+    for entry_mode in EntryMode
+}
+
 
 def is_canonical_selector(selector: str) -> bool:
     """True iff ``selector`` is exactly one of the 438 entries in
@@ -181,6 +212,18 @@ def is_canonical_selector(selector: str) -> bool:
     ``tradelab.entry_signal_timeline`` could actually produce, never a
     merely syntactically-plausible one."""
     return isinstance(selector, str) and selector in _CANONICAL_SELECTOR_SET
+
+
+def opposite_liquidity_selector(selector: str) -> str:
+    """Canonical selector for the opposite liquidity side, same setup mode.
+
+    A high/reversal (short) maps to low/reversal (long), a high/
+    continuation (long) maps to low/continuation (short), and vice versa.
+    """
+    try:
+        return _OPPOSITE_LIQUIDITY_SELECTOR[selector]
+    except KeyError:
+        raise ValueError(f"{selector!r} is not a canonical liquidity selector") from None
 
 
 def _require_canonical(selector: str) -> None:

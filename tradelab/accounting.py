@@ -107,6 +107,10 @@ class RiskConfig:
     target_risk_usd: float = 500.0
     max_stop_risk_usd: float = 550.0
     entry_cost_usd: float = 20.0
+    # Apex 50K EOD allows up to 60 micros, but TradeLab deliberately uses
+    # a tighter research guardrail.  A setup needing more than this is still
+    # traded at the cap, provided one MNQ contract fits the dollar-risk limit.
+    max_contracts: int = 30
 
     def __post_init__(self) -> None:
         if self.target_risk_usd <= 0:
@@ -115,6 +119,8 @@ class RiskConfig:
             raise ValueError(f"RiskConfig.max_stop_risk_usd must be positive, got {self.max_stop_risk_usd!r}")
         if self.entry_cost_usd <= 0:
             raise ValueError(f"RiskConfig.entry_cost_usd must be positive, got {self.entry_cost_usd!r}")
+        if not isinstance(self.max_contracts, int) or isinstance(self.max_contracts, bool) or self.max_contracts <= 0:
+            raise ValueError(f"RiskConfig.max_contracts must be a positive integer, got {self.max_contracts!r}")
         if self.target_risk_usd > self.max_stop_risk_usd:
             raise ValueError(
                 f"RiskConfig.target_risk_usd ({self.target_risk_usd!r}) must be <= max_stop_risk_usd "
@@ -203,7 +209,12 @@ def apply_accounting(backtest_result: BacktestResult, instrument: Instrument, ri
 
     for trade in backtest_result.trades:
         risk_per_contract_usd = _risk_per_contract(trade, pv)
-        quantity = _choose_quantity(risk_per_contract_usd, risk_config.target_risk_usd, risk_config.max_stop_risk_usd)
+        quantity = _choose_quantity(
+            risk_per_contract_usd,
+            risk_config.target_risk_usd,
+            risk_config.max_stop_risk_usd,
+            risk_config.max_contracts,
+        )
 
         if quantity is None:
             untradeable.append(
@@ -278,17 +289,22 @@ def _risk_per_contract(trade: ExecutedTrade, pv: float) -> float:
     return risk
 
 
-def _choose_quantity(risk_per_contract_usd: float, target_risk_usd: float, max_stop_risk_usd: float) -> int | None:
+def _choose_quantity(
+    risk_per_contract_usd: float,
+    target_risk_usd: float,
+    max_stop_risk_usd: float,
+    max_contracts: int,
+) -> int | None:
     """The contract count whose planned risk is closest to ``target_risk_
-    usd`` among every positive integer count that keeps planned risk at
-    or below ``max_stop_risk_usd`` -- ``None`` if not even one contract
-    qualifies (untradeable). Ties favor the smaller count; see the
-    module docstring for why an ascending scan alone already guarantees
-    that without extra tie-breaking logic."""
+    usd`` among every positive integer count up to ``max_contracts`` that
+    keeps planned risk at or below ``max_stop_risk_usd`` -- ``None`` if not
+    even one contract qualifies (untradeable). Ties favor the smaller count;
+    see the module docstring for why an ascending scan alone already
+    guarantees that without extra tie-breaking logic."""
     best_quantity: int | None = None
     best_distance: float | None = None
     quantity = 1
-    while quantity * risk_per_contract_usd <= max_stop_risk_usd + _RISK_EPSILON:
+    while quantity <= max_contracts and quantity * risk_per_contract_usd <= max_stop_risk_usd + _RISK_EPSILON:
         distance = abs(quantity * risk_per_contract_usd - target_risk_usd)
         if best_distance is None or distance < best_distance - _RISK_EPSILON:
             best_distance = distance
