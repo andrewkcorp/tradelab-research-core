@@ -12,7 +12,7 @@ are deliberately removed from that stream by its conservative conflict rule.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from tradelab.entry_signal_timeline import LONG, SHORT
 from tradelab.entry_strategy_universe import (
@@ -21,6 +21,7 @@ from tradelab.entry_strategy_universe import (
     EntryStrategyUniverseResult,
     ObservedEntry,
     PrimaryTriggerKind,
+    mirror_bias_requirement,
 )
 from tradelab.selector_catalog import opposite_liquidity_selector
 
@@ -45,6 +46,7 @@ class BothDirectionEquivalenceClass:
     representative_spec: BothDirectionSpec
     entry_count_2024: int
     entry_count_2025: int
+    fvg_link_selectors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -80,10 +82,20 @@ def discover_both_direction_universe(universe: EntryStrategyUniverseResult) -> B
     entries_by_key: dict[tuple, tuple[ObservedEntry, ...]] = {}
     streams_by_key: dict[tuple, tuple[tuple[ObservedEntry, ...], tuple[ObservedEntry, ...]]] = {}
     for pair in pairs:
-        long_entries = class_by_spec_id[pair.long_spec.spec_id].observed_entries
-        short_entries = class_by_spec_id[pair.short_spec.spec_id].observed_entries
+        fvg_link_selectors = _fvg_link_selectors(pair.long_spec)
+        long_entries = tuple(
+            replace(entry, strategy_fvg_link_selectors=fvg_link_selectors)
+            for entry in class_by_spec_id[pair.long_spec.spec_id].observed_entries
+        )
+        short_entries = tuple(
+            replace(entry, strategy_fvg_link_selectors=fvg_link_selectors)
+            for entry in class_by_spec_id[pair.short_spec.spec_id].observed_entries
+        )
         entries = _merge_for_key(long_entries, short_entries)
-        sequence_key = tuple((entry.entry_id, entry.known_at, entry.direction) for entry in entries)
+        sequence_key = (
+            tuple((entry.entry_id, entry.known_at, entry.direction) for entry in entries),
+            fvg_link_selectors,
+        )
         grouped.setdefault(sequence_key, []).append(pair)
         entries_by_key[sequence_key] = entries
         streams_by_key[sequence_key] = (long_entries, short_entries)
@@ -99,6 +111,7 @@ def discover_both_direction_universe(universe: EntryStrategyUniverseResult) -> B
             representative_spec=ordered_members[0],
             entry_count_2024=sum(1 for entry in entries if entry.known_at.year == 2024),
             entry_count_2025=sum(1 for entry in entries if entry.known_at.year == 2025),
+            fvg_link_selectors=_fvg_link_selectors(ordered_members[0].long_spec),
         ))
     classes.sort(key=lambda value: value.class_id)
     return BothDirectionUniverseResult(tuple(classes), len(pairs), len(classes))
@@ -112,13 +125,33 @@ def _symmetric_key(spec: EntryStrategySpec) -> tuple:
         assert primary.liquidity_selector is not None
         opposite = opposite_liquidity_selector(primary.liquidity_selector)
         primary_key = (primary.kind.value, primary.timeframe, min(primary.liquidity_selector, opposite))
+    bias = spec.bias_requirement if spec.primary.direction == LONG else mirror_bias_requirement(spec.bias_requirement)
     return (
         primary_key,
         tuple(sorted(spec.required_fvg_context_selectors)),
-        spec.bias_requirement.tf_1h,
-        spec.bias_requirement.tf_4h,
-        spec.bias_requirement.tf_1d,
+        bias.tf_1h,
+        bias.tf_4h,
+        bias.tf_1d,
     )
+
+
+def _fvg_link_selectors(spec: EntryStrategySpec) -> tuple[str, ...]:
+    """Exact 5m/15m FVG selectors this recipe is allowed to use for SL."""
+    selectors = {
+        selector for selector in spec.required_fvg_context_selectors
+        if selector.startswith(("fvg-5m-", "fvg-15m-"))
+    }
+    primary = spec.primary
+    kind_by_primary = {
+        PrimaryTriggerKind.FVG_TOUCH: "fvg_touch",
+        PrimaryTriggerKind.IFVG: "ifvg",
+        PrimaryTriggerKind.SWEEP_FVG_TOUCH_SETUP: "fvg_touch",
+        PrimaryTriggerKind.SWEEP_IFVG_SETUP: "ifvg",
+    }
+    kind = kind_by_primary.get(primary.kind)
+    if kind is not None and primary.timeframe in ("5m", "15m"):
+        selectors.add(f"fvg-{primary.timeframe}-{kind}")
+    return tuple(sorted(selectors))
 
 
 def _merge_for_key(long_entries: tuple[ObservedEntry, ...], short_entries: tuple[ObservedEntry, ...]) -> tuple[ObservedEntry, ...]:

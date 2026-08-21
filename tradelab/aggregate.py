@@ -106,7 +106,12 @@ def aggregate_bars(bars: list[Bar1m], timeframe: str) -> list[AggregatedBar]:
                 volume=sum(b.volume for b in acc),
                 contract=acc[0].contract,
                 timeframe=timeframe,
-                known_at=bucket_end_utc,
+                # The aggregate is knowable when its final expected *open*
+                # minute closes.  For 1D and the 14:00-18:00 4H bucket the
+                # nominal wall-clock tail 17:00-18:00 is a scheduled CME
+                # closure, so waiting until 18:00 would delay HTF state by an
+                # artificial hour even though no further member bar can occur.
+                known_at=acc[-1].timestamp + timedelta(minutes=1),
             )
         )
 

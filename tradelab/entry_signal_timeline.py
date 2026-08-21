@@ -1137,6 +1137,7 @@ class MarketStateSnapshot:
 
     as_of: datetime
     active_fvg_selectors_by_direction: Mapping[str, frozenset[str]]
+    active_fvg_zone_ids_by_direction_selector: Mapping[str, Mapping[str, tuple[str, ...]]]
     bias: BiasSnapshot
 
 
@@ -1509,6 +1510,15 @@ def iter_candidate_entry_snapshots(
         market_state = MarketStateSnapshot(
             as_of=real_events[0].known_at,
             active_fvg_selectors_by_direction={LONG: counter.active_selectors(LONG), SHORT: counter.active_selectors(SHORT)},
+            active_fvg_zone_ids_by_direction_selector={
+                direction: {
+                    _fvg_zone_selector(timeframe, FVGSourceType.FVG_TOUCH.value): tuple(sorted(zones))
+                    for timeframe, by_direction in zone_active.items()
+                    for zones in (by_direction.get(direction, {}),)
+                    if zones
+                }
+                for direction in (LONG, SHORT)
+            },
             bias=BiasSnapshot(timeframe_states=dict(bias_timeframe_states), global_bias=bias_global),
         )
         for signal in real_events:

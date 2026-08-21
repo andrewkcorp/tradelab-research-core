@@ -32,8 +32,11 @@ class AccountMarkToMarketAudit:
     """Conservative account-level intrabar risk observation.
 
     ``worst_equity_usd`` marks a long to each bar's low and a short to each
-    bar's high. It is deliberately an audit lower bound, not an additional
-    fill model: it cannot alter entries, exits, cash equity or ranking.
+    bar's high. ``max_mark_to_market_drawdown_usd`` is conservative when the
+    intrabar order is unknown: each bar's favourable extreme may establish a
+    peak before that same bar's adverse extreme measures drawdown.  This is an
+    audit bound, not an additional fill model: it cannot alter entries, exits,
+    cash equity or ranking.
     """
 
     worst_equity_usd: float
@@ -128,16 +131,20 @@ def _audit_account_mark_to_market_reference(
         if bar.timestamp in starts:
             open_trade = starts[bar.timestamp]
             balance -= open_trade.entry_cost_usd
-        marked = balance
+        adverse_marked = balance
+        favourable_marked = balance
         if open_trade is not None:
             pv = point_value_usd(open_trade.instrument)
             adverse_price = bar.low if open_trade.direction == "long" else bar.high
-            points = (adverse_price - open_trade.entry_price) if open_trade.direction == "long" else (open_trade.entry_price - adverse_price)
-            marked += points * pv * open_trade.quantity
-        peak = max(peak, marked)
-        max_drawdown = max(max_drawdown, peak - marked)
-        if marked < worst:
-            worst, worst_at = marked, bar.timestamp
+            favourable_price = bar.high if open_trade.direction == "long" else bar.low
+            adverse_points = (adverse_price - open_trade.entry_price) if open_trade.direction == "long" else (open_trade.entry_price - adverse_price)
+            favourable_points = (favourable_price - open_trade.entry_price) if open_trade.direction == "long" else (open_trade.entry_price - favourable_price)
+            adverse_marked += adverse_points * pv * open_trade.quantity
+            favourable_marked += favourable_points * pv * open_trade.quantity
+        peak = max(peak, favourable_marked)
+        max_drawdown = max(max_drawdown, peak - adverse_marked)
+        if adverse_marked < worst:
+            worst, worst_at = adverse_marked, bar.timestamp
         if bar.timestamp in ends:
             closing = ends[bar.timestamp]
             assert closing.gross_pnl_usd is not None
@@ -197,23 +204,36 @@ def audit_account_mark_to_market(
     worst_at: datetime | None = None
     previous_end = -1
     for open_trade, start, end in sorted(starts.values(), key=lambda item: item[1]):
-        if start <= previous_end:
+        # Multiple signals sharing a timestamp may each enter and resolve
+        # immediately on that same 1m bar. They are sequential in execution
+        # order and therefore valid when start == previous_end.
+        if start < previous_end:
             raise ValueError("accounted trades overlap; one-position MTM audit requires non-overlapping trades")
         previous_end = end
         balance -= open_trade.entry_cost_usd
         pv = point_value_usd(open_trade.instrument)
         for bar in ordered_bars[start:end + 1]:
             adverse_price = bar.low if open_trade.direction == "long" else bar.high
-            points = (
+            favourable_price = bar.high if open_trade.direction == "long" else bar.low
+            adverse_points = (
                 adverse_price - open_trade.entry_price
                 if open_trade.direction == "long"
                 else open_trade.entry_price - adverse_price
             )
-            marked = balance + points * pv * open_trade.quantity
-            peak = max(peak, marked)
-            max_drawdown = max(max_drawdown, peak - marked)
-            if marked < worst:
-                worst, worst_at = marked, bar.timestamp
+            favourable_points = (
+                favourable_price - open_trade.entry_price
+                if open_trade.direction == "long"
+                else open_trade.entry_price - favourable_price
+            )
+            adverse_marked = balance + adverse_points * pv * open_trade.quantity
+            favourable_marked = balance + favourable_points * pv * open_trade.quantity
+            # We do not know whether high or low printed first inside the 1m
+            # candle.  For a risk audit, assume the favourable extreme could
+            # establish the peak first and then measure the adverse extreme.
+            peak = max(peak, favourable_marked)
+            max_drawdown = max(max_drawdown, peak - adverse_marked)
+            if adverse_marked < worst:
+                worst, worst_at = adverse_marked, bar.timestamp
         if open_trade.exit_timestamp is not None:
             assert open_trade.gross_pnl_usd is not None
             balance += open_trade.gross_pnl_usd

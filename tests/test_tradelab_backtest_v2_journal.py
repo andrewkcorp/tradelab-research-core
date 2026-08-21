@@ -24,7 +24,9 @@ def _summary_row(variant_id: str, *, net_pnl_usd: float = 100.0, max_drawdown_us
         "exit_variant_id": "tp_first_swing_high_r1__sl_first_swing_low_r1", "tp_kind": "first_swing_high", "tp_rank": 1,
         "sl_kind": "first_swing_low", "sl_rank": 1, "sl_fvg_timeframe": None, "net_pnl_usd": net_pnl_usd, "roi": 0.1,
         "win_rate": 0.5, "trade_count": 10, "max_drawdown_usd": max_drawdown_usd, "drawdowns_over_2000_count": 0,
-        "skipped_entries_by_reason": {}, "yearly": {}, "monthly": {},
+        "research_eligible": True, "completed_trades_2024": 100, "completed_trades_2025": 100,
+        "skipped_entries_by_reason": {},
+        "yearly": {"2024": {"trade_count": 100}, "2025": {"trade_count": 100}}, "monthly": {},
     }
 
 
@@ -160,6 +162,25 @@ class CommitSummaryAndUniquenessTests(unittest.TestCase):
             self.assertEqual(stored.apex_largest_eod_drawdown_breach_usd, 50.0)
             j.close()
 
+    def test_persists_research_eligibility_and_mark_to_market_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _open(Path(tmp) / "journal.sqlite3")
+            row = _summary_row("eligible")
+            row["mark_to_market_audit"] = {
+                "worst_equity_usd": 47_500.0,
+                "max_mark_to_market_drawdown_usd": 3_250.0,
+                "timestamp_of_worst_equity": "2025-04-01T14:31:00+00:00",
+            }
+            j.commit_summary(row)
+            stored = j.top_n_summaries(1)[0]
+            self.assertTrue(stored.research_eligible)
+            self.assertEqual(stored.completed_trades_2024, 100)
+            self.assertEqual(stored.completed_trades_2025, 100)
+            self.assertEqual(stored.mtm_worst_equity_usd, 47_500.0)
+            self.assertEqual(stored.mtm_max_drawdown_usd, 3_250.0)
+            self.assertEqual(stored.mtm_worst_equity_at, "2025-04-01T14:31:00+00:00")
+            j.close()
+
     def test_duplicate_strategy_variant_id_raises_rather_than_silently_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "journal.sqlite3"
@@ -172,6 +193,21 @@ class CommitSummaryAndUniquenessTests(unittest.TestCase):
 
 
 class TopNSummariesOrderingTests(unittest.TestCase):
+    def test_ineligible_rows_are_durable_but_excluded_from_leaderboard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _open(Path(tmp) / "journal.sqlite3")
+            ineligible = _summary_row("ineligible", net_pnl_usd=1_000_000.0)
+            ineligible.update({
+                "research_eligible": False,
+                "completed_trades_2024": 99,
+                "completed_trades_2025": 100,
+            })
+            j.commit_summary(ineligible)
+            j.commit_summary(_summary_row("eligible", net_pnl_usd=1.0))
+            self.assertEqual(j.completed_count(), 2)
+            self.assertEqual([row.strategy_variant_id for row in j.top_n_summaries(10)], ["eligible"])
+            j.close()
+
     def test_ranked_by_net_pnl_desc_then_drawdown_asc_then_id_desc(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "journal.sqlite3"

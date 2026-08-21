@@ -155,7 +155,7 @@ class DailyBreakCompletenessTests(unittest.TestCase):
 
         [agg] = aggregate_bars(bars, "1D")
         self.assertEqual(agg.timestamp, start_utc)
-        self.assertEqual(agg.known_at, end_utc)
+        self.assertEqual(agg.known_at, bars[-1].timestamp + timedelta(minutes=1))
         self.assertEqual(agg.open, bars[0].open)
         self.assertEqual(agg.close, bars[-1].close)
 
@@ -167,7 +167,7 @@ class DailyBreakCompletenessTests(unittest.TestCase):
 
         [agg] = aggregate_bars(bars, "4H")
         self.assertEqual(agg.timestamp, start_utc)
-        self.assertEqual(agg.known_at, end_utc)
+        self.assertEqual(agg.known_at, bars[-1].timestamp + timedelta(minutes=1))
 
     def test_one_missing_regular_minute_still_rejects_the_4h_bucket(self):
         start_utc = datetime(2026, 1, 6, 14, 0, tzinfo=NY).astimezone(timezone.utc)
@@ -205,7 +205,7 @@ class TradingDayTests(unittest.TestCase):
         self.assertEqual(agg[0].timestamp, day1_start)
         self.assertEqual(agg[0].open, day1[0].open)
         self.assertEqual(agg[0].close, day1[-1].close)
-        self.assertEqual(agg[0].known_at, day1_end)
+        self.assertEqual(agg[0].known_at, day1[-1].timestamp + timedelta(minutes=1))
         self.assertEqual(agg[1].open, day2[0].open)
 
 
@@ -219,11 +219,10 @@ class FourHourAnchorTests(unittest.TestCase):
         self.assertEqual(len(agg), 6)
         expected_hours = [18, 22, 2, 6, 10, 14]
         self.assertEqual([a.timestamp.astimezone(NY).hour for a in agg], expected_hours)
-        # known_at is always the nominal wall-clock close of the window (raw
-        # 240 minutes later here, no DST involved) -- it marks *when* the bar
-        # is known, independent of how many bars fed it.
+        # known_at is the close of the final expected member candle. The last
+        # bucket is complete at 17:00 because 17:00-18:00 is scheduled closed.
         raw_durations = [(a.known_at - a.timestamp).total_seconds() / 60 for a in agg]
-        self.assertEqual(raw_durations, [240] * 6)
+        self.assertEqual(raw_durations, [240, 240, 240, 240, 240, 180])
         # Each bar_at_utc fixture has volume=1, so summed volume reveals how
         # many 1m bars actually fed each bucket: 240 for every segment except
         # the last (14:00-18:00), which loses its final hour to the daily
@@ -275,10 +274,10 @@ class DstTransitionTests(unittest.TestCase):
         complete = [bar_at_utc(t) for t in expected]
         closer = [bar_at_utc(datetime(2026, 11, 2, 0, 0, tzinfo=timezone.utc))]
         [agg] = aggregate_bars(complete + closer, "1D")
-        # known_at is the nominal wall-clock close (25 real hours later here,
-        # the fall-back extra hour) -- independent of how many bars fed it.
-        self.assertEqual((agg.known_at - agg.timestamp).total_seconds() / 60, 1500)
-        self.assertEqual(agg.known_at.astimezone(NY), datetime(2026, 11, 1, 18, 0, tzinfo=NY))
+        # The last expected member closes at 17:00 NY; the scheduled final
+        # hour is not part of OHLC and cannot delay availability.
+        self.assertEqual((agg.known_at - agg.timestamp).total_seconds() / 60, 1440)
+        self.assertEqual(agg.known_at.astimezone(NY), datetime(2026, 11, 1, 17, 0, tzinfo=NY))
         self.assertEqual(agg.volume, 1440)  # each fixture bar has volume=1: 1440 fed the bucket
 
         one_short = [bar_at_utc(t) for t in expected[:-1]]

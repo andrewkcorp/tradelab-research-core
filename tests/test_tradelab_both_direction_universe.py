@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
-from tradelab.bias import BULLISH
+from tradelab.bias import BEARISH, BULLISH
 from tradelab.both_direction_universe import discover_both_direction_universe
 from tradelab.entry_signal_timeline import LONG, SHORT
 from tradelab.entry_strategy_universe import (
@@ -14,12 +14,12 @@ from tradelab.entry_strategy_universe import (
 UTC = timezone.utc
 
 
-def _spec(direction: str) -> EntryStrategySpec:
+def _spec(direction: str, bias: BiasRequirementSpec | None = None) -> EntryStrategySpec:
     primary = PrimaryTriggerSpec(PrimaryTriggerKind.FVG_TOUCH, direction, "1m")
     return EntryStrategySpec(
         spec_id=f"fvg_touch|{direction}|1m|-|ctx=-|bias=1H:any,4H:any,1D:any",
         primary=primary, required_fvg_context_selectors=frozenset(),
-        bias_requirement=BiasRequirementSpec("any", "any", "any"),
+        bias_requirement=bias or BiasRequirementSpec("any", "any", "any"),
     )
 
 
@@ -28,6 +28,27 @@ def _class(spec: EntryStrategySpec, entry: ObservedEntry) -> EntryStrategyEquiva
 
 
 class BothDirectionUniverseTests(unittest.TestCase):
+    @staticmethod
+    def _universe(long: EntryStrategySpec, short: EntryStrategySpec) -> EntryStrategyUniverseResult:
+        t0 = datetime(2024, 6, 3, 14, tzinfo=UTC)
+        return EntryStrategyUniverseResult(
+            equivalence_classes=(
+                _class(long, ObservedEntry("long", t0, LONG, object())),
+                _class(short, ObservedEntry("short", t0.replace(minute=1), SHORT, object())),
+            ),
+            syntactically_enumerated_spec_count=2, eligible_spec_count=2,
+            specs_rejected_by_yearly_eligibility_count=0, equivalence_class_count=2,
+            spec_counts_by_primary_kind={}, spec_counts_by_direction={},
+            spec_counts_by_execution_timeframe={}, spec_counts_by_bias_requirement_pattern={},
+        )
+
+    def test_pairs_direction_relative_mirrored_bias_not_same_literal_bias(self):
+        long = _spec(LONG, BiasRequirementSpec(BULLISH, BEARISH, "neutral"))
+        mirrored_short = _spec(SHORT, BiasRequirementSpec(BEARISH, BULLISH, "neutral"))
+        same_literal_short = _spec(SHORT, BiasRequirementSpec(BULLISH, BEARISH, "neutral"))
+        self.assertEqual(discover_both_direction_universe(self._universe(long, mirrored_short)).paired_spec_count, 1)
+        self.assertEqual(discover_both_direction_universe(self._universe(long, same_literal_short)).paired_spec_count, 0)
+
     def test_pairs_symmetric_fvg_long_short_and_merges_entries(self):
         t0 = datetime(2024, 6, 3, 14, tzinfo=UTC)
         long, short = _spec(LONG), _spec(SHORT)

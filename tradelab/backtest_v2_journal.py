@@ -56,7 +56,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-JOURNAL_SCHEMA_VERSION = "1.0"
+JOURNAL_SCHEMA_VERSION = "1.1"
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS run_manifest (
@@ -92,11 +92,18 @@ CREATE TABLE IF NOT EXISTS variant_summaries (
     trade_count INTEGER NOT NULL,
     max_drawdown_usd REAL NOT NULL,
     drawdowns_over_2000_count INTEGER NOT NULL,
+    research_eligible INTEGER NOT NULL DEFAULT 0,
+    completed_trades_2024 INTEGER NOT NULL DEFAULT 0,
+    completed_trades_2025 INTEGER NOT NULL DEFAULT 0,
+    ambiguous_same_bar_exit_count INTEGER NOT NULL DEFAULT 0,
     apex_has_breach INTEGER NOT NULL DEFAULT 0,
     apex_breach_count INTEGER NOT NULL DEFAULT 0,
     apex_breached_trading_day_count INTEGER NOT NULL DEFAULT 0,
     apex_max_daily_loss_usd REAL NOT NULL DEFAULT 0,
     apex_largest_eod_drawdown_breach_usd REAL NOT NULL DEFAULT 0,
+    mtm_worst_equity_usd REAL,
+    mtm_max_drawdown_usd REAL,
+    mtm_worst_equity_at TEXT,
     skipped_entries_by_reason_json TEXT NOT NULL,
     yearly_json TEXT NOT NULL,
     monthly_json TEXT NOT NULL,
@@ -112,8 +119,12 @@ _MANIFEST_COLUMNS = (
 _SUMMARY_COLUMNS = (
     "strategy_variant_id", "equivalence_class_id", "direction", "instrument", "exit_variant_id", "tp_kind", "tp_rank",
     "sl_kind", "sl_rank", "sl_fvg_timeframe", "net_pnl_usd", "roi", "win_rate", "trade_count", "max_drawdown_usd",
-    "drawdowns_over_2000_count", "apex_has_breach", "apex_breach_count", "apex_breached_trading_day_count",
-    "apex_max_daily_loss_usd", "apex_largest_eod_drawdown_breach_usd", "skipped_entries_by_reason_json", "yearly_json", "monthly_json",
+    "drawdowns_over_2000_count", "research_eligible", "completed_trades_2024", "completed_trades_2025",
+    "ambiguous_same_bar_exit_count",
+    "apex_has_breach", "apex_breach_count", "apex_breached_trading_day_count",
+    "apex_max_daily_loss_usd", "apex_largest_eod_drawdown_breach_usd",
+    "mtm_worst_equity_usd", "mtm_max_drawdown_usd", "mtm_worst_equity_at",
+    "skipped_entries_by_reason_json", "yearly_json", "monthly_json",
 )
 
 
@@ -146,11 +157,18 @@ class JournalVariantSummary:
     trade_count: int
     max_drawdown_usd: float
     drawdowns_over_2000_count: int
+    research_eligible: bool
+    completed_trades_2024: int
+    completed_trades_2025: int
+    ambiguous_same_bar_exit_count: int
     apex_has_breach: bool
     apex_breach_count: int
     apex_breached_trading_day_count: int
     apex_max_daily_loss_usd: float
     apex_largest_eod_drawdown_breach_usd: float
+    mtm_worst_equity_usd: float | None
+    mtm_max_drawdown_usd: float | None
+    mtm_worst_equity_at: str | None
     skipped_entries_by_reason: Mapping[str, int]
     yearly: Mapping[str, Mapping[str, float | int]]
     monthly: Mapping[str, Mapping[str, float | int]]
@@ -160,18 +178,25 @@ class JournalVariantSummary:
         (
             strategy_variant_id, equivalence_class_id, direction, instrument, exit_variant_id, tp_kind, tp_rank, sl_kind,
             sl_rank, sl_fvg_timeframe, net_pnl_usd, roi, win_rate, trade_count, max_drawdown_usd, drawdowns_over_2000_count,
+            research_eligible, completed_trades_2024, completed_trades_2025, ambiguous_same_bar_exit_count,
             apex_has_breach, apex_breach_count, apex_breached_trading_day_count, apex_max_daily_loss_usd,
-            apex_largest_eod_drawdown_breach_usd, skipped_json, yearly_json, monthly_json,
+            apex_largest_eod_drawdown_breach_usd, mtm_worst_equity_usd, mtm_max_drawdown_usd,
+            mtm_worst_equity_at, skipped_json, yearly_json, monthly_json,
         ) = row
         return JournalVariantSummary(
             strategy_variant_id=strategy_variant_id, equivalence_class_id=equivalence_class_id, direction=direction,
             instrument=instrument, exit_variant_id=exit_variant_id, tp_kind=tp_kind, tp_rank=tp_rank, sl_kind=sl_kind,
             sl_rank=sl_rank, sl_fvg_timeframe=sl_fvg_timeframe, net_pnl_usd=net_pnl_usd, roi=roi, win_rate=win_rate,
             trade_count=trade_count, max_drawdown_usd=max_drawdown_usd, drawdowns_over_2000_count=drawdowns_over_2000_count,
+            research_eligible=bool(research_eligible), completed_trades_2024=completed_trades_2024,
+            completed_trades_2025=completed_trades_2025,
+            ambiguous_same_bar_exit_count=ambiguous_same_bar_exit_count,
             apex_has_breach=bool(apex_has_breach), apex_breach_count=apex_breach_count,
             apex_breached_trading_day_count=apex_breached_trading_day_count,
             apex_max_daily_loss_usd=apex_max_daily_loss_usd,
             apex_largest_eod_drawdown_breach_usd=apex_largest_eod_drawdown_breach_usd,
+            mtm_worst_equity_usd=mtm_worst_equity_usd, mtm_max_drawdown_usd=mtm_max_drawdown_usd,
+            mtm_worst_equity_at=mtm_worst_equity_at,
             skipped_entries_by_reason=json.loads(skipped_json), yearly=json.loads(yearly_json), monthly=json.loads(monthly_json),
         )
 
@@ -323,11 +348,17 @@ class BacktestV2Journal:
                     row["exit_variant_id"], row["tp_kind"], row["tp_rank"], row["sl_kind"], row["sl_rank"],
                     row["sl_fvg_timeframe"], row["net_pnl_usd"], row["roi"], row["win_rate"], row["trade_count"],
                     row["max_drawdown_usd"], row["drawdowns_over_2000_count"],
+                    int(bool(row.get("research_eligible", False))),
+                    int(row.get("completed_trades_2024", 0)), int(row.get("completed_trades_2025", 0)),
+                    int(row.get("ambiguous_same_bar_exit_count", 0)),
                     int(bool((row.get("apex_eod_audit") or {}).get("has_breach", False))),
                     int((row.get("apex_eod_audit") or {}).get("breach_count", 0)),
                     int((row.get("apex_eod_audit") or {}).get("breached_trading_day_count", 0)),
                     float((row.get("apex_eod_audit") or {}).get("max_daily_loss_usd", 0.0)),
                     float((row.get("apex_eod_audit") or {}).get("largest_eod_drawdown_breach_usd", 0.0)),
+                    (row.get("mark_to_market_audit") or {}).get("worst_equity_usd"),
+                    (row.get("mark_to_market_audit") or {}).get("max_mark_to_market_drawdown_usd"),
+                    (row.get("mark_to_market_audit") or {}).get("timestamp_of_worst_equity"),
                     json.dumps(dict(row["skipped_entries_by_reason"]), sort_keys=True),
                     json.dumps(dict(row["yearly"]), sort_keys=True), json.dumps(dict(row["monthly"]), sort_keys=True),
                     _utc_now_iso(),
@@ -344,6 +375,7 @@ class BacktestV2Journal:
             return []
         rows = self._conn.execute(
             f"SELECT {', '.join(_SUMMARY_COLUMNS)} FROM variant_summaries "
+            "WHERE research_eligible = 1 "
             "ORDER BY net_pnl_usd DESC, max_drawdown_usd ASC, strategy_variant_id DESC LIMIT ?",
             (n,),
         ).fetchall()
@@ -365,12 +397,36 @@ _SUMMARY_MIGRATION_COLUMNS = {
     "apex_breached_trading_day_count": "INTEGER NOT NULL DEFAULT 0",
     "apex_max_daily_loss_usd": "REAL NOT NULL DEFAULT 0",
     "apex_largest_eod_drawdown_breach_usd": "REAL NOT NULL DEFAULT 0",
+    "research_eligible": "INTEGER NOT NULL DEFAULT 0",
+    "completed_trades_2024": "INTEGER NOT NULL DEFAULT 0",
+    "completed_trades_2025": "INTEGER NOT NULL DEFAULT 0",
+    "ambiguous_same_bar_exit_count": "INTEGER NOT NULL DEFAULT 0",
+    "mtm_worst_equity_usd": "REAL",
+    "mtm_max_drawdown_usd": "REAL",
+    "mtm_worst_equity_at": "TEXT",
 }
 
 
 def _migrate_summary_schema(conn: sqlite3.Connection) -> None:
     """Add read-only audit columns to pre-existing local journals safely."""
     existing = {row[1] for row in conn.execute("PRAGMA table_info(variant_summaries)")}
+    added_eligibility = "research_eligible" not in existing
     for name, definition in _SUMMARY_MIGRATION_COLUMNS.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE variant_summaries ADD COLUMN {name} {definition}")
+    if added_eligibility:
+        # Historic journals stored yearly trade counts only in JSON.  Migrate
+        # them deterministically using the long-standing 100/year research
+        # threshold so the dashboard does not silently hide valid old rows.
+        for rowid, yearly_json in conn.execute("SELECT rowid, yearly_json FROM variant_summaries"):
+            yearly = json.loads(yearly_json)
+            count_2024 = int(yearly.get("2024", {}).get("trade_count", 0))
+            count_2025 = int(yearly.get("2025", {}).get("trade_count", 0))
+            conn.execute(
+                "UPDATE variant_summaries SET research_eligible = ?, completed_trades_2024 = ?, completed_trades_2025 = ? WHERE rowid = ?",
+                (int(count_2024 >= 100 and count_2025 >= 100), count_2024, count_2025, rowid),
+            )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_variant_summaries_eligible_pnl "
+        "ON variant_summaries(research_eligible, net_pnl_usd DESC, max_drawdown_usd ASC)"
+    )

@@ -152,6 +152,38 @@ class GrammarSizeTests(unittest.TestCase):
 
 
 class PrimaryTriggerKindTests(unittest.TestCase):
+    def test_both_yearly_eligibility_combines_natural_long_and_short_sides(self):
+        candidates = []
+        zones = []
+        for year in (2024, 2025):
+            base = datetime(year, 1, 1, tzinfo=UTC)
+            for direction, count, prefix in ((LONG, 60, "long"), (SHORT, 40, "short")):
+                for i in range(count):
+                    known_at = base + timedelta(days=i, hours=12)
+                    zone_id = f"{year}-{prefix}-{i}"
+                    zones.append(fvg_zone(zone_id, "1m", direction, known_at - timedelta(minutes=1)))
+                    candidates.append(fvg_touch(zone_id, "1m", direction, known_at))
+
+        directional = discover_entry_strategy_universe(
+            fvg_res(*zones), FVGEntryCandidateResult(candidates=candidates),
+            LiquidityEntryCandidateResult(candidates=[]), EMPTY_BIAS,
+            min_entries_per_year=100,
+        )
+        combined = discover_entry_strategy_universe(
+            fvg_res(*zones), FVGEntryCandidateResult(candidates=candidates),
+            LiquidityEntryCandidateResult(candidates=[]), EMPTY_BIAS,
+            min_entries_per_year=100, pair_yearly_eligibility_for_both=True,
+        )
+
+        self.assertEqual(directional.eligible_spec_count, 0)
+        self.assertGreater(combined.eligible_spec_count, 0)
+        directions = {
+            spec.primary.direction
+            for equivalence_class in combined.equivalence_classes
+            for spec in equivalence_class.member_specs
+        }
+        self.assertEqual(directions, {LONG, SHORT})
+
     def test_fvg_touch_primary_produces_eligible_entries(self):
         year = 2024
         candidates, zones = repeated_touch_candidates(LONG, "1m", year, DEFAULT_MIN_ENTRIES_PER_YEAR, "ta")

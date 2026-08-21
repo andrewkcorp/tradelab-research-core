@@ -22,7 +22,7 @@ from unittest.mock import patch
 
 from tradelab.accounting import Instrument, RiskConfig, UntradeableReason, apply_accounting, point_value_usd
 from tradelab.entry_target_cache import EntryTargetCache
-from tradelab.backtest import BacktestResult, TradeExitReason, prepare_backtest_context
+from tradelab.backtest import BacktestResult, ExecutedTrade, TradeExitReason, prepare_backtest_context
 from tradelab.backtest_v2 import (
     ALL_EXIT_VARIANTS,
     DEFAULT_EQUITY_CONFIG,
@@ -34,9 +34,11 @@ from tradelab.backtest_v2 import (
     TPVariantKind,
     VariantSummaryRow,
     _expand_and_simulate,
+    _ambiguous_same_bar_exit_count,
     _find_first_exit,
     _leaderboard_sort_key,
     _linked_fvg_candidate,
+    _linked_fvg_candidates,
     _open_journal,
     _resolve_sl_candidate,
     _simulate_market_execution_reference,
@@ -66,6 +68,7 @@ from tradelab.entry_signal_timeline import LONG, SHORT, EntryEvent, EntryEventKi
 from tradelab.entry_strategy_universe import EntryStrategyUniverseResult, ObservedEntry, discover_entry_strategy_universe
 from tradelab.equity import build_equity_curve
 from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, SourceType
+from tradelab.fvg import FVGStatus, FVGZone
 from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityLevel, LiquidityStatus, LiquidityType
 from tradelab.market_data_artifact import MarketDataArtifact, SeriesKind
 from tradelab.news import NewsBlackoutIndex, NewsEvent
@@ -99,6 +102,23 @@ class BothDirectionEntryMergeTests(unittest.TestCase):
         self.assertEqual(entries, ())
         self.assertEqual([skip.entry_id for skip in conflicts], ["long", "short"])
         self.assertTrue(all(skip.reason == ExecutionSkipReason.OPPOSING_SIGNALS_SAME_INSTANT for skip in conflicts))
+
+    def test_compact_opposing_signal_audit_exactly_matches_detailed_audit(self):
+        t0 = datetime(2026, 1, 5, 15, tzinfo=UTC)
+        long_entries = (
+            self._entry("long-conflict", t0, LONG),
+            self._entry("long-ok", t0 + timedelta(minutes=1), LONG),
+        )
+        short_entries = (self._entry("short-conflict", t0, SHORT),)
+        detailed_entries, detailed = merge_both_direction_entries(long_entries, short_entries)
+        compact_entries, compact = merge_both_direction_entries(
+            long_entries, short_entries, compact_skip_counts=True,
+        )
+        self.assertEqual(compact_entries, detailed_entries)
+        self.assertEqual(
+            compact,
+            {ExecutionSkipReason.OPPOSING_SIGNALS_SAME_INSTANT.value: len(detailed)},
+        )
 
     def test_both_runner_reports_one_combined_direction_result(self):
         from tradelab.both_direction_universe import BothDirectionEquivalenceClass
@@ -159,12 +179,27 @@ class BothDirectionEntryMergeTests(unittest.TestCase):
                 context.swing_equal_liquidity_results, context.session_liquidity_results,
             ),
         )
+        compact_batched = simulate_market_execution_batched(
+            merged, "both", variants, context, "equiv",
+            bar_range_index=BarRangeIndex.build(context.bars_1m),
+            entry_target_cache=EntryTargetCache(),
+            liquidity_target_index=LiquidityTargetIndex.build(
+                context.swing_equal_liquidity_results, context.session_liquidity_results,
+            ),
+            compact_skip_counts=True,
+        )
 
         for variant in variants:
             expected_trades, expected_skips = sequential[variant.variant_id]
             actual_trades, actual_skips = batched[variant.variant_id]
             self.assertEqual(actual_trades, expected_trades, variant.variant_id)
             self.assertEqual(list(conflicts) + actual_skips, expected_skips, variant.variant_id)
+            compact_trades, compact_skips = compact_batched[variant.variant_id]
+            expected_counts = {}
+            for skipped in actual_skips:
+                expected_counts[skipped.reason.value] = expected_counts.get(skipped.reason.value, 0) + 1
+            self.assertEqual(compact_trades, actual_trades, variant.variant_id)
+            self.assertEqual(compact_skips, expected_counts, variant.variant_id)
 
     def test_production_orchestrator_batches_pending_both_variants_once(self):
         from tradelab.both_direction_universe import BothDirectionEquivalenceClass, BothDirectionUniverseResult
@@ -373,6 +408,26 @@ class LinkedFVGExtractionTests(unittest.TestCase):
         )
         entry = ObservedEntry(entry_id=setup.setup_id, known_at=setup.known_at, direction=setup.direction, source=setup)
         self.assertIs(_linked_fvg_candidate(entry), fvg_candidate)
+
+    def test_required_context_links_only_exact_active_zone_for_recipe_selector(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        zone = FVGZone(
+            zone_id="required-z1", timeframe="5m", direction="bullish", lower=98.0, upper=100.0,
+            candle_1_timestamp=t0 - timedelta(minutes=15), candle_2_timestamp=t0 - timedelta(minutes=10),
+            candle_3_timestamp=t0 - timedelta(minutes=5), formed_at=t0, status=FVGStatus.ACTIVE,
+            resolved_at=None, produced_ifvg=False,
+        )
+        unrelated = dataclasses.replace(zone, zone_id="unrelated-z2")
+        entry = ObservedEntry(
+            entry_id="liquidity-entry", known_at=t0 + timedelta(minutes=5), direction=LONG, source=object(),
+            active_fvg_zones_by_selector={
+                "fvg-5m-fvg_touch": (zone,),
+                "fvg-5m-ifvg": (unrelated,),
+            },
+            strategy_fvg_link_selectors=("fvg-5m-fvg_touch",),
+        )
+        self.assertEqual(_linked_fvg_candidates(entry, "5m"), (zone,))
+        self.assertEqual(_linked_fvg_candidates(entry, "15m"), ())
 
 
 class NextBarOpenEntryTests(unittest.TestCase):
@@ -610,6 +665,26 @@ class TPSLHitTests(unittest.TestCase):
         self.assertEqual(outcome[0], TradeExitReason.SL_HIT)
         self.assertEqual(outcome[1], 105.0)
 
+    def test_same_bar_ambiguity_is_counted_without_changing_execution(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        exit_at = t0 + timedelta(minutes=1)
+        trade = ExecutedTrade(
+            trade_id="t1", strategy_id="s", direction=LONG, signal_known_at=t0,
+            entry_timestamp=t0, entry_price=100.0, tp_price=110.0,
+            tp_source_type="liquidity", tp_source_id="tp", sl_price=95.0,
+            sl_source_type="liquidity", sl_source_id="sl", exit_timestamp=exit_at,
+            exit_price=95.0, exit_reason=TradeExitReason.SL_HIT, gross_pnl_points=-5.0,
+        )
+        bars = (
+            bar(t0, 100.0, 101.0, 99.0, 100.0),
+            bar(exit_at, 100.0, 112.0, 90.0, 105.0),
+        )
+        self.assertEqual(_ambiguous_same_bar_exit_count((trade,), bars), 1)
+        self.assertEqual(
+            _ambiguous_same_bar_exit_count((trade,), (bars[0], bar(exit_at, 100.0, 109.0, 90.0, 96.0))),
+            0,
+        )
+
 
 class NewsBlockTests(unittest.TestCase):
     def test_entry_blocked_when_actual_fill_bar_falls_in_news_window(self):
@@ -721,6 +796,25 @@ class YearlyMonthlyAggregationTests(unittest.TestCase):
         self.assertEqual(yearly["2025"]["trade_count"], 1)
         self.assertIn("2024-06", monthly)
         self.assertIn("2025-03", monthly)
+
+    def test_open_unresolved_position_does_not_count_as_completed_trade(self):
+        t_2025 = datetime(2025, 12, 31, 20, tzinfo=UTC)
+        unresolved = _make_executed_trade(
+            "open", "s", LONG, t_2025, t_2025, 100.0, 110.0, 95.0,
+            None, None, TradeExitReason.OPEN_UNRESOLVED, None,
+        )
+        backtest_result = BacktestResult(
+            strategy_id="s", trades=[unresolved], skipped_signals=[], trade_count=1,
+            tp_hit_count=0, sl_hit_count=0, open_unresolved_count=1,
+            gross_pnl_points_total=0.0,
+        )
+        account_result = apply_accounting(backtest_result, Instrument.MNQ, RiskConfig())
+        equity_result = build_equity_curve(account_result, DEFAULT_EQUITY_CONFIG)
+        yearly, monthly = _yearly_monthly_breakdown(account_result, equity_result)
+        self.assertEqual(yearly["2025"]["trade_count"], 0)
+        self.assertEqual(monthly["2025-12"]["trade_count"], 0)
+        # Its entry cost remains real cash and is still reported.
+        self.assertEqual(yearly["2025"]["net_pnl_usd"], -20.0)
 
 
 class TelemetryIntegrationTests(unittest.TestCase):
@@ -837,6 +931,11 @@ class VariantSummaryRowTests(unittest.TestCase):
         self.assertEqual(d["exit_variant_id"], result.exit_variant.variant_id)
         self.assertIsNotNone(d["apex_eod_audit"])
         self.assertIn("has_breach", d["apex_eod_audit"])
+        self.assertIn("mark_to_market_audit", d)
+        self.assertIn("research_eligible", d)
+        self.assertIn("completed_trades_2024", d)
+        self.assertIn("completed_trades_2025", d)
+        self.assertIn("ambiguous_same_bar_exit_count", d)
         self.assertNotIn("trades", d)  # deliberately lean -- no trade-level detail
         self.assertNotIn("equity_curve", d)
 

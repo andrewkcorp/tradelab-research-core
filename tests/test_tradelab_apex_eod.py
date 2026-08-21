@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import unittest
+import dataclasses
 from datetime import datetime, timedelta, timezone
 
 from tradelab.accounting import AccountBacktestResult, AccountedTrade, Instrument, RiskConfig
 from tradelab.apex_eod import ApexEODConfig, ApexLimit, audit_apex_eod, trading_day_id
 from tradelab.backtest import TradeExitReason
+from tradelab.bar import Bar1m
 
 UTC = timezone.utc
 RISK = RiskConfig()
@@ -49,6 +51,29 @@ class ApexAuditTests(unittest.TestCase):
         self.assertFalse(audit.has_breach)
         self.assertEqual(original.trade_count, 1)
         self.assertEqual([t.trade_id for t in original.accounted_trades], ["t1"])
+        self.assertFalse(audit.uses_mark_to_market)
+
+    def test_production_mtm_audit_catches_unrealized_dll_breach(self):
+        start = datetime(2026, 1, 6, 15, tzinfo=UTC)
+        held = dataclasses.replace(
+            trade("intrabar", start, 0.0, exit_minutes=2),
+            quantity=30, planned_risk_usd=60.0,
+        )
+        bars = [
+            Bar1m(start + timedelta(minutes=i), 100.0, high, low, close, 1.0, "MNQH6")
+            for i, (high, low, close) in enumerate((
+                (101.0, 99.0, 100.0),
+                (101.0, 80.0, 100.0),  # -$1,200 unrealised, plus $20 fee
+                (101.0, 99.0, 100.0),
+            ))
+        ]
+        cash_only = audit_apex_eod(account(held))
+        mtm = audit_apex_eod(account(held), bars=bars)
+        self.assertFalse(cash_only.has_breach)
+        self.assertTrue(mtm.uses_mark_to_market)
+        self.assertIn(ApexLimit.DAILY_LOSS_LIMIT, mtm.breached_limits)
+        # Audit only: the original completed trade remains present.
+        self.assertEqual(account(held).trade_count, 1)
 
     def test_reports_daily_loss_and_eod_breach_without_stopping_later_trade(self):
         start = datetime(2026, 1, 6, 15, tzinfo=UTC)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""tradelab.bar_range_index tests (task 045): the sparse-table range-max/
-range-min queries and the first-hit binary-descent queries built on top
+"""tradelab.bar_range_index tests (task 045): the segment-tree range-max/
+range-min queries and the first-hit tree-descent queries built on top
 of them match an independent brute-force scan across many randomized
 trials (varied bar counts, thresholds, and query ranges), plus edge
 cases (empty index, single bar, zero-length range, threshold exactly at
@@ -132,7 +132,7 @@ class EdgeCaseTests(unittest.TestCase):
 
 class BuildProgressCallbackTests(unittest.TestCase):
     """task 046: BarRangeIndex.build's own on_progress callback reports
-    real, exact sparse-table construction progress (stage, level, cells
+    real, exact segment-tree construction progress (stage, level, cells
     built, cells total) -- never a fabricated estimate -- so a dashboard
     watching this genuinely multi-step build sees real movement rather
     than sitting at bars_scanned: 0 for its whole duration."""
@@ -160,7 +160,7 @@ class BuildProgressCallbackTests(unittest.TestCase):
         self.assertEqual(len(totals), 1)  # cells_total never changes mid-build
         total = totals.pop()
         self.assertEqual(calls[-1][2], total)  # the very last call reaches exactly 100%
-        self.assertGreater(total, 5000)  # more cells than just the base level -- genuinely counts every sparse-table level
+        self.assertGreater(total, 5000)  # more cells than leaves alone -- genuinely counts every tree level
 
     def test_no_callback_means_no_overhead_and_identical_result(self):
         rng = random.Random(8)

@@ -58,7 +58,18 @@ class TradePathAuditTests(unittest.TestCase):
         audit = audit_account_mark_to_market([trade], account, [bar(0, 101, 99), bar(1, 104, 96), bar(2, 103, 98)])
         # 30 MNQ × $2/point × 4 adverse points, plus the $20 entry cost.
         self.assertEqual(audit.worst_equity_usd, 49_740.0)
-        self.assertEqual(audit.max_mark_to_market_drawdown_usd, 260.0)
+        # The favourable 104 high can establish a $50,220 peak before the
+        # same 1m bar's 96 low produces the conservative $480 drawdown.
+        self.assertEqual(audit.max_mark_to_market_drawdown_usd, 480.0)
+
+    def test_mtm_drawdown_uses_favourable_peak_before_adverse_extreme(self):
+        trade = execution("short")
+        account = apply_accounting(BacktestResult("s", [trade], [], 1, 1, 0, 0, 1.0), Instrument.MNQ, RiskConfig())
+        audit = audit_account_mark_to_market(
+            [trade], account, [bar(0, 101, 99), bar(1, 108, 94), bar(2, 103, 98)]
+        )
+        # 30 MNQ: low 94 establishes $50,340, then high 108 marks $49,500.
+        self.assertEqual(audit.max_mark_to_market_drawdown_usd, 840.0)
 
     def test_sparse_mtm_replay_matches_original_full_bar_reference(self):
         rng = random.Random(20260821)
@@ -115,3 +126,20 @@ class TradePathAuditTests(unittest.TestCase):
             audit_account_mark_to_market([trade], account, bars, bar_range_index=BarRangeIndex.build(bars)),
             _audit_account_mark_to_market_reference([trade], account, bars),
         )
+
+    def test_sequential_same_bar_trades_are_not_mistaken_for_overlap(self):
+        first = dataclasses.replace(
+            execution("long"), trade_id="first", exit_timestamp=T0,
+            exit_price=100.0, gross_pnl_points=0.0,
+        )
+        second = dataclasses.replace(
+            execution("short"), trade_id="second", exit_timestamp=T0,
+            exit_price=100.0, gross_pnl_points=0.0,
+        )
+        backtest = BacktestResult("s", [first, second], [], 2, 2, 0, 0, 0.0)
+        account = apply_accounting(backtest, Instrument.MNQ, RiskConfig())
+        audit = audit_account_mark_to_market(
+            [first, second], account, [bar(0, 101, 99)],
+            bar_range_index=BarRangeIndex.build([bar(0, 101, 99)]),
+        )
+        self.assertLess(audit.worst_equity_usd, 50_000.0)

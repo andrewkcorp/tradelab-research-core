@@ -84,6 +84,7 @@ from enum import Enum
 
 from tradelab.fvg_entry import FVGEntryCandidate
 from tradelab.fvg_entry import SourceType as FVGSourceType
+from tradelab.fvg import FVGZone
 from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityStatus, LiquidityType
 from tradelab.liquidity import SUPPORTED_TIMEFRAMES as _SWING_EQUAL_TIMEFRAMES
 from tradelab.session_liquidity import SUPPORTED_TIMEFRAMES as _SESSION_TIMEFRAMES
@@ -109,7 +110,7 @@ class SelectedFVGConfluence:
     an arbitrary, unrelated FVG zone)."""
 
     entry_id: str
-    fvg_candidates: tuple[FVGEntryCandidate, ...]
+    fvg_candidates: tuple[FVGEntryCandidate | FVGZone, ...]
 
     def __post_init__(self) -> None:
         if not self.entry_id:
@@ -328,22 +329,30 @@ def _candidates_from_levels(
 def _fvg_sl_candidates(entry: MarketEntryContext, selected_fvg: SelectedFVGConfluence) -> list[SLTargetCandidate]:
     out: list[SLTargetCandidate] = []
     for candidate in selected_fvg.fvg_candidates:
+        if isinstance(candidate, FVGEntryCandidate):
+            candidate_id = candidate.candidate_id
+            candidate_known_at = candidate.known_at
+            candidate_source_type = candidate.source_type
+        else:
+            candidate_id = f"zone-{candidate.zone_id}"
+            candidate_known_at = candidate.formed_at
+            candidate_source_type = FVGSourceType.FVG_TOUCH
         if candidate.timeframe not in FVG_SL_TIMEFRAMES:
             raise ValueError(
-                f"FVGEntryCandidate {candidate.candidate_id!r} has timeframe {candidate.timeframe!r}; only "
+                f"FVG confluence {candidate_id!r} has timeframe {candidate.timeframe!r}; only "
                 f"{sorted(FVG_SL_TIMEFRAMES)} qualify for FVG SL"
             )
         if candidate.lower >= candidate.upper:
             raise ValueError(
-                f"FVGEntryCandidate {candidate.candidate_id!r} has non-increasing bounds "
+                f"FVG confluence {candidate_id!r} has non-increasing bounds "
                 f"(lower={candidate.lower!r}, upper={candidate.upper!r})"
             )
-        if candidate.known_at > entry.entry_known_at:
+        if candidate_known_at > entry.entry_known_at:
             continue  # not yet known at entry time
 
         price = candidate.lower if entry.direction == LONG else candidate.upper
         if price <= 0:
-            raise ValueError(f"FVGEntryCandidate {candidate.candidate_id!r} has non-positive price {price!r}")
+            raise ValueError(f"FVG confluence {candidate_id!r} has non-positive price {price!r}")
         if entry.direction == LONG and price >= entry.entry_price:
             continue
         if entry.direction == SHORT and price <= entry.entry_price:
@@ -358,7 +367,7 @@ def _fvg_sl_candidates(entry: MarketEntryContext, selected_fvg: SelectedFVGConfl
                 direction=entry.direction,
                 price=price,
                 distance=abs(price - entry.entry_price),
-                known_at=candidate.known_at,
+                known_at=candidate_known_at,
                 rank=None,
                 lower=candidate.lower,
                 upper=candidate.upper,
@@ -366,8 +375,8 @@ def _fvg_sl_candidates(entry: MarketEntryContext, selected_fvg: SelectedFVGConfl
                 level_id=None,
                 source_family=None,
                 zone_id=candidate.zone_id,
-                fvg_source_type=candidate.source_type,
-                fvg_candidate_id=candidate.candidate_id,
+                fvg_source_type=candidate_source_type,
+                fvg_candidate_id=candidate_id,
                 fvg_timeframe=candidate.timeframe,
             )
         )

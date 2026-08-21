@@ -61,6 +61,9 @@ _RANGE_FILTER_COLUMNS = {
     "pnl": "net_pnl_usd", "roi": "roi", "win_rate": "win_rate",
     "trade_count": "trade_count", "max_drawdown": "max_drawdown_usd",
     "drawdowns_over_2000_count": "drawdowns_over_2000_count",
+    "completed_trades_2024": "completed_trades_2024",
+    "completed_trades_2025": "completed_trades_2025",
+    "mtm_max_drawdown": "mtm_max_drawdown_usd",
 }
 _BOOLEAN_FILTER_COLUMNS = {"apex_has_breach": "apex_has_breach"}
 
@@ -124,26 +127,34 @@ def _build_universe_order(run_dir: Path, *, sort_key: str, direction: str, min_t
     db_path = run_dir / "backtest_v2_journal.sqlite3"
     if not db_path.is_file():
         return None
-    order = "ASC" if direction == "asc" else "DESC"
-    clauses = ["trade_count >= ?"]
-    values: list[object] = [min_trades]
-    for key, filter_column in _RANGE_FILTER_COLUMNS.items():
-        if f"{key}_min" in filters:
-            clauses.append(f"{filter_column} >= ?"); values.append(filters[f"{key}_min"])
-        if f"{key}_max" in filters:
-            clauses.append(f"{filter_column} <= ?"); values.append(filters[f"{key}_max"])
-    for key in ("direction", "instrument", "tp_kind", "sl_kind"):
-        if key in filters:
-            selected = filters[key]
-            clauses.append(f"{key} IN ({','.join('?' for _ in selected)})"); values.extend(selected)
-    for key, column in _BOOLEAN_FILTER_COLUMNS.items():
-        if key in filters:
-            clauses.append(f"{column} = ?"); values.append(filters[key])
-    for key in ("confluence", "session", "contains"):
-        for term in filters.get(key, ()):
-            clauses.append("strategy_variant_id LIKE ?"); values.append(f"%{term}%")
     connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
     try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(variant_summaries)")}
+        order = "ASC" if direction == "asc" else "DESC"
+        clauses = ["trade_count >= ?"]
+        values: list[object] = [min_trades]
+        # New journals persist the final research rule explicitly: >=100
+        # actually completed trades in both complete years. Old journals
+        # remain readable and fall back to the historic total-trade filter.
+        if "research_eligible" in columns:
+            clauses.append("research_eligible = 1")
+        for key, filter_column in _RANGE_FILTER_COLUMNS.items():
+            if filter_column not in columns:
+                continue
+            if f"{key}_min" in filters:
+                clauses.append(f"{filter_column} >= ?"); values.append(filters[f"{key}_min"])
+            if f"{key}_max" in filters:
+                clauses.append(f"{filter_column} <= ?"); values.append(filters[f"{key}_max"])
+        for key in ("direction", "instrument", "tp_kind", "sl_kind"):
+            if key in filters:
+                selected = filters[key]
+                clauses.append(f"{key} IN ({','.join('?' for _ in selected)})"); values.extend(selected)
+        for key, column in _BOOLEAN_FILTER_COLUMNS.items():
+            if key in filters and column in columns:
+                clauses.append(f"{column} = ?"); values.append(filters[key])
+        for key in ("confluence", "session", "contains"):
+            for term in filters.get(key, ()):
+                clauses.append("strategy_variant_id LIKE ?"); values.append(f"%{term}%")
         return [row[0] for row in connection.execute(
             f"""SELECT rowid FROM variant_summaries
                 WHERE {' AND '.join(clauses)}
@@ -218,6 +229,13 @@ def _read_universe_leaders(
                    {optional_column('apex_breach_count', '0')},
                    {optional_column('apex_max_daily_loss_usd', '0.0')},
                    {optional_column('apex_largest_eod_drawdown_breach_usd', '0.0')}, monthly_json
+                   , {optional_column('research_eligible', '0')}
+                   , {optional_column('completed_trades_2024', '0')}
+                   , {optional_column('completed_trades_2025', '0')}
+                   , {optional_column('mtm_worst_equity_usd', 'NULL')}
+                   , {optional_column('mtm_max_drawdown_usd', 'NULL')}
+                   , {optional_column('mtm_worst_equity_at', 'NULL')}
+                   , {optional_column('ambiguous_same_bar_exit_count', '0')}
             FROM variant_summaries
             WHERE rowid IN ({placeholders})""",
             requested_rowids,
@@ -232,7 +250,9 @@ def _read_universe_leaders(
     for position, rowid in enumerate(requested_rowids, start=offset + 1):
         (strategy_id, pnl, roi, win_rate, trade_count, max_drawdown, dd_count,
          apex_has_breach, apex_breach_count, apex_max_daily_loss,
-         apex_largest_eod_breach, monthly_json) = by_rowid[rowid]
+         apex_largest_eod_breach, monthly_json, research_eligible,
+         completed_trades_2024, completed_trades_2025, mtm_worst_equity,
+         mtm_max_drawdown, mtm_worst_equity_at, ambiguous_same_bar_exit_count) = by_rowid[rowid]
         detailed = detailed_by_id.get(strategy_id)
         if detailed is not None:
             # leaderboard.json retains rich trade detail but predates the
@@ -244,6 +264,13 @@ def _read_universe_leaders(
                 "apex_breach_count": apex_breach_count,
                 "apex_max_daily_loss_usd": apex_max_daily_loss,
                 "apex_largest_eod_drawdown_breach_usd": apex_largest_eod_breach,
+                "research_eligible": bool(research_eligible),
+                "completed_trades_2024": completed_trades_2024,
+                "completed_trades_2025": completed_trades_2025,
+                "mtm_worst_equity_usd": mtm_worst_equity,
+                "mtm_max_drawdown_usd": mtm_max_drawdown,
+                "mtm_worst_equity_at": mtm_worst_equity_at,
+                "ambiguous_same_bar_exit_count": ambiguous_same_bar_exit_count,
             })
             detailed["rank"] = position
             entries.append(detailed)
@@ -263,6 +290,13 @@ def _read_universe_leaders(
             "apex_breach_count": apex_breach_count,
             "apex_max_daily_loss_usd": apex_max_daily_loss,
             "apex_largest_eod_drawdown_breach_usd": apex_largest_eod_breach,
+            "research_eligible": bool(research_eligible),
+            "completed_trades_2024": completed_trades_2024,
+            "completed_trades_2025": completed_trades_2025,
+            "mtm_worst_equity_usd": mtm_worst_equity,
+            "mtm_max_drawdown_usd": mtm_max_drawdown,
+            "mtm_worst_equity_at": mtm_worst_equity_at,
+            "ambiguous_same_bar_exit_count": ambiguous_same_bar_exit_count,
             "equity_curve": _monthly_equity_curve(monthly),
             "trade_pnls": [],
             "trades_by_month": trades_by_month,
@@ -651,7 +685,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 
   <section id="section-leaders">
     <h2 id="leaders-title">Completed strategies</h2>
-    <div class="leaders-note">Only variants with at least 100 completed trades are shown. Click a column to sort the entire completed universe; scroll to load more rows without re-sorting. Click a row to inspect it.</div>
+    <div class="leaders-note">Only research-eligible variants are shown: at least 100 actually completed trades in both 2024 and 2025. Click a column to sort the entire completed universe; scroll to load more rows without re-sorting. Click a row to inspect it.</div>
     <button id="toggle-filters" class="filter-toggle">Show filters</button>
     <div class="filters-panel" id="filters-panel">
     <div class="filters" id="leader-filters">
@@ -914,8 +948,11 @@ function renderStrategySummary(leaderboard) {
     <div class="card"><div class="label">ROI</div><div class="value">${fmtPct(entry.roi)}</div><div class="subtle">relative to $50,000</div></div>
     <div class="card"><div class="label">Max drawdown</div><div class="value pnl-neg">${fmtMoney(entry.max_drawdown)}</div><div class="subtle">largest peak-to-trough fall</div></div>
     <div class="card"><div class="label">Trades</div><div class="value">${fmtNum(entry.trade_count)}</div><div class="subtle">completed positions</div></div>
+    <div class="card"><div class="label">Complete-year frequency</div><div class="value">${fmtNum(entry.completed_trades_2024)} / ${fmtNum(entry.completed_trades_2025)}</div><div class="subtle">actual trades · 2024 / 2025</div></div>
     <div class="card"><div class="label">Win rate</div><div class="value">${fmtPct(entry.win_rate)}</div><div class="subtle">not the ranking criterion</div></div>
     <div class="card"><div class="label">Apex EOD audit</div><div class="value ${entry.apex_has_breach ? "pnl-neg" : "pnl-pos"}">${entry.apex_has_breach ? "BREACH" : "No recorded breach"}</div><div class="subtle">${entry.apex_has_breach ? `${fmtNum(entry.apex_breach_count || 0)} event(s)` : "audit only — does not alter trades"}</div></div>
+    <div class="card"><div class="label">Mark-to-market drawdown</div><div class="value pnl-neg">${fmtMoney(entry.mtm_max_drawdown_usd)}</div><div class="subtle">includes open-position path</div></div>
+    <div class="card"><div class="label">Ambiguous exit bars</div><div class="value">${fmtNum(entry.ambiguous_same_bar_exit_count)}</div><div class="subtle">TP and SL both touched · SL-first policy</div></div>
     <div class="card"><div class="label">Profit factor</div><div class="value">${profitFactor === null ? "–" : fmtNum(profitFactor)}</div><div class="subtle">gross wins ÷ gross losses</div></div>
     <div class="card"><div class="label">Average trade</div><div class="value ${averageTrade >= 0 ? "pnl-pos" : "pnl-neg"}">${fmtMoney(averageTrade)}</div><div class="subtle">net realised P&amp;L</div></div>
     <div class="card"><div class="label">Largest win</div><div class="value pnl-pos">${fmtMoney(biggestWin)}</div><div class="subtle">share of P&amp;L: ${outlierShare === null ? "–" : fmtPct(outlierShare)}</div></div>

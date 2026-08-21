@@ -188,7 +188,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Union
 
 from tradelab.accounting import AccountBacktestResult, Instrument, RiskConfig, apply_accounting
 from tradelab.apex_eod import ApexEODAudit, ApexEODConfig, audit_apex_eod
@@ -211,7 +211,13 @@ from tradelab.both_direction_universe import (
     discover_both_direction_universe,
 )
 from tradelab.entry_signal_timeline import LONG, SHORT, EntryEvent, EntryEventKind
-from tradelab.entry_strategy_universe import EntryStrategyEquivalenceClass, EntryStrategyUniverseResult, ObservedEntry, discover_entry_strategy_universe
+from tradelab.entry_strategy_universe import (
+    DEFAULT_MIN_ENTRIES_PER_YEAR,
+    EntryStrategyEquivalenceClass,
+    EntryStrategyUniverseResult,
+    ObservedEntry,
+    discover_entry_strategy_universe,
+)
 from tradelab.entry_target_cache import EntryTargetCache
 from tradelab.trade_path_audit import AccountMarkToMarketAudit, audit_account_mark_to_market
 from tradelab.liquidity_target_index import LiquidityTargetIndex
@@ -343,7 +349,8 @@ class SkippedEntryV2:
 
 def merge_both_direction_entries(
     long_entries: tuple[ObservedEntry, ...], short_entries: tuple[ObservedEntry, ...],
-) -> tuple[tuple[ObservedEntry, ...], tuple[SkippedEntryV2, ...]]:
+    *, compact_skip_counts: bool = False,
+) -> tuple[tuple[ObservedEntry, ...], tuple[SkippedEntryV2, ...] | dict[str, int]]:
     """Make one deterministic long+short entry stream for a ``both`` setup.
 
     The normal one-position rule is then enforced by the ordinary market
@@ -363,18 +370,45 @@ def merge_both_direction_entries(
     for entry in all_entries:
         by_time.setdefault(entry.known_at, []).append(entry)
     merged: list[ObservedEntry] = []
-    conflicts: list[SkippedEntryV2] = []
+    conflicts: list[SkippedEntryV2] | dict[str, int] = {} if compact_skip_counts else []
     for known_at in sorted(by_time):
         entries = sorted(by_time[known_at], key=lambda entry: entry.entry_id)
         directions = {entry.direction for entry in entries}
         if directions == {LONG, SHORT}:
-            conflicts.extend(
-                SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.OPPOSING_SIGNALS_SAME_INSTANT)
-                for entry in entries
-            )
+            for entry in entries:
+                _record_execution_skip(conflicts, entry, ExecutionSkipReason.OPPOSING_SIGNALS_SAME_INSTANT)
         else:
             merged.extend(entries)
-    return tuple(merged), tuple(conflicts)
+    return tuple(merged), (dict(conflicts) if compact_skip_counts else tuple(conflicts))
+
+
+SkippedEntryAudit = Union[list[SkippedEntryV2], tuple[SkippedEntryV2, ...], dict[str, int]]
+
+
+def _record_execution_skip(
+    audit: list[SkippedEntryV2] | dict[str, int], entry: ObservedEntry, reason: ExecutionSkipReason,
+) -> None:
+    """Record one skipped entry in detailed or production-compact form.
+
+    Production only persists counts by stable reason; direct execution APIs
+    retain detailed objects by default for diagnostics and equivalence tests.
+    """
+    if isinstance(audit, dict):
+        audit[reason.value] = audit.get(reason.value, 0) + 1
+    else:
+        audit.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, reason))
+
+
+def _merge_skip_audits(*audits: SkippedEntryAudit) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for audit in audits:
+        if isinstance(audit, dict):
+            for reason, count in audit.items():
+                counts[reason] = counts.get(reason, 0) + int(count)
+        else:
+            for entry in audit:
+                counts[entry.reason.value] = counts.get(entry.reason.value, 0) + 1
+    return counts
 
 
 def _linked_fvg_candidate(entry: ObservedEntry) -> FVGEntryCandidate | None:
@@ -392,6 +426,32 @@ def _linked_fvg_candidate(entry: ObservedEntry) -> FVGEntryCandidate | None:
             candidate = source.source
             return candidate if isinstance(candidate, FVGEntryCandidate) else None
     return None
+
+
+def _linked_fvg_candidates(entry: ObservedEntry, timeframe: str) -> tuple[Any, ...]:
+    """Every exact FVG zone this recipe used on ``timeframe``.
+
+    A direct FVG/iFVG primary contributes its own candidate. Required
+    persistent context contributes only the active original zones belonging
+    to the recipe's explicitly linked selector(s). Zone ids are de-duplicated
+    deterministically; unrelated active FVGs are never admitted.
+    """
+    allowed = set(entry.strategy_fvg_link_selectors)
+    own = _linked_fvg_candidate(entry)
+    selected: list[Any] = []
+    if own is not None and own.timeframe == timeframe:
+        own_selector = f"fvg-{own.timeframe}-{own.source_type.value}"
+        # Legacy/direct diagnostic entries predate recipe annotation and
+        # preserve their historical exact-own-primary behavior.
+        if not allowed or own_selector in allowed:
+            selected.append(own)
+    if allowed and entry.active_fvg_zones_by_selector:
+        for selector in sorted(allowed):
+            if not selector.startswith(f"fvg-{timeframe}-"):
+                continue
+            selected.extend(entry.active_fvg_zones_by_selector.get(selector, ()))
+    by_zone_id = {candidate.zone_id: candidate for candidate in selected}
+    return tuple(by_zone_id[zone_id] for zone_id in sorted(by_zone_id))
 
 
 def _resolve_tp_candidate(
@@ -447,12 +507,15 @@ def _resolve_sl_candidate(
             if candidate.rank == variant.sl_rank:
                 return candidate
         return None
-    linked = _linked_fvg_candidate(entry)
-    if linked is None or linked.timeframe != variant.sl_fvg_timeframe:
+    linked = _linked_fvg_candidates(entry, variant.sl_fvg_timeframe)
+    if not linked:
         return None
-    confluence = SelectedFVGConfluence(entry_id=market_entry.entry_id, fvg_candidates=(linked,))
+    confluence = SelectedFVGConfluence(entry_id=market_entry.entry_id, fvg_candidates=linked)
+    confluence_key = "|".join(
+        (variant.sl_fvg_timeframe, *(candidate.zone_id for candidate in linked))
+    )
     if entry_target_cache is not None:
-        result = entry_target_cache.sl_candidates(market_entry, linked.timeframe, confluence, swing_equal_results, session_results, liquidity_index=liquidity_target_index)
+        result = entry_target_cache.sl_candidates(market_entry, confluence_key, confluence, swing_equal_results, session_results, liquidity_index=liquidity_target_index)
     else:
         result = detect_sl_target_candidates(market_entry, confluence, swing_equal_results, session_results, liquidity_index=liquidity_target_index)
     return result.fvg_targets[0] if result.fvg_targets else None
@@ -881,8 +944,9 @@ class _BatchedVariantState:
     variant: ExitVariantSpec
     neutral_strategy_id: str
     trades: list[ExecutedTrade]
-    skipped: list[SkippedEntryV2]
+    skipped: list[SkippedEntryV2] | dict[str, int]
     position: _OpenPosition | None = None
+    scheduled_exit: tuple[int, TradeExitReason, float] | None = None
     trade_seq: int = 0
     bar_cursor: int = 0
 
@@ -900,7 +964,8 @@ def simulate_market_execution_batched(
     entry_target_cache: EntryTargetCache | None = None,
     liquidity_target_index: LiquidityTargetIndex | None = None,
     news_blackout_index: NewsBlackoutIndex | None = None,
-) -> dict[str, tuple[list[ExecutedTrade], list[SkippedEntryV2]]]:
+    compact_skip_counts: bool = False,
+) -> dict[str, tuple[list[ExecutedTrade], list[SkippedEntryV2] | dict[str, int]]]:
     """Execute every supplied exit variant in one chronological entry pass.
 
     This is an exact batching optimisation, not a new strategy model.  A
@@ -925,7 +990,7 @@ def simulate_market_execution_batched(
             variant=variant,
             neutral_strategy_id=f"{equivalence_class_id}::{variant.variant_id}",
             trades=[],
-            skipped=[],
+            skipped={} if compact_skip_counts else [],
         )
         for variant in variants
     ]
@@ -940,7 +1005,7 @@ def simulate_market_execution_batched(
         fill_index = index.find_bar_at_or_after(entry.known_at)
         if fill_index is None:
             for state in states:
-                state.skipped.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.NO_BAR_AVAILABLE))
+                _record_execution_skip(state.skipped, entry, ExecutionSkipReason.NO_BAR_AVAILABLE)
             continue
 
         fill_bar = bars[fill_index]
@@ -957,21 +1022,22 @@ def simulate_market_execution_batched(
         )
 
         for state in states:
-            # Settle this variant's position up to (but not past) the next
-            # entry's fill instant, exactly as the independent engine does.
-            if state.bar_cursor < fill_index and state.position is not None:
-                hit = _find_first_exit(bars, index, state.position, state.bar_cursor, fill_index)
-                if hit is not None:
-                    exit_index, reason, exit_price = hit
+            # The eventual exit is found exactly once when the position
+            # opens. ``<`` preserves the existing same-bar rule: an entry on
+            # the position's exit bar still sees that position as open.
+            if state.position is not None and state.scheduled_exit is not None:
+                exit_index, reason, exit_price = state.scheduled_exit
+                if exit_index < fill_index:
                     state.trades.append(_finalize_trade(state.position, exit_timestamp=bars[exit_index].timestamp, exit_price=exit_price, reason=reason))
                     state.position = None
+                    state.scheduled_exit = None
             state.bar_cursor = fill_index
 
             if state.position is not None:
-                state.skipped.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.POSITION_ALREADY_OPEN))
+                _record_execution_skip(state.skipped, entry, ExecutionSkipReason.POSITION_ALREADY_OPEN)
                 continue
             if blocked:
-                state.skipped.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.NEWS_BLOCK))
+                _record_execution_skip(state.skipped, entry, ExecutionSkipReason.NEWS_BLOCK)
                 continue
 
             # The independent engine allocates the per-variant trade
@@ -988,7 +1054,7 @@ def simulate_market_execution_batched(
                 liquidity_target_index=liquidity_target_index,
             )
             if tp_candidate is None:
-                state.skipped.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.MISSING_TP_TARGET))
+                _record_execution_skip(state.skipped, entry, ExecutionSkipReason.MISSING_TP_TARGET)
                 continue
             sl_candidate = _resolve_sl_candidate(
                 state.variant, entry, market_entry, context.swing_equal_liquidity_results,
@@ -996,10 +1062,10 @@ def simulate_market_execution_batched(
                 liquidity_target_index=liquidity_target_index,
             )
             if sl_candidate is None:
-                state.skipped.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.MISSING_SL_TARGET))
+                _record_execution_skip(state.skipped, entry, ExecutionSkipReason.MISSING_SL_TARGET)
                 continue
             if sl_candidate.distance <= 0 or tp_candidate.distance <= 0:
-                state.skipped.append(SkippedEntryV2(entry.entry_id, entry.known_at, entry.direction, ExecutionSkipReason.NON_POSITIVE_RISK))
+                _record_execution_skip(state.skipped, entry, ExecutionSkipReason.NON_POSITIVE_RISK)
                 continue
 
             position = _OpenPosition(
@@ -1015,6 +1081,7 @@ def simulate_market_execution_batched(
             exit_outcome = _check_exit(position, fill_bar)
             if exit_outcome is None:
                 state.position = position
+                state.scheduled_exit = _find_first_exit(bars, index, position, fill_index + 1, len(bars))
             else:
                 reason, exit_price = exit_outcome
                 state.trades.append(_finalize_trade(position, exit_timestamp=fill_bar.timestamp, exit_price=exit_price, reason=reason))
@@ -1023,12 +1090,11 @@ def simulate_market_execution_batched(
             on_bar_progress(fill_index, len(bars))
 
     for state in states:
-        if state.position is not None and state.bar_cursor < len(bars):
-            hit = _find_first_exit(bars, index, state.position, state.bar_cursor, len(bars))
-            if hit is not None:
-                exit_index, reason, exit_price = hit
-                state.trades.append(_finalize_trade(state.position, exit_timestamp=bars[exit_index].timestamp, exit_price=exit_price, reason=reason))
-                state.position = None
+        if state.position is not None and state.scheduled_exit is not None:
+            exit_index, reason, exit_price = state.scheduled_exit
+            state.trades.append(_finalize_trade(state.position, exit_timestamp=bars[exit_index].timestamp, exit_price=exit_price, reason=reason))
+            state.position = None
+            state.scheduled_exit = None
         if state.position is not None:
             state.trades.append(_finalize_trade(state.position, exit_timestamp=None, exit_price=None, reason=TradeExitReason.OPEN_UNRESOLVED))
 
@@ -1062,6 +1128,34 @@ class StrategyVariantResult:
     # Audit-only; never feeds back into fills, exits or future entries.
     apex_eod_audit: ApexEODAudit | None = None
     mark_to_market_audit: AccountMarkToMarketAudit | None = None
+    ambiguous_same_bar_exit_count: int = 0
+
+
+def _ambiguous_same_bar_exit_count(
+    trades: list[ExecutedTrade] | tuple[ExecutedTrade, ...],
+    bars_1m: tuple[Bar1m, ...] | list[Bar1m],
+    bar_range_index: BarRangeIndex | None = None,
+) -> int:
+    """Count resolved exits whose 1m bar touched both TP and SL.
+
+    Execution remains deliberately conservative (SL wins), but ambiguity is
+    persisted as audit data instead of being invisible in the leaderboard.
+    """
+    timestamps = bar_range_index.timestamps if bar_range_index is not None else tuple(bar.timestamp for bar in bars_1m)
+    count = 0
+    for trade in trades:
+        if trade.exit_timestamp is None:
+            continue
+        index = bisect.bisect_left(timestamps, trade.exit_timestamp)
+        if index >= len(bars_1m) or bars_1m[index].timestamp != trade.exit_timestamp:
+            continue
+        bar = bars_1m[index]
+        if trade.direction == LONG:
+            both_hit = bar.low <= trade.sl_price and bar.high >= trade.tp_price
+        else:
+            both_hit = bar.high >= trade.sl_price and bar.low <= trade.tp_price
+        count += int(both_hit)
+    return count
 
 
 def _win_rate(account_result: AccountBacktestResult) -> float | None:
@@ -1084,6 +1178,12 @@ def _yearly_monthly_breakdown(account_result: AccountBacktestResult, equity_resu
     yearly_count: dict[int, int] = {}
     monthly_count: dict[str, int] = {}
     for trade in account_result.accounted_trades:
+        # Research eligibility is explicitly based on completed trades.
+        # The final still-open position paid its entry fee and remains in
+        # cash P&L, but it must not turn a 99-trade year into an eligible
+        # 100-trade year.
+        if trade.exit_reason == TradeExitReason.OPEN_UNRESOLVED:
+            continue
         year = trade.entry_timestamp.year
         month_key = f"{year:04d}-{trade.entry_timestamp.month:02d}"
         yearly_count[year] = yearly_count.get(year, 0) + 1
@@ -1168,7 +1268,7 @@ def _build_variant_result_for_instrument(
     variant: ExitVariantSpec,
     instrument: Instrument,
     trades: list[ExecutedTrade],
-    skipped: list[SkippedEntryV2],
+    skipped: SkippedEntryAudit,
     *,
     risk_config: RiskConfig,
     equity_config: EquityConfig,
@@ -1202,7 +1302,10 @@ def _build_variant_result_for_instrument(
         _t0 = time.perf_counter()
     account_result = apply_accounting(backtest_result, instrument, risk_config)
     equity_result = build_equity_curve(account_result, equity_config)
-    apex_eod_audit = audit_apex_eod(account_result, DEFAULT_APEX_EOD_CONFIG)
+    apex_eod_audit = audit_apex_eod(
+        account_result, DEFAULT_APEX_EOD_CONFIG,
+        bars=bars_1m, bar_range_index=audit_bar_range_index,
+    ) if bars_1m is not None else audit_apex_eod(account_result, DEFAULT_APEX_EOD_CONFIG)
     mark_to_market_audit = (
         audit_account_mark_to_market(
             trades, account_result, bars_1m,
@@ -1214,9 +1317,7 @@ def _build_variant_result_for_instrument(
     if stage_timings is not None:
         stage_timings.record("accounting_equity", time.perf_counter() - _t0)
 
-    skipped_by_reason: dict[str, int] = {}
-    for entry in skipped:
-        skipped_by_reason[entry.reason.value] = skipped_by_reason.get(entry.reason.value, 0) + 1
+    skipped_by_reason = _merge_skip_audits(skipped)
     for untradeable in account_result.untradeable_trades:
         skipped_by_reason[untradeable.reason.value] = skipped_by_reason.get(untradeable.reason.value, 0) + 1
 
@@ -1230,6 +1331,10 @@ def _build_variant_result_for_instrument(
         max_drawdown_usd=equity_result.max_drawdown_usd, drawdowns_over_2000_count=equity_result.drawdown_over_threshold_episode_count,
         skipped_entries_by_reason=skipped_by_reason, yearly=yearly, monthly=monthly, apex_eod_audit=apex_eod_audit,
         mark_to_market_audit=mark_to_market_audit,
+        ambiguous_same_bar_exit_count=(
+            _ambiguous_same_bar_exit_count(trades, bars_1m, audit_bar_range_index)
+            if bars_1m is not None else 0
+        ),
     )
 
 
@@ -1301,7 +1406,7 @@ def _build_both_variant_result_for_instrument(
     variant: ExitVariantSpec,
     instrument: Instrument,
     trades: list[ExecutedTrade],
-    skipped: list[SkippedEntryV2],
+    skipped: SkippedEntryAudit,
     context: PreparedBacktestContext,
     *,
     risk_config: RiskConfig,
@@ -1325,9 +1430,7 @@ def _build_both_variant_result_for_instrument(
     )
     account_result = apply_accounting(backtest_result, instrument, risk_config)
     equity_result = build_equity_curve(account_result, equity_config)
-    skipped_by_reason: dict[str, int] = {}
-    for skipped_entry in skipped:
-        skipped_by_reason[skipped_entry.reason.value] = skipped_by_reason.get(skipped_entry.reason.value, 0) + 1
+    skipped_by_reason = _merge_skip_audits(skipped)
     for untradeable in account_result.untradeable_trades:
         skipped_by_reason[untradeable.reason.value] = skipped_by_reason.get(untradeable.reason.value, 0) + 1
     yearly, monthly = _yearly_monthly_breakdown(account_result, equity_result)
@@ -1340,11 +1443,17 @@ def _build_both_variant_result_for_instrument(
         max_drawdown_usd=equity_result.max_drawdown_usd,
         drawdowns_over_2000_count=equity_result.drawdown_over_threshold_episode_count,
         skipped_entries_by_reason=skipped_by_reason, yearly=yearly, monthly=monthly,
-        apex_eod_audit=audit_apex_eod(account_result, DEFAULT_APEX_EOD_CONFIG),
+        apex_eod_audit=audit_apex_eod(
+            account_result, DEFAULT_APEX_EOD_CONFIG,
+            bars=context.bars_1m, bar_range_index=audit_bar_range_index,
+        ),
         mark_to_market_audit=audit_account_mark_to_market(
             trades, account_result, context.bars_1m,
             initial_balance_usd=equity_config.initial_balance_usd,
             bar_range_index=audit_bar_range_index,
+        ),
+        ambiguous_same_bar_exit_count=_ambiguous_same_bar_exit_count(
+            trades, context.bars_1m, audit_bar_range_index,
         ),
     )
 
@@ -1433,6 +1542,10 @@ class VariantSummaryRow:
     trade_count: int
     max_drawdown_usd: float
     drawdowns_over_2000_count: int
+    research_eligible: bool
+    completed_trades_2024: int
+    completed_trades_2025: int
+    ambiguous_same_bar_exit_count: int
     skipped_entries_by_reason: Mapping[str, int]
     yearly: Mapping[str, Mapping[str, float | int]]
     monthly: Mapping[str, Mapping[str, float | int]]
@@ -1440,14 +1553,26 @@ class VariantSummaryRow:
     mark_to_market_audit: Mapping[str, Any] | None = None
 
     @staticmethod
-    def from_result(result: StrategyVariantResult) -> "VariantSummaryRow":
+    def from_result(
+        result: StrategyVariantResult,
+        *,
+        min_completed_trades_per_year: int = 0,
+    ) -> "VariantSummaryRow":
         v = result.exit_variant
+        completed_2024 = int(result.yearly.get("2024", {}).get("trade_count", 0))
+        completed_2025 = int(result.yearly.get("2025", {}).get("trade_count", 0))
         return VariantSummaryRow(
             strategy_variant_id=result.strategy_variant_id, equivalence_class_id=result.equivalence_class_id,
             direction=result.direction, instrument=result.instrument.value, exit_variant_id=v.variant_id,
             tp_kind=v.tp_kind.value, tp_rank=v.tp_rank, sl_kind=v.sl_kind.value, sl_rank=v.sl_rank, sl_fvg_timeframe=v.sl_fvg_timeframe,
             net_pnl_usd=result.net_pnl_usd, roi=result.roi, win_rate=result.win_rate, trade_count=result.trade_count,
             max_drawdown_usd=result.max_drawdown_usd, drawdowns_over_2000_count=result.drawdowns_over_2000_count,
+            research_eligible=(
+                completed_2024 >= min_completed_trades_per_year
+                and completed_2025 >= min_completed_trades_per_year
+            ),
+            completed_trades_2024=completed_2024, completed_trades_2025=completed_2025,
+            ambiguous_same_bar_exit_count=result.ambiguous_same_bar_exit_count,
             skipped_entries_by_reason=dict(result.skipped_entries_by_reason), yearly=dict(result.yearly), monthly=dict(result.monthly),
             apex_eod_audit=_apex_audit_summary(result.apex_eod_audit),
             mark_to_market_audit=_mark_to_market_audit_summary(result.mark_to_market_audit),
@@ -1461,6 +1586,10 @@ class VariantSummaryRow:
             "sl_fvg_timeframe": self.sl_fvg_timeframe, "net_pnl_usd": self.net_pnl_usd, "roi": self.roi,
             "win_rate": self.win_rate, "trade_count": self.trade_count, "max_drawdown_usd": self.max_drawdown_usd,
             "drawdowns_over_2000_count": self.drawdowns_over_2000_count,
+            "research_eligible": self.research_eligible,
+            "completed_trades_2024": self.completed_trades_2024,
+            "completed_trades_2025": self.completed_trades_2025,
+            "ambiguous_same_bar_exit_count": self.ambiguous_same_bar_exit_count,
             "skipped_entries_by_reason": dict(self.skipped_entries_by_reason), "yearly": dict(self.yearly), "monthly": dict(self.monthly),
             "apex_eod_audit": None if self.apex_eod_audit is None else dict(self.apex_eod_audit),
             "mark_to_market_audit": None if self.mark_to_market_audit is None else dict(self.mark_to_market_audit),
@@ -1477,6 +1606,7 @@ def _apex_audit_summary(audit: ApexEODAudit | None) -> dict[str, Any] | None:
         "breached_trading_day_count": len({breach.trading_day_id for breach in audit.breaches}),
         "max_daily_loss_usd": audit.max_daily_loss_usd,
         "largest_eod_drawdown_breach_usd": audit.largest_eod_drawdown_breach_usd,
+        "uses_mark_to_market": audit.uses_mark_to_market,
     }
 
 
@@ -1555,6 +1685,8 @@ _EARLY_PHASE_CHECKPOINT_RESUMABLE_NOTE = (
     "already-cheap phase."
 )
 
+_LEADERBOARD_PUBLISH_INTERVAL_SECONDS = 30.0
+
 
 def _leaderboard_entry_from_journal_summary(summary: JournalVariantSummary, rank: int = 1) -> LeaderboardEntry:
     """A durably-completed (in a *previous* process) variant, rendered
@@ -1594,7 +1726,7 @@ def _merged_leaderboard(durable_top_n: list[LeaderboardEntry], tracker: _TopNTra
 def _expand_and_simulate(
     reporter: RunReporter,
     journal: BacktestV2Journal,
-    universe: EntryStrategyUniverseResult,
+    universe: EntryStrategyUniverseResult | None,
     exit_variants: tuple[ExitVariantSpec, ...],
     instruments: tuple[Instrument, ...],
     context: PreparedBacktestContext,
@@ -1605,6 +1737,7 @@ def _expand_and_simulate(
     equity_config: EquityConfig,
     top_n_leaderboard: int,
     checkpoint_every: int,
+    min_completed_trades_per_year: int = 0,
 ) -> tuple[int, list[LeaderboardEntry]]:
     """Shared by :func:`run_production_backtest_v2` and the CLI smoke
     test: reports ``expanding_exit_variants`` then ``simulating_
@@ -1686,7 +1819,9 @@ def _expand_and_simulate(
     # system.  Keeping the opt-in directional path preserves focused unit
     # tests and diagnostic benchmarks, but it is not part of the production
     # strategy population and must never compete in its leaderboard.
-    directional_class_count = universe.equivalence_class_count if include_directional_variants else 0
+    if include_directional_variants and universe is None:
+        raise ValueError("_expand_and_simulate requires a directional universe when include_directional_variants=True")
+    directional_class_count = universe.equivalence_class_count if include_directional_variants and universe is not None else 0
     both_class_count = 0 if both_universe is None else both_universe.equivalence_class_count
     total_variant_runs = (directional_class_count + both_class_count) * len(exit_variants) * len(instruments)
     reporter.phase_started(RunPhase.EXPANDING_EXIT_VARIANTS, items_total=max(total_variant_runs, 1))
@@ -1702,12 +1837,13 @@ def _expand_and_simulate(
     durable_top_n = [_leaderboard_entry_from_journal_summary(s) for s in journal.top_n_summaries(top_n_leaderboard)]
 
     top_n = _TopNTracker(top_n_leaderboard)
+    last_leaderboard_publish_at = time.monotonic()
     if completed:
         reporter.progress(items_completed=completed, backtests_completed=completed)
         reporter.update_leaderboard(_merged_leaderboard(durable_top_n, top_n, top_n_leaderboard))
 
     entry_target_cache = EntryTargetCache(max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES)
-    directional_classes = universe.equivalence_classes if include_directional_variants else ()
+    directional_classes = universe.equivalence_classes if include_directional_variants and universe is not None else ()
     for equivalence_class in directional_classes:
         # One bounded cache survives the whole prepared run. Multiple
         # equivalence classes often share the exact same observed event, so
@@ -1759,10 +1895,13 @@ def _expand_and_simulate(
                     risk_config=risk_config, equity_config=equity_config, bars_1m=context.bars_1m,
                     audit_bar_range_index=bar_range_index,
                 )
-                row = VariantSummaryRow.from_result(result)
+                row = VariantSummaryRow.from_result(
+                    result, min_completed_trades_per_year=min_completed_trades_per_year,
+                )
                 journal.commit_summary(row.to_dict())  # durable, authoritative -- BEFORE anything below reports it as done
                 append_jsonl(summary_path, row.to_dict())  # plain-text export/audit mirror only, never read back for resume
-                top_n.offer(result)
+                if row.research_eligible:
+                    top_n.offer(result)
                 completed += 1
                 if completed % checkpoint_every == 0 or completed == total_variant_runs:
                     reporter.progress(items_completed=completed, backtests_completed=completed)
@@ -1771,7 +1910,10 @@ def _expand_and_simulate(
                         cursor={"stage": "simulating_backtests", "completed": completed, "total": total_variant_runs},
                         resumable=True, resumable_note=_CHECKPOINT_RESUMABLE_NOTE,
                     )
-                    reporter.update_leaderboard(_merged_leaderboard(durable_top_n, top_n, top_n_leaderboard))
+                    now = time.monotonic()
+                    if completed == total_variant_runs or now - last_leaderboard_publish_at >= _LEADERBOARD_PUBLISH_INTERVAL_SECONDS:
+                        reporter.update_leaderboard(_merged_leaderboard(durable_top_n, top_n, top_n_leaderboard))
+                        last_leaderboard_publish_at = now
 
     # A ``both`` class is deliberately simulated through one position state,
     # not assembled from two separately profitable directional curves.  It
@@ -1809,7 +1951,7 @@ def _expand_and_simulate(
                 )
             )
             merged_entries, conflicts = merge_both_direction_entries(
-                equivalence_class.long_entries, equivalence_class.short_entries
+                equivalence_class.long_entries, equivalence_class.short_entries, compact_skip_counts=True,
             )
             executions_by_variant = simulate_market_execution_batched(
                 merged_entries, "both", tuple(variant for variant, _pending in pending_by_variant),
@@ -1818,21 +1960,25 @@ def _expand_and_simulate(
                 on_entry_progress=_entry_progress_callback(reporter, variant_id=lead_variant_id),
                 bar_range_index=bar_range_index, entry_target_cache=both_target_cache,
                 liquidity_target_index=liquidity_target_index, news_blackout_index=news_blackout_index,
+                compact_skip_counts=True,
             )
 
             for variant, pending_instruments in pending_by_variant:
                 trades, variant_skipped = executions_by_variant[variant.variant_id]
-                skipped = list(conflicts) + variant_skipped
+                skipped = _merge_skip_audits(conflicts, variant_skipped)
                 for instrument in pending_instruments:
                     result = _build_both_variant_result_for_instrument(
                         equivalence_class, variant, instrument, trades, skipped, context,
                         risk_config=risk_config, equity_config=equity_config,
                         audit_bar_range_index=bar_range_index,
                     )
-                    row = VariantSummaryRow.from_result(result)
+                    row = VariantSummaryRow.from_result(
+                        result, min_completed_trades_per_year=min_completed_trades_per_year,
+                    )
                     journal.commit_summary(row.to_dict())
                     append_jsonl(summary_path, row.to_dict())
-                    top_n.offer(result)
+                    if row.research_eligible:
+                        top_n.offer(result)
                     completed += 1
                     if completed % checkpoint_every == 0 or completed == total_variant_runs:
                         reporter.progress(items_completed=completed, backtests_completed=completed)
@@ -1841,7 +1987,10 @@ def _expand_and_simulate(
                             cursor={"stage": "simulating_backtests", "completed": completed, "total": total_variant_runs},
                             resumable=True, resumable_note=_CHECKPOINT_RESUMABLE_NOTE,
                         )
-                        reporter.update_leaderboard(_merged_leaderboard(durable_top_n, top_n, top_n_leaderboard))
+                        now = time.monotonic()
+                        if completed == total_variant_runs or now - last_leaderboard_publish_at >= _LEADERBOARD_PUBLISH_INTERVAL_SECONDS:
+                            reporter.update_leaderboard(_merged_leaderboard(durable_top_n, top_n, top_n_leaderboard))
+                            last_leaderboard_publish_at = now
 
     reporter.phase_started(RunPhase.RANKING_RESULTS, items_total=1)
     final_leaderboard = _merged_leaderboard(durable_top_n, top_n, top_n_leaderboard)
@@ -2115,7 +2264,8 @@ def run_production_backtest_v2(
 
         reporter.phase_started(RunPhase.DISCOVERING_ENTRIES, items_total=1)
         universe = discover_entry_strategy_universe(
-            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=min_entries_per_year,
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result,
+            min_entries_per_year=min_entries_per_year, pair_yearly_eligibility_for_both=True,
             on_progress=_discovery_progress_callback(reporter),
         )
         reporter.progress(
@@ -2125,6 +2275,7 @@ def run_production_backtest_v2(
 
         reporter.phase_started(RunPhase.DEDUPLICATING_ENTRIES, items_total=1)
         both_universe = discover_both_direction_universe(universe)
+        directional_equivalence_class_count = universe.equivalence_class_count
         reporter.progress(
             items_completed=1,
             unique_entry_classes=both_universe.equivalence_class_count,
@@ -2132,23 +2283,30 @@ def run_production_backtest_v2(
         reporter.checkpoint_written(
             cursor={
                 "stage": "deduplicating_entries",
-                "directional_equivalence_class_count": universe.equivalence_class_count,
+                "directional_equivalence_class_count": directional_equivalence_class_count,
                 "both_equivalence_class_count": both_universe.equivalence_class_count,
             },
             resumable=True, resumable_note=_EARLY_PHASE_CHECKPOINT_RESUMABLE_NOTE,
         )
 
+        # The production population is ``both`` only.  Its classes own the
+        # exact long/short streams they need, so retaining the much larger
+        # directional discovery container through every simulation only
+        # wastes RAM.  Releasing it here cannot affect results.
+        del universe
+
         completed, final_leaderboard = _expand_and_simulate(
-            reporter, journal, universe, exit_variants, instruments, context,
+            reporter, journal, None, exit_variants, instruments, context,
             both_universe=both_universe, include_directional_variants=False,
             risk_config=risk_config, equity_config=equity_config,
             top_n_leaderboard=top_n_leaderboard, checkpoint_every=checkpoint_every,
+            min_completed_trades_per_year=min_entries_per_year,
         )
 
         reporter.completed(
             summary={
                 "equivalence_class_count": both_universe.equivalence_class_count,
-                "directional_equivalence_class_count": universe.equivalence_class_count,
+                "directional_equivalence_class_count": directional_equivalence_class_count,
                 "both_equivalence_class_count": both_universe.equivalence_class_count,
                 "exit_variant_count": len(exit_variants),
                 "strategy_variant_result_count": completed, "top_net_pnl_usd": (final_leaderboard[0].pnl if final_leaderboard else None),
@@ -2175,6 +2333,8 @@ _TEMPLATE_SUMMARY_ROW = VariantSummaryRow(
     exit_variant_id="tp_first_swing_high_r1__sl_first_swing_low_r1", tp_kind="first_swing_high", tp_rank=1,
     sl_kind="first_swing_low", sl_rank=1, sl_fvg_timeframe=None, net_pnl_usd=1234.56, roi=0.1234, win_rate=0.55,
     trade_count=42, max_drawdown_usd=567.89, drawdowns_over_2000_count=1,
+    research_eligible=False, completed_trades_2024=20, completed_trades_2025=22,
+    ambiguous_same_bar_exit_count=0,
     skipped_entries_by_reason={"news_block": 3, "infeasible_size": 1},
     yearly={"2024": {"trade_count": 20, "net_pnl_usd": 600.0}, "2025": {"trade_count": 22, "net_pnl_usd": 634.56}},
     monthly={f"2024-{m:02d}": {"trade_count": 2, "net_pnl_usd": 50.0} for m in range(1, 13)},

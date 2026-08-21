@@ -108,10 +108,16 @@ from typing import Callable, Mapping
 from tradelab.bias import BEARISH, BULLISH, HTFBiasResult, NEUTRAL
 from tradelab.bias import SUPPORTED_TIMEFRAMES as _BIAS_TIMEFRAMES
 from tradelab.entry_signal_timeline import LONG, SHORT, EntryEvent, EntryEventKind, MarketStateSnapshot, build_entry_events, iter_candidate_entry_snapshots
-from tradelab.fvg import FVGDetectionResult
+from tradelab.fvg import FVGDetectionResult, FVGZone
 from tradelab.fvg_entry import FVGEntryCandidateResult
 from tradelab.liquidity_entry import LiquidityEntryCandidateResult
-from tradelab.selector_catalog import CANONICAL_FVG_SELECTORS, CANONICAL_LIQUIDITY_SELECTORS, selector_fixed_direction, selector_timeframe
+from tradelab.selector_catalog import (
+    CANONICAL_FVG_SELECTORS,
+    CANONICAL_LIQUIDITY_SELECTORS,
+    opposite_liquidity_selector,
+    selector_fixed_direction,
+    selector_timeframe,
+)
 from tradelab.sweep_fvg_setup import SweepFVGSetupEvent, build_sweep_fvg_setup_events
 
 _UTC = timezone.utc
@@ -229,6 +235,20 @@ class BiasRequirementSpec:
         return f"1H:{self.tf_1h},4H:{self.tf_4h},1D:{self.tf_1d}"
 
 
+def mirror_bias_requirement(pattern: BiasRequirementSpec) -> BiasRequirementSpec:
+    """Direction-relative mirror used by one coherent ``both`` strategy.
+
+    A bullish requirement for the long side corresponds to a bearish
+    requirement for the short side. ``any`` and ``neutral`` are symmetric.
+    """
+    opposite = {ANY_BIAS: ANY_BIAS, BULLISH: BEARISH, BEARISH: BULLISH, NEUTRAL: NEUTRAL}
+    return BiasRequirementSpec(
+        tf_1h=opposite[pattern.tf_1h],
+        tf_4h=opposite[pattern.tf_4h],
+        tf_1d=opposite[pattern.tf_1d],
+    )
+
+
 def _build_spec_id(primary: PrimaryTriggerSpec, required_fvg_context_selectors: frozenset[str], bias_requirement: BiasRequirementSpec) -> str:
     context_label = ",".join(sorted(required_fvg_context_selectors)) if required_fvg_context_selectors else "-"
     liquidity_label = primary.liquidity_selector or "-"
@@ -269,6 +289,8 @@ class ObservedEntry:
     known_at: datetime
     direction: str
     source: EntryEvent | SweepFVGSetupEvent
+    active_fvg_zones_by_selector: Mapping[str, tuple[FVGZone, ...]] | None = None
+    strategy_fvg_link_selectors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -404,6 +426,7 @@ def discover_entry_strategy_universe(
     *,
     min_entries_per_year: int = DEFAULT_MIN_ENTRIES_PER_YEAR,
     require_yearly_eligibility: bool = True,
+    pair_yearly_eligibility_for_both: bool = False,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> EntryStrategyUniverseResult:
     """Enumerate the full, fixed 1,554,432-spec syntactic universe,
@@ -440,6 +463,18 @@ def discover_entry_strategy_universe(
         snapshot.event.event_id: snapshot.market_state
         for snapshot in iter_candidate_entry_snapshots(fvg_results, fvg_entry_result, liquidity_entry_result, htf_bias_result)
     }
+    fvg_zone_by_id = {
+        zone.zone_id: zone
+        for result in fvg_results.values()
+        for zone in result.zones
+    }
+
+    def _active_zones(direction: str, market_state: MarketStateSnapshot) -> Mapping[str, tuple[FVGZone, ...]]:
+        return {
+            selector: tuple(fvg_zone_by_id[zone_id] for zone_id in zone_ids)
+            for selector, zone_ids in market_state.active_fvg_zone_ids_by_direction_selector[direction].items()
+            if selector.startswith(("fvg-5m-", "fvg-15m-"))
+        }
 
     # (ObservedEntry, S, B) tuples, grouped by their own PrimaryTriggerSpec
     # -- S is the observed active-FVG-context set (already intersected
@@ -462,7 +497,10 @@ def discover_entry_strategy_universe(
             key = PrimaryTriggerSpec(kind=kind, direction=event.direction, timeframe=event.timeframe, liquidity_selector=None)
         market_state = market_state_by_event_id[event.event_id]
         s, b = _signature(event.direction, market_state)
-        observed = ObservedEntry(entry_id=event.event_id, known_at=event.known_at, direction=event.direction, source=event)
+        observed = ObservedEntry(
+            entry_id=event.event_id, known_at=event.known_at, direction=event.direction, source=event,
+            active_fvg_zones_by_selector=_active_zones(event.direction, market_state),
+        )
         items_by_primary.setdefault(key, []).append((observed, s, b))
 
     for setup in build_sweep_fvg_setup_events(fvg_entry_result, liquidity_entry_result):
@@ -470,7 +508,10 @@ def discover_entry_strategy_universe(
         key = PrimaryTriggerSpec(kind=kind, direction=setup.direction, timeframe=setup.fvg_timeframe, liquidity_selector=setup.sweep_event.selector)
         market_state = market_state_by_event_id[setup.fvg_event.event_id]
         s, b = _signature(setup.direction, market_state)
-        observed = ObservedEntry(entry_id=setup.setup_id, known_at=setup.known_at, direction=setup.direction, source=setup)
+        observed = ObservedEntry(
+            entry_id=setup.setup_id, known_at=setup.known_at, direction=setup.direction, source=setup,
+            active_fvg_zones_by_selector=_active_zones(setup.direction, market_state),
+        )
         items_by_primary.setdefault(key, []).append((observed, s, b))
 
     context_subset_lookup = _build_context_subset_lookup()
@@ -480,28 +521,99 @@ def discover_entry_strategy_universe(
     classes_by_sequence_key: dict[tuple, list[EntryStrategySpec]] = {}
     observed_by_sequence_key: dict[tuple, tuple[ObservedEntry, ...]] = {}
 
-    total_primaries = len(items_by_primary)
-    for primary_index, (primary, items) in enumerate(items_by_primary.items(), start=1):
+    def _cells_for(
+        items: list[tuple[ObservedEntry, frozenset[str], tuple[str, str, str]]],
+    ) -> dict[tuple[frozenset[str], BiasRequirementSpec], list[ObservedEntry]]:
         cells: dict[tuple[frozenset[str], BiasRequirementSpec], list[ObservedEntry]] = {}
         for observed, s, b in items:
             for req in context_subset_lookup[s]:
                 for pattern in bias_pattern_lookup[b]:
                     cells.setdefault((req, pattern), []).append(observed)
+        return cells
 
-        for (req, pattern), observed_list in cells.items():
-            count_2024, count_2025 = _year_counts(observed_list)
-            if require_yearly_eligibility and (count_2024 < min_entries_per_year or count_2025 < min_entries_per_year):
+    def _accept_cell(
+        primary: PrimaryTriggerSpec,
+        req: frozenset[str],
+        pattern: BiasRequirementSpec,
+        observed_list: list[ObservedEntry],
+    ) -> None:
+        spec = EntryStrategySpec(
+            spec_id=_build_spec_id(primary, req, pattern), primary=primary,
+            required_fvg_context_selectors=req, bias_requirement=pattern,
+        )
+        eligible_specs.append(spec)
+        sequence_key = tuple((o.entry_id, o.known_at, o.direction) for o in observed_list)
+        classes_by_sequence_key.setdefault(sequence_key, []).append(spec)
+        observed_by_sequence_key[sequence_key] = tuple(observed_list)
+
+    def _opposite_primary(primary: PrimaryTriggerSpec) -> PrimaryTriggerSpec:
+        direction = SHORT if primary.direction == LONG else LONG
+        selector = primary.liquidity_selector
+        if selector is not None:
+            selector = opposite_liquidity_selector(selector)
+        return PrimaryTriggerSpec(
+            kind=primary.kind, direction=direction, timeframe=primary.timeframe,
+            liquidity_selector=selector,
+        )
+
+    total_primaries = len(items_by_primary)
+    progress_count = 0
+
+    if pair_yearly_eligibility_for_both:
+        # Production ranks one coherent long+short system.  Its coarse
+        # discovery threshold must therefore be applied to the combined raw
+        # stream, not independently to each side (99 long + 1 short is a
+        # valid 100-entry recipe).  Process natural opposite primaries as a
+        # pair so sub-threshold directional specs never need to be retained
+        # globally; memory remains bounded by two 512-cell primary grids.
+        processed: set[PrimaryTriggerSpec] = set()
+        for primary, items in items_by_primary.items():
+            if primary in processed:
                 continue
-            spec = EntryStrategySpec(
-                spec_id=_build_spec_id(primary, req, pattern), primary=primary, required_fvg_context_selectors=req, bias_requirement=pattern
-            )
-            eligible_specs.append(spec)
-            sequence_key = tuple((o.entry_id, o.known_at, o.direction) for o in observed_list)
-            classes_by_sequence_key.setdefault(sequence_key, []).append(spec)
-            observed_by_sequence_key[sequence_key] = tuple(observed_list)
+            opposite = _opposite_primary(primary)
+            processed.add(primary)
+            paired_items = items_by_primary.get(opposite)
+            if paired_items is None:
+                progress_count += 1
+                if on_progress is not None:
+                    on_progress(progress_count, total_primaries)
+                continue
+            processed.add(opposite)
+            long_primary, long_items = (primary, items) if primary.direction == LONG else (opposite, paired_items)
+            short_primary, short_items = (opposite, paired_items) if primary.direction == LONG else (primary, items)
+            long_cells = _cells_for(long_items)
+            short_cells = _cells_for(short_items)
+            for (req, long_pattern), long_observed in long_cells.items():
+                short_pattern = mirror_bias_requirement(long_pattern)
+                right_observed = short_cells.get((req, short_pattern))
+                if right_observed is None:
+                    continue
+                count_2024_left, count_2025_left = _year_counts(long_observed)
+                count_2024_right, count_2025_right = _year_counts(right_observed)
+                if require_yearly_eligibility and (
+                    count_2024_left + count_2024_right < min_entries_per_year
+                    or count_2025_left + count_2025_right < min_entries_per_year
+                ):
+                    continue
+                _accept_cell(long_primary, req, long_pattern, long_observed)
+                _accept_cell(short_primary, req, short_pattern, right_observed)
+            for _ in range(2):
+                progress_count += 1
+                if on_progress is not None:
+                    on_progress(progress_count, total_primaries)
+    else:
+        for primary, items in items_by_primary.items():
+            cells = _cells_for(items)
 
-        if on_progress is not None:
-            on_progress(primary_index, total_primaries)
+            for (req, pattern), observed_list in cells.items():
+                count_2024, count_2025 = _year_counts(observed_list)
+                if require_yearly_eligibility and (count_2024 < min_entries_per_year or count_2025 < min_entries_per_year):
+                    continue
+                _accept_cell(primary, req, pattern, observed_list)
+
+            progress_count += 1
+            if on_progress is not None:
+                on_progress(progress_count, total_primaries)
 
     equivalence_classes: list[EntryStrategyEquivalenceClass] = []
     for sequence_key, specs in classes_by_sequence_key.items():
