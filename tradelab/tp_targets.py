@@ -81,11 +81,11 @@ _EQUAL_TYPES = frozenset({LiquidityType.EQUAL_HIGHS, LiquidityType.EQUAL_LOWS})
 _SESSION_TYPES = frozenset(lt for lt in LiquidityType if lt.value.startswith("session_"))
 
 MAX_LIQUIDITY_TARGETS = 3
-# 500 points = 2,000 MNQ ticks. This is deliberately a single research
+# 100 points = 400 MNQ ticks. This is deliberately a single research
 # constraint, not a grid parameter: a data wick further away is not a
 # plausible execution target for this intraday strategy and was responsible
 # for the pathological outlier P&L seen in the diagnostic run.
-MAX_DATA_WICK_TARGET_DISTANCE_POINTS = 500.0
+MAX_DATA_WICK_TARGET_DISTANCE_POINTS = 100.0
 
 
 class TPSourceType(str, Enum):
