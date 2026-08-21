@@ -1551,6 +1551,7 @@ def _expand_and_simulate(
     context: PreparedBacktestContext,
     *,
     both_universe: BothDirectionUniverseResult | None = None,
+    include_directional_variants: bool = True,
     risk_config: RiskConfig,
     equity_config: EquityConfig,
     top_n_leaderboard: int,
@@ -1632,8 +1633,13 @@ def _expand_and_simulate(
     py``'s ``EntryTargetCacheEquivalenceTests`` for the randomized
     equivalence proof against running with no cache at all.
     """
+    # Production research deliberately evaluates one shared long+short
+    # system.  Keeping the opt-in directional path preserves focused unit
+    # tests and diagnostic benchmarks, but it is not part of the production
+    # strategy population and must never compete in its leaderboard.
+    directional_class_count = universe.equivalence_class_count if include_directional_variants else 0
     both_class_count = 0 if both_universe is None else both_universe.equivalence_class_count
-    total_variant_runs = (universe.equivalence_class_count + both_class_count) * len(exit_variants) * len(instruments)
+    total_variant_runs = (directional_class_count + both_class_count) * len(exit_variants) * len(instruments)
     reporter.phase_started(RunPhase.EXPANDING_EXIT_VARIANTS, items_total=max(total_variant_runs, 1))
     reporter.progress(items_completed=max(total_variant_runs, 1), exit_variants_generated=total_variant_runs)
 
@@ -1651,7 +1657,8 @@ def _expand_and_simulate(
         reporter.update_leaderboard(_merged_leaderboard(durable_top_n, top_n, top_n_leaderboard))
 
     entry_target_cache = EntryTargetCache(max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES)
-    for equivalence_class in universe.equivalence_classes:
+    directional_classes = universe.equivalence_classes if include_directional_variants else ()
+    for equivalence_class in directional_classes:
         # One bounded cache survives the whole prepared run. Multiple
         # equivalence classes often share the exact same observed event, so
         # this avoids resolving its TP/SL candidates again. LRU eviction only
@@ -2044,26 +2051,28 @@ def run_production_backtest_v2(
         both_universe = discover_both_direction_universe(universe)
         reporter.progress(
             items_completed=1,
-            unique_entry_classes=universe.equivalence_class_count + both_universe.equivalence_class_count,
+            unique_entry_classes=both_universe.equivalence_class_count,
         )
         reporter.checkpoint_written(
             cursor={
                 "stage": "deduplicating_entries",
-                "equivalence_class_count": universe.equivalence_class_count,
+                "directional_equivalence_class_count": universe.equivalence_class_count,
                 "both_equivalence_class_count": both_universe.equivalence_class_count,
             },
             resumable=True, resumable_note=_EARLY_PHASE_CHECKPOINT_RESUMABLE_NOTE,
         )
 
         completed, final_leaderboard = _expand_and_simulate(
-            reporter, journal, universe, exit_variants, instruments, context, both_universe=both_universe,
+            reporter, journal, universe, exit_variants, instruments, context,
+            both_universe=both_universe, include_directional_variants=False,
             risk_config=risk_config, equity_config=equity_config,
             top_n_leaderboard=top_n_leaderboard, checkpoint_every=checkpoint_every,
         )
 
         reporter.completed(
             summary={
-                "equivalence_class_count": universe.equivalence_class_count,
+                "equivalence_class_count": both_universe.equivalence_class_count,
+                "directional_equivalence_class_count": universe.equivalence_class_count,
                 "both_equivalence_class_count": both_universe.equivalence_class_count,
                 "exit_variant_count": len(exit_variants),
                 "strategy_variant_result_count": completed, "top_net_pnl_usd": (final_leaderboard[0].pnl if final_leaderboard else None),
@@ -2942,7 +2951,8 @@ def _run_smoke_pipeline(reporter: RunReporter, context: PreparedBacktestContext,
         reporter.progress(items_completed=1, discovered_specs=universe.syntactically_enumerated_spec_count, eligible_specs=universe.eligible_spec_count)
 
         reporter.phase_started(RunPhase.DEDUPLICATING_ENTRIES, items_total=1)
-        reporter.progress(items_completed=1, unique_entry_classes=universe.equivalence_class_count)
+        both_universe = discover_both_direction_universe(universe)
+        reporter.progress(items_completed=1, unique_entry_classes=both_universe.equivalence_class_count)
 
         journal = _open_journal(
             reporter, market_artifact_path=None, news_csv_path=None,
@@ -2952,7 +2962,8 @@ def _run_smoke_pipeline(reporter: RunReporter, context: PreparedBacktestContext,
         )
         try:
             completed, final_leaderboard = _expand_and_simulate(
-                reporter, journal, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, context, both_universe=both_universe,
+                reporter, journal, universe, ALL_EXIT_VARIANTS, DEFAULT_INSTRUMENTS, context,
+                both_universe=both_universe, include_directional_variants=False,
                 risk_config=DEFAULT_RISK_CONFIG,
                 equity_config=DEFAULT_EQUITY_CONFIG, top_n_leaderboard=10, checkpoint_every=25,
             )
