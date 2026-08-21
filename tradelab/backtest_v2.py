@@ -2774,6 +2774,10 @@ def main(argv: list[str] | None = None) -> int:
     real.add_argument("--reclaim-window-bars", type=int, required=True)
     real.add_argument("--min-entries-per-year", type=int, default=100)
     real.add_argument(
+        "--exclude-data-wick", action="store_true",
+        help="Run only liquidity TP variants. The exclusion is recorded in the run manifest via its exact exit-variant list.",
+    )
+    real.add_argument(
         "--run-id", default=None,
         help="Resume an interrupted run: pass the SAME --run-id used on the original invocation "
         "(printed as 'run_id: ...' when that run started). Requires identical market artifact, "
@@ -2846,9 +2850,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.mode == "run":
+        exit_variants = tuple(v for v in ALL_EXIT_VARIANTS if v.tp_kind != TPVariantKind.DATA_WICK) if args.exclude_data_wick else ALL_EXIT_VARIANTS
         reporter = run_production_backtest_v2(
             market_artifact_path=args.market_artifact, news_csv_path=args.news_csv, runs_dir=args.runs_dir,
             pivot_strength=args.pivot_strength, reclaim_window_bars=args.reclaim_window_bars, min_entries_per_year=args.min_entries_per_year,
+            exit_variants=exit_variants,
             run_id=args.run_id, command="python3 -m tradelab.backtest_v2 run",
         )
     elif args.mode == "preflight":
