@@ -154,6 +154,27 @@ def _build_universe_order(run_dir: Path, *, sort_key: str, direction: str, min_t
         connection.close()
 
 
+def _journal_supports_live_readers(run_dir: Path) -> bool:
+    """Return true only for a WAL journal safe to query during writes.
+
+    WAL readers see a stable snapshot and do not block the writer.  Historic
+    rollback-journal runs retain the lightweight top-N fallback, because a
+    full filter could otherwise delay a critical durable checkpoint.
+    """
+    db_path = run_dir / "backtest_v2_journal.sqlite3"
+    if not db_path.is_file():
+        return False
+    try:
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.25)
+        try:
+            row = connection.execute("PRAGMA journal_mode").fetchone()
+            return bool(row and str(row[0]).lower() == "wal")
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return False
+
+
 def _read_universe_leaders(
     run_dir: Path, *, order_rowids: list[int], sort_key: str, direction: str,
     min_trades: int, offset: int, limit: int,
@@ -361,7 +382,7 @@ class _DashboardRequestHandler(BaseHTTPRequestHandler):
             # atomic JSON P&L snapshot. Full global filtering is enabled once
             # the run is terminal, when no writer can be blocked.
             live_status = read_live_status(run_dir)
-            if live_status.phase == "simulating_backtests":
+            if live_status.phase == "simulating_backtests" and not _journal_supports_live_readers(run_dir):
                 leaderboard = read_leaderboard(run_dir)
                 payload = leaderboard.to_dict() if leaderboard is not None else {"entries": []}
                 sort_key = query.get("sort", ["pnl"])[0]

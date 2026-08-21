@@ -203,7 +203,14 @@ class BacktestV2Journal:
             raise ValueError("BacktestV2Journal: run_id must be non-empty")
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._db_path))
+        # WAL lets the dashboard read a consistent snapshot without blocking
+        # the backtest's per-variant checkpoint transaction.  The rollback
+        # journal default (``DELETE``) cannot provide that guarantee.
+        # Keep FULL sync: this journal is the authoritative resume source.
+        self._conn = sqlite3.connect(str(self._db_path), timeout=5.0)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=FULL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA_SQL)
         _migrate_summary_schema(self._conn)
         self._conn.commit()

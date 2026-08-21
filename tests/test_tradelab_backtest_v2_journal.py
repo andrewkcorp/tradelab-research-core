@@ -40,6 +40,13 @@ def _open(db_path: Path, **overrides) -> BacktestV2Journal:
 
 
 class ManifestCreateAndVerifyTests(unittest.TestCase):
+    def test_fresh_journal_uses_wal_for_nonblocking_dashboard_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "journal.sqlite3"
+            journal = _open(db_path)
+            self.assertEqual(journal._conn.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
+            journal.close()
+
     def test_fresh_creation_writes_manifest_and_reopen_with_identical_config_succeeds(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "journal.sqlite3"
