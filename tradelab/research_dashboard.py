@@ -48,6 +48,7 @@ UNIVERSE_PAGE_DEFAULT = 100
 UNIVERSE_PAGE_MAX = 250
 UNIVERSE_CACHE_SECONDS = 60.0
 UNIVERSE_CACHE_MAX_ORDERS = 2
+_LOSS_LIMITS_2000_SQL = "__loss_limits_2000__"
 _UNIVERSE_SORT_COLUMNS = {
     "rank": "net_pnl_usd",
     "pnl": "net_pnl_usd",
@@ -55,17 +56,33 @@ _UNIVERSE_SORT_COLUMNS = {
     "win_rate": "win_rate",
     "trade_count": "trade_count",
     "max_drawdown": "max_drawdown_usd",
-    "drawdowns_over_2000_count": "drawdowns_over_2000_count",
+    # The user-facing value is the number of complete $2k risk limits
+    # contained in the worst observed drawdown, not the legacy count of
+    # threshold-entry edges.  Ordering by the underlying drawdown is exactly
+    # monotonic with floor(drawdown / 2000) and avoids an expression index.
+    "drawdowns_over_2000_count": _LOSS_LIMITS_2000_SQL,
 }
 _RANGE_FILTER_COLUMNS = {
     "pnl": "net_pnl_usd", "roi": "roi", "win_rate": "win_rate",
     "trade_count": "trade_count", "max_drawdown": "max_drawdown_usd",
-    "drawdowns_over_2000_count": "drawdowns_over_2000_count",
+    "drawdowns_over_2000_count": _LOSS_LIMITS_2000_SQL,
     "completed_trades_2024": "completed_trades_2024",
     "completed_trades_2025": "completed_trades_2025",
     "mtm_max_drawdown": "mtm_max_drawdown_usd",
 }
 _BOOLEAN_FILTER_COLUMNS = {"apex_has_breach": "apex_has_breach"}
+
+
+def _loss_limits_2000(*, max_drawdown_usd: float | None, mtm_max_drawdown_usd: float | None) -> int:
+    """Return complete $2,000 risk limits consumed by worst drawdown.
+
+    New journals prefer conservative mark-to-market drawdown. Historic runs
+    fall back to realised max drawdown. This is deliberately derived at read
+    time so a live run never needs to be stopped or its durable journal rows
+    rewritten merely to correct dashboard semantics.
+    """
+    observed = mtm_max_drawdown_usd if mtm_max_drawdown_usd is not None else max_drawdown_usd
+    return max(0, int(float(observed or 0.0) // 2_000.0))
 
 
 def _parse_universe_filters(query: dict) -> dict[str, object]:
@@ -130,6 +147,12 @@ def _build_universe_order(run_dir: Path, *, sort_key: str, direction: str, min_t
     connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
     try:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(variant_summaries)")}
+        loss_drawdown_column = (
+            "COALESCE(mtm_max_drawdown_usd, max_drawdown_usd)"
+            if "mtm_max_drawdown_usd" in columns else "max_drawdown_usd"
+        )
+        if sort_column == _LOSS_LIMITS_2000_SQL:
+            sort_column = f"CAST(({loss_drawdown_column}) / 2000.0 AS INTEGER)"
         order = "ASC" if direction == "asc" else "DESC"
         clauses = ["trade_count >= ?"]
         values: list[object] = [min_trades]
@@ -139,7 +162,9 @@ def _build_universe_order(run_dir: Path, *, sort_key: str, direction: str, min_t
         if "research_eligible" in columns:
             clauses.append("research_eligible = 1")
         for key, filter_column in _RANGE_FILTER_COLUMNS.items():
-            if filter_column not in columns:
+            if filter_column == _LOSS_LIMITS_2000_SQL:
+                filter_column = f"CAST(({loss_drawdown_column}) / 2000.0 AS INTEGER)"
+            elif filter_column not in columns:
                 continue
             if f"{key}_min" in filters:
                 clauses.append(f"{filter_column} >= ?"); values.append(filters[f"{key}_min"])
@@ -272,6 +297,9 @@ def _read_universe_leaders(
                 "mtm_worst_equity_at": mtm_worst_equity_at,
                 "ambiguous_same_bar_exit_count": ambiguous_same_bar_exit_count,
             })
+            detailed["drawdowns_over_2000_count"] = _loss_limits_2000(
+                max_drawdown_usd=max_drawdown, mtm_max_drawdown_usd=mtm_max_drawdown,
+            )
             detailed["rank"] = position
             entries.append(detailed)
             continue
@@ -285,7 +313,9 @@ def _read_universe_leaders(
             "win_rate": win_rate or 0.0,
             "trade_count": trade_count,
             "max_drawdown": max_drawdown,
-            "drawdowns_over_2000_count": dd_count,
+            "drawdowns_over_2000_count": _loss_limits_2000(
+                max_drawdown_usd=max_drawdown, mtm_max_drawdown_usd=mtm_max_drawdown,
+            ),
             "apex_has_breach": bool(apex_has_breach),
             "apex_breach_count": apex_breach_count,
             "apex_max_daily_loss_usd": apex_max_daily_loss,
@@ -422,11 +452,18 @@ class _DashboardRequestHandler(BaseHTTPRequestHandler):
                 sort_key = query.get("sort", ["pnl"])[0]
                 direction = query.get("dir", ["desc"])[0]
                 column = _UNIVERSE_SORT_COLUMNS.get(sort_key, "net_pnl_usd")
-                entry_key = {
-                    "net_pnl_usd": "pnl", "roi": "roi", "win_rate": "win_rate",
-                    "trade_count": "trade_count", "max_drawdown_usd": "max_drawdown",
-                    "drawdowns_over_2000_count": "drawdowns_over_2000_count",
-                }[column]
+                if sort_key == "drawdowns_over_2000_count":
+                    for entry in payload.get("entries", []):
+                        entry["drawdowns_over_2000_count"] = _loss_limits_2000(
+                            max_drawdown_usd=entry.get("max_drawdown"),
+                            mtm_max_drawdown_usd=entry.get("mtm_max_drawdown_usd"),
+                        )
+                    entry_key = "drawdowns_over_2000_count"
+                else:
+                    entry_key = {
+                        "net_pnl_usd": "pnl", "roi": "roi", "win_rate": "win_rate",
+                        "trade_count": "trade_count", "max_drawdown_usd": "max_drawdown",
+                    }[column]
                 # Sorting this atomic JSON snapshot is in-memory and tiny
                 # (top-N only), so it never holds a SQLite read lock against
                 # the active writer. It makes the live dashboard responsive
@@ -710,7 +747,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       <table id="leaders-table" style="display:none">
         <thead><tr>
           <th class="num">Position</th><th>Strategy</th><th class="num"><button class="sort-button" data-sort-key="pnl">P&amp;L <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="roi">ROI <span class="sort-indicator"></span></button></th>
-          <th class="num"><button class="sort-button" data-sort-key="win_rate">Win rate <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="trade_count">Trades <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="max_drawdown">Max DD <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="drawdowns_over_2000_count">DD&gt;$2k <span class="sort-indicator"></span></button></th>
+          <th class="num"><button class="sort-button" data-sort-key="win_rate">Win rate <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="trade_count">Trades <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="max_drawdown">Max DD <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="drawdowns_over_2000_count">$2k limits <span class="sort-indicator"></span></button></th>
         </tr></thead>
         <tbody id="leaders-tbody"></tbody>
       </table>
@@ -900,7 +937,7 @@ function renderActiveWork(status) {
   }
 }
 
-const SORT_LABELS = {rank:"original rank", pnl:"realised P&L", roi:"ROI", win_rate:"win rate", trade_count:"trade count", max_drawdown:"max drawdown", drawdowns_over_2000_count:"DD > $2k episodes"};
+const SORT_LABELS = {rank:"original rank", pnl:"realised P&L", roi:"ROI", win_rate:"win rate", trade_count:"trade count", max_drawdown:"max drawdown", drawdowns_over_2000_count:"$2k loss limits consumed"};
 function sortedEntries(leaderboard) {
   const sign = leaderboardSort.dir === "asc" ? 1 : -1;
   return ((leaderboard && leaderboard.entries) || []).slice().sort((a,b) => {
@@ -952,6 +989,7 @@ function renderStrategySummary(leaderboard) {
     <div class="card"><div class="label">Win rate</div><div class="value">${fmtPct(entry.win_rate)}</div><div class="subtle">not the ranking criterion</div></div>
     <div class="card"><div class="label">Apex EOD audit</div><div class="value ${entry.apex_has_breach ? "pnl-neg" : "pnl-pos"}">${entry.apex_has_breach ? "BREACH" : "No recorded breach"}</div><div class="subtle">${entry.apex_has_breach ? `${fmtNum(entry.apex_breach_count || 0)} event(s)` : "audit only — does not alter trades"}</div></div>
     <div class="card"><div class="label">Mark-to-market drawdown</div><div class="value pnl-neg">${fmtMoney(entry.mtm_max_drawdown_usd)}</div><div class="subtle">includes open-position path</div></div>
+    <div class="card"><div class="label">$2k loss limits consumed</div><div class="value pnl-neg">${fmtNum(entry.drawdowns_over_2000_count)}</div><div class="subtle">floor(MTM max drawdown ÷ $2,000)</div></div>
     <div class="card"><div class="label">Ambiguous exit bars</div><div class="value">${fmtNum(entry.ambiguous_same_bar_exit_count)}</div><div class="subtle">TP and SL both touched · SL-first policy</div></div>
     <div class="card"><div class="label">Profit factor</div><div class="value">${profitFactor === null ? "–" : fmtNum(profitFactor)}</div><div class="subtle">gross wins ÷ gross losses</div></div>
     <div class="card"><div class="label">Average trade</div><div class="value ${averageTrade >= 0 ? "pnl-pos" : "pnl-neg"}">${fmtMoney(averageTrade)}</div><div class="subtle">net realised P&amp;L</div></div>

@@ -220,6 +220,39 @@ class ArtifactParsingTests(_ServerTestCase):
         self.assertEqual(status, 200)
         self.assertEqual([entry["strategy_id"] for entry in json.loads(body)["entries"]], ["profit-mid-dd", "profit-high-dd", "loss-low-dd"])
 
+    def test_2k_limit_sort_uses_mtm_drawdown_units_not_legacy_episode_edges(self):
+        create_run(runs_dir=self.runs_dir, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="run-loss-limits")
+        db_path = f"{self.runs_dir}/run-loss-limits/backtest_v2_journal.sqlite3"
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute("""
+                CREATE TABLE variant_summaries (
+                    strategy_variant_id TEXT PRIMARY KEY,
+                    net_pnl_usd REAL NOT NULL, roi REAL NOT NULL, win_rate REAL,
+                    trade_count INTEGER NOT NULL, max_drawdown_usd REAL NOT NULL,
+                    drawdowns_over_2000_count INTEGER NOT NULL,
+                    mtm_max_drawdown_usd REAL, monthly_json TEXT NOT NULL
+                )
+            """)
+            connection.executemany(
+                "INSERT INTO variant_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    ("deep-loss", -180_000.0, -3.6, 0.1, 500, 180_000.0, 1, 181_999.0, "{}"),
+                    ("small-loss", -4_000.0, -0.08, 0.4, 200, 4_000.0, 99, 4_999.0, "{}"),
+                ],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        status, body = self._get(
+            "/api/runs/run-loss-limits/leaderboard?scope=all&sort=drawdowns_over_2000_count&dir=desc"
+        )
+        self.assertEqual(status, 200)
+        entries = json.loads(body)["entries"]
+        self.assertEqual([entry["strategy_id"] for entry in entries], ["deep-loss", "small-loss"])
+        self.assertEqual([entry["drawdowns_over_2000_count"] for entry in entries], [90, 2])
+
     def test_events_endpoint_respects_limit(self):
         reporter = create_run(runs_dir=self.runs_dir, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="run-g")
         reporter.phase_started(RunPhase.PREPARING_DATA, items_total=5)
