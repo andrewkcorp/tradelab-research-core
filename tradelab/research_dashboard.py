@@ -81,8 +81,9 @@ def _loss_limits_2000(*, max_drawdown_usd: float | None, mtm_max_drawdown_usd: f
     time so a live run never needs to be stopped or its durable journal rows
     rewritten merely to correct dashboard semantics.
     """
-    observed = mtm_max_drawdown_usd if mtm_max_drawdown_usd is not None else max_drawdown_usd
-    return max(0, int(float(observed or 0.0) // 2_000.0))
+    realised = float(max_drawdown_usd or 0.0)
+    mtm = float(mtm_max_drawdown_usd or 0.0)
+    return max(0, int(max(realised, mtm) // 2_000.0))
 
 
 def _parse_universe_filters(query: dict) -> dict[str, object]:
@@ -148,7 +149,7 @@ def _build_universe_order(run_dir: Path, *, sort_key: str, direction: str, min_t
     try:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(variant_summaries)")}
         loss_drawdown_column = (
-            "COALESCE(mtm_max_drawdown_usd, max_drawdown_usd)"
+            "MAX(max_drawdown_usd, COALESCE(mtm_max_drawdown_usd, max_drawdown_usd))"
             if "mtm_max_drawdown_usd" in columns else "max_drawdown_usd"
         )
         if sort_column == _LOSS_LIMITS_2000_SQL:
@@ -989,7 +990,7 @@ function renderStrategySummary(leaderboard) {
     <div class="card"><div class="label">Win rate</div><div class="value">${fmtPct(entry.win_rate)}</div><div class="subtle">not the ranking criterion</div></div>
     <div class="card"><div class="label">Apex EOD audit</div><div class="value ${entry.apex_has_breach ? "pnl-neg" : "pnl-pos"}">${entry.apex_has_breach ? "BREACH" : "No recorded breach"}</div><div class="subtle">${entry.apex_has_breach ? `${fmtNum(entry.apex_breach_count || 0)} event(s)` : "audit only — does not alter trades"}</div></div>
     <div class="card"><div class="label">Mark-to-market drawdown</div><div class="value pnl-neg">${fmtMoney(entry.mtm_max_drawdown_usd)}</div><div class="subtle">includes open-position path</div></div>
-    <div class="card"><div class="label">$2k loss limits consumed</div><div class="value pnl-neg">${fmtNum(entry.drawdowns_over_2000_count)}</div><div class="subtle">floor(MTM max drawdown ÷ $2,000)</div></div>
+    <div class="card"><div class="label">$2k loss limits consumed</div><div class="value pnl-neg">${fmtNum(entry.drawdowns_over_2000_count)}</div><div class="subtle">floor(worst realised/MTM DD ÷ $2,000)</div></div>
     <div class="card"><div class="label">Ambiguous exit bars</div><div class="value">${fmtNum(entry.ambiguous_same_bar_exit_count)}</div><div class="subtle">TP and SL both touched · SL-first policy</div></div>
     <div class="card"><div class="label">Profit factor</div><div class="value">${profitFactor === null ? "–" : fmtNum(profitFactor)}</div><div class="subtle">gross wins ÷ gross losses</div></div>
     <div class="card"><div class="label">Average trade</div><div class="value ${averageTrade >= 0 ? "pnl-pos" : "pnl-neg"}">${fmtMoney(averageTrade)}</div><div class="subtle">net realised P&amp;L</div></div>

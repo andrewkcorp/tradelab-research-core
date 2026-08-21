@@ -237,7 +237,10 @@ class ArtifactParsingTests(_ServerTestCase):
             connection.executemany(
                 "INSERT INTO variant_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
-                    ("deep-loss", -180_000.0, -3.6, 0.1, 500, 180_000.0, 1, 181_999.0, "{}"),
+                    # MTM being lower must never hide the already-realised
+                    # $180k drawdown: the safe dashboard metric uses the
+                    # worse of the two and therefore still consumes 90 limits.
+                    ("deep-loss", -180_000.0, -3.6, 0.1, 500, 180_000.0, 1, 179_000.0, "{}"),
                     ("small-loss", -4_000.0, -0.08, 0.4, 200, 4_000.0, 99, 4_999.0, "{}"),
                 ],
             )
