@@ -218,7 +218,7 @@ from tradelab.liquidity_target_index import LiquidityTargetIndex
 from tradelab.equity import EquityConfig, EquityResult, build_equity_curve
 from tradelab.fvg import DEFAULT_TICK_SIZE
 from tradelab.fvg_entry import FVGEntryCandidate
-from tradelab.news import is_entry_blocked
+from tradelab.news import NewsBlackoutIndex, is_entry_blocked
 from tradelab.research_run import LeaderboardEntry, ProgressThrottle, RunPhase, RunReporter, append_jsonl, atomic_write_json, create_run, read_run_manifest
 from tradelab.research_run import _git_provenance as _current_git_provenance
 from tradelab.research_run import _sha256_of_file as _hash_file
@@ -650,6 +650,8 @@ def simulate_market_execution(
     on_entry_progress: Callable[[int, int], None] | None = None,
     bar_range_index: BarRangeIndex | None = None,
     entry_target_cache: EntryTargetCache | None = None,
+    liquidity_target_index: LiquidityTargetIndex | None = None,
+    news_blackout_index: NewsBlackoutIndex | None = None,
     stage_timings: StageTimings | None = None,
 ) -> tuple[list[ExecutedTrade], list[SkippedEntryV2]]:
     """**The real, accelerated execution loop (task 045).** Identical
@@ -750,7 +752,11 @@ def simulate_market_execution(
             skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.POSITION_ALREADY_OPEN))
             continue
 
-        blocked, _blocking = is_entry_blocked(fill_bar.timestamp, context.news_events)
+        blocked = (
+            news_blackout_index.is_blocked(fill_bar.timestamp)
+            if news_blackout_index is not None
+            else is_entry_blocked(fill_bar.timestamp, context.news_events)[0]
+        )
         if blocked:
             skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.NEWS_BLOCK))
             continue
@@ -777,6 +783,7 @@ def simulate_market_execution(
         tp_candidate = _resolve_tp_candidate(
             variant, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results, context.data_wick_result,
             entry_target_cache=entry_target_cache,
+            liquidity_target_index=liquidity_target_index,
         )
         if stage_timings is not None:
             stage_timings.record("entry_target_resolution", time.perf_counter() - _t0)
@@ -789,6 +796,7 @@ def simulate_market_execution(
         sl_candidate = _resolve_sl_candidate(
             variant, entry, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results,
             entry_target_cache=entry_target_cache,
+            liquidity_target_index=liquidity_target_index,
         )
         if stage_timings is not None:
             stage_timings.record("entry_target_resolution", time.perf_counter() - _t0)
@@ -891,6 +899,7 @@ def simulate_market_execution_batched(
     bar_range_index: BarRangeIndex | None = None,
     entry_target_cache: EntryTargetCache | None = None,
     liquidity_target_index: LiquidityTargetIndex | None = None,
+    news_blackout_index: NewsBlackoutIndex | None = None,
 ) -> dict[str, tuple[list[ExecutedTrade], list[SkippedEntryV2]]]:
     """Execute every supplied exit variant in one chronological entry pass.
 
@@ -935,7 +944,11 @@ def simulate_market_execution_batched(
             continue
 
         fill_bar = bars[fill_index]
-        blocked, _blocking = is_entry_blocked(fill_bar.timestamp, context.news_events)
+        blocked = (
+            news_blackout_index.is_blocked(fill_bar.timestamp)
+            if news_blackout_index is not None
+            else is_entry_blocked(fill_bar.timestamp, context.news_events)[0]
+        )
         market_entry = MarketEntryContext(
             entry_id=entry.entry_id,
             direction=entry.direction,
@@ -1161,6 +1174,7 @@ def _build_variant_result_for_instrument(
     equity_config: EquityConfig,
     stage_timings: StageTimings | None = None,
     bars_1m: tuple[Bar1m, ...] | list[Bar1m] | None = None,
+    audit_bar_range_index: BarRangeIndex | None = None,
 ) -> StrategyVariantResult:
     """Sizing/P&L (``tradelab.accounting.apply_accounting``, unmodified)
     then equity/drawdown (``tradelab.equity.build_equity_curve``,
@@ -1190,7 +1204,11 @@ def _build_variant_result_for_instrument(
     equity_result = build_equity_curve(account_result, equity_config)
     apex_eod_audit = audit_apex_eod(account_result, DEFAULT_APEX_EOD_CONFIG)
     mark_to_market_audit = (
-        audit_account_mark_to_market(trades, account_result, bars_1m, initial_balance_usd=equity_config.initial_balance_usd)
+        audit_account_mark_to_market(
+            trades, account_result, bars_1m,
+            initial_balance_usd=equity_config.initial_balance_usd,
+            bar_range_index=audit_bar_range_index,
+        )
         if bars_1m is not None else None
     )
     if stage_timings is not None:
@@ -1261,6 +1279,7 @@ def run_both_direction_variant_backtest(
     on_entry_progress: Callable[[int, int], None] | None = None,
     bar_range_index: BarRangeIndex | None = None,
     entry_target_cache: EntryTargetCache | None = None,
+    liquidity_target_index: LiquidityTargetIndex | None = None,
 ) -> StrategyVariantResult:
     """Backtest one real symmetric long+short strategy as a single system."""
     trades, skipped = simulate_both_direction_market_execution(
@@ -1269,7 +1288,33 @@ def run_both_direction_variant_backtest(
         variant, context, f"{equivalence_class.class_id}::{variant.variant_id}",
         on_bar_progress=on_bar_progress, on_entry_progress=on_entry_progress,
         bar_range_index=bar_range_index, entry_target_cache=entry_target_cache,
+        liquidity_target_index=liquidity_target_index,
     )
+    return _build_both_variant_result_for_instrument(
+        equivalence_class, variant, instrument, trades, skipped, context,
+        risk_config=risk_config, equity_config=equity_config,
+    )
+
+
+def _build_both_variant_result_for_instrument(
+    equivalence_class: BothDirectionEquivalenceClass,
+    variant: ExitVariantSpec,
+    instrument: Instrument,
+    trades: list[ExecutedTrade],
+    skipped: list[SkippedEntryV2],
+    context: PreparedBacktestContext,
+    *,
+    risk_config: RiskConfig,
+    equity_config: EquityConfig,
+    audit_bar_range_index: BarRangeIndex | None = None,
+) -> StrategyVariantResult:
+    """Build one accounted ``both`` result from an already-simulated path.
+
+    Keeping execution separate from accounting lets every exit variant share
+    the exact batched entry traversal while preserving the existing result
+    construction byte-for-byte.  This helper contains no fill/target/exit
+    decisions.
+    """
     variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value)
     backtest_result = BacktestResult(
         strategy_id=variant_id, trades=trades, skipped_signals=[], trade_count=len(trades),
@@ -1296,7 +1341,11 @@ def run_both_direction_variant_backtest(
         drawdowns_over_2000_count=equity_result.drawdown_over_threshold_episode_count,
         skipped_entries_by_reason=skipped_by_reason, yearly=yearly, monthly=monthly,
         apex_eod_audit=audit_apex_eod(account_result, DEFAULT_APEX_EOD_CONFIG),
-        mark_to_market_audit=audit_account_mark_to_market(trades, account_result, context.bars_1m, initial_balance_usd=equity_config.initial_balance_usd),
+        mark_to_market_audit=audit_account_mark_to_market(
+            trades, account_result, context.bars_1m,
+            initial_balance_usd=equity_config.initial_balance_usd,
+            bar_range_index=audit_bar_range_index,
+        ),
     )
 
 
@@ -1647,6 +1696,7 @@ def _expand_and_simulate(
     summary_path = reporter.run_dir / "variant_summaries.jsonl"
     bar_range_index = _build_bar_range_index_with_heartbeat(reporter, context.bars_1m)
     liquidity_target_index = LiquidityTargetIndex.build(context.swing_equal_liquidity_results, context.session_liquidity_results)
+    news_blackout_index = NewsBlackoutIndex.build(context.news_events)
 
     completed = journal.completed_count()
     durable_top_n = [_leaderboard_entry_from_journal_summary(s) for s in journal.top_n_summaries(top_n_leaderboard)]
@@ -1697,7 +1747,8 @@ def _expand_and_simulate(
             tuple(variant for variant, _pending in pending_by_variant), context, equivalence_class.class_id,
             on_bar_progress=bar_progress.maybe,
             on_entry_progress=_entry_progress_callback(reporter, variant_id=lead_variant_id),
-            bar_range_index=bar_range_index, entry_target_cache=entry_target_cache, liquidity_target_index=liquidity_target_index,
+            bar_range_index=bar_range_index, entry_target_cache=entry_target_cache,
+            liquidity_target_index=liquidity_target_index, news_blackout_index=news_blackout_index,
         )
 
         for variant, pending_instruments in pending_by_variant:
@@ -1706,6 +1757,7 @@ def _expand_and_simulate(
                 result = _build_variant_result_for_instrument(
                     equivalence_class, variant, instrument, trades, skipped,
                     risk_config=risk_config, equity_config=equity_config, bars_1m=context.bars_1m,
+                    audit_bar_range_index=bar_range_index,
                 )
                 row = VariantSummaryRow.from_result(result)
                 journal.commit_summary(row.to_dict())  # durable, authoritative -- BEFORE anything below reports it as done
@@ -1729,29 +1781,53 @@ def _expand_and_simulate(
     if both_universe is not None:
         both_target_cache = EntryTargetCache(max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES)
         for equivalence_class in both_universe.equivalence_classes:
+            pending_by_variant: list[tuple[ExitVariantSpec, tuple[Instrument, ...]]] = []
             for variant in exit_variants:
-                for instrument in instruments:
-                    variant_id = strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value)
-                    if journal.is_completed(variant_id):
-                        continue
-                    current_unit_index = completed + 1
-                    reporter.heartbeat(
-                        operation="simulating_backtests", variant_id=variant_id,
-                        unit_index=current_unit_index, unit_total=total_variant_runs,
-                        bars_scanned=0, bars_total=len(context.bars_1m),
-                    )
-                    bar_progress = ProgressThrottle(
-                        lambda scanned, total, _vid=variant_id, _idx=current_unit_index: reporter.heartbeat(
-                            operation="simulating_backtests", variant_id=_vid, unit_index=_idx,
-                            unit_total=total_variant_runs, bars_scanned=scanned, bars_total=total,
-                        )
-                    )
-                    result = run_both_direction_variant_backtest(
-                        equivalence_class, variant, instrument, context,
+                pending_instruments = tuple(
+                    instrument for instrument in instruments
+                    if not journal.is_completed(strategy_variant_id(equivalence_class.class_id, variant.variant_id, instrument.value))
+                )
+                if pending_instruments:
+                    pending_by_variant.append((variant, pending_instruments))
+            if not pending_by_variant:
+                continue
+
+            first_variant, first_instruments = pending_by_variant[0]
+            lead_variant_id = strategy_variant_id(
+                equivalence_class.class_id, first_variant.variant_id, first_instruments[0].value
+            )
+            current_unit_index = completed + 1
+            reporter.heartbeat(
+                operation="simulating_backtests", variant_id=lead_variant_id,
+                unit_index=current_unit_index, unit_total=total_variant_runs,
+                bars_scanned=0, bars_total=len(context.bars_1m),
+            )
+            bar_progress = ProgressThrottle(
+                lambda scanned, total, _vid=lead_variant_id, _idx=current_unit_index: reporter.heartbeat(
+                    operation="simulating_backtests", variant_id=_vid, unit_index=_idx,
+                    unit_total=total_variant_runs, bars_scanned=scanned, bars_total=total,
+                )
+            )
+            merged_entries, conflicts = merge_both_direction_entries(
+                equivalence_class.long_entries, equivalence_class.short_entries
+            )
+            executions_by_variant = simulate_market_execution_batched(
+                merged_entries, "both", tuple(variant for variant, _pending in pending_by_variant),
+                context, equivalence_class.class_id,
+                on_bar_progress=bar_progress.maybe,
+                on_entry_progress=_entry_progress_callback(reporter, variant_id=lead_variant_id),
+                bar_range_index=bar_range_index, entry_target_cache=both_target_cache,
+                liquidity_target_index=liquidity_target_index, news_blackout_index=news_blackout_index,
+            )
+
+            for variant, pending_instruments in pending_by_variant:
+                trades, variant_skipped = executions_by_variant[variant.variant_id]
+                skipped = list(conflicts) + variant_skipped
+                for instrument in pending_instruments:
+                    result = _build_both_variant_result_for_instrument(
+                        equivalence_class, variant, instrument, trades, skipped, context,
                         risk_config=risk_config, equity_config=equity_config,
-                        on_bar_progress=bar_progress.maybe,
-                        on_entry_progress=_entry_progress_callback(reporter, variant_id=variant_id),
-                        bar_range_index=bar_range_index, entry_target_cache=both_target_cache,
+                        audit_bar_range_index=bar_range_index,
                     )
                     row = VariantSummaryRow.from_result(result)
                     journal.commit_summary(row.to_dict())

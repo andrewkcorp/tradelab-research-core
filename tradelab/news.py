@@ -25,6 +25,7 @@ Out of scope for this module, on purpose:
 """
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -85,6 +86,39 @@ REQUIRED_CURRENCY = "USD"
 # Red-folder blackout window for entry T: [T - 15min, T + 5min], inclusive.
 RED_FOLDER_BEFORE = timedelta(minutes=15)
 RED_FOLDER_AFTER = timedelta(minutes=5)
+
+
+@dataclass(frozen=True)
+class NewsBlackoutIndex:
+    """Immutable O(log events) boolean lookup for the entry blackout.
+
+    ``is_entry_blocked`` intentionally returns every overlapping source
+    event and therefore remains the authoritative audit API.  Market
+    execution only needs the boolean decision, however, and previously
+    rebuilt that full list by scanning every event for every candidate
+    entry.  For a timestamp ``ts`` the equivalent predicate is simply:
+
+    ``event.scheduled_at in [ts - RED_FOLDER_AFTER, ts + RED_FOLDER_BEFORE]``.
+
+    A binary search over sorted scheduled timestamps answers that predicate
+    exactly, including both inclusive boundaries.  It changes no news rule
+    and stores no derived trading state.
+    """
+
+    scheduled_at: tuple[datetime, ...]
+
+    @classmethod
+    def build(cls, events: list["NewsEvent"] | tuple["NewsEvent", ...]) -> "NewsBlackoutIndex":
+        return cls(tuple(sorted(event.scheduled_at for event in events)))
+
+    def is_blocked(self, ts_utc: datetime) -> bool:
+        if ts_utc.tzinfo is None:
+            raise ValueError(f"NewsBlackoutIndex.is_blocked: ts_utc must be timezone-aware: {ts_utc!r}")
+        ts_utc = ts_utc.astimezone(timezone.utc)
+        earliest = ts_utc - RED_FOLDER_AFTER
+        latest = ts_utc + RED_FOLDER_BEFORE
+        index = bisect.bisect_left(self.scheduled_at, earliest)
+        return index < len(self.scheduled_at) and self.scheduled_at[index] <= latest
 
 
 @dataclass(frozen=True)

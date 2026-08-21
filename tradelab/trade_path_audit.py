@@ -14,6 +14,7 @@ from datetime import datetime
 from tradelab.accounting import AccountBacktestResult, Instrument, point_value_usd
 from tradelab.backtest import ExecutedTrade
 from tradelab.bar import Bar1m
+from tradelab.bar_range_index import BarRangeIndex
 
 
 @dataclass(frozen=True)
@@ -89,21 +90,14 @@ def audit_trade_paths(
     return tuple(audits)
 
 
-def audit_account_mark_to_market(
+def _audit_account_mark_to_market_reference(
     trades: tuple[ExecutedTrade, ...] | list[ExecutedTrade],
     account_result: AccountBacktestResult,
     bars: tuple[Bar1m, ...] | list[Bar1m],
     *,
     initial_balance_usd: float = 50_000.0,
 ) -> AccountMarkToMarketAudit:
-    """Audit worst intrabar account equity without changing execution.
-
-    TradeLab strategies maintain one open position at a time. Therefore a
-    chronological replay of entry fee, realised exit P&L, and that position's
-    adverse bar extreme yields an exact conservative MTM path for the
-    simulated one-position system. A missing execution/bar is a loud error,
-    never a silently optimistic risk result.
-    """
+    """Original full-bar replay retained as the equivalence oracle."""
     executions = {trade.trade_id: trade for trade in trades}
     accounted = {trade.trade_id: trade for trade in account_result.accounted_trades}
     ordered_bars = tuple(bars)
@@ -153,4 +147,78 @@ def audit_account_mark_to_market(
             max_drawdown = max(max_drawdown, peak - balance)
             if balance < worst:
                 worst, worst_at = balance, bar.timestamp
+    return AccountMarkToMarketAudit(worst, max_drawdown, worst_at)
+
+
+def audit_account_mark_to_market(
+    trades: tuple[ExecutedTrade, ...] | list[ExecutedTrade],
+    account_result: AccountBacktestResult,
+    bars: tuple[Bar1m, ...] | list[Bar1m],
+    *,
+    initial_balance_usd: float = 50_000.0,
+    bar_range_index: BarRangeIndex | None = None,
+) -> AccountMarkToMarketAudit:
+    """Audit worst intrabar account equity without changing execution.
+
+    TradeLab strategies maintain one open position at a time. Therefore a
+    chronological replay of entry fee, realised exit P&L, and that position's
+    adverse bar extreme yields an exact conservative MTM path for the
+    simulated one-position system. A missing execution/bar is a loud error,
+    never a silently optimistic risk result.
+    """
+    executions = {trade.trade_id: trade for trade in trades}
+    accounted = {trade.trade_id: trade for trade in account_result.accounted_trades}
+    ordered_bars = tuple(bars)
+    if not ordered_bars:
+        return AccountMarkToMarketAudit(initial_balance_usd, 0.0, None)
+    index = bar_range_index if bar_range_index is not None else BarRangeIndex.build(ordered_bars)
+
+    def exact_position(timestamp: datetime) -> int:
+        position = index.find_bar_at_or_after(timestamp)
+        if position is None or ordered_bars[position].timestamp != timestamp:
+            raise ValueError(f"timestamp {timestamp!r} is absent from bars")
+        return position
+
+    starts: dict[datetime, tuple[object, int, int]] = {}
+    for trade_id, value in accounted.items():
+        if trade_id not in executions:
+            raise ValueError(f"accounted trade {trade_id!r} has no matching executed trade")
+        start = exact_position(value.entry_timestamp)
+        if value.exit_timestamp is not None:
+            end = exact_position(value.exit_timestamp)
+        else:
+            end = len(ordered_bars) - 1
+        starts[value.entry_timestamp] = (value, start, end)
+
+    balance = initial_balance_usd
+    peak = balance
+    max_drawdown = 0.0
+    worst = balance
+    worst_at: datetime | None = None
+    previous_end = -1
+    for open_trade, start, end in sorted(starts.values(), key=lambda item: item[1]):
+        if start <= previous_end:
+            raise ValueError("accounted trades overlap; one-position MTM audit requires non-overlapping trades")
+        previous_end = end
+        balance -= open_trade.entry_cost_usd
+        pv = point_value_usd(open_trade.instrument)
+        for bar in ordered_bars[start:end + 1]:
+            adverse_price = bar.low if open_trade.direction == "long" else bar.high
+            points = (
+                adverse_price - open_trade.entry_price
+                if open_trade.direction == "long"
+                else open_trade.entry_price - adverse_price
+            )
+            marked = balance + points * pv * open_trade.quantity
+            peak = max(peak, marked)
+            max_drawdown = max(max_drawdown, peak - marked)
+            if marked < worst:
+                worst, worst_at = marked, bar.timestamp
+        if open_trade.exit_timestamp is not None:
+            assert open_trade.gross_pnl_usd is not None
+            balance += open_trade.gross_pnl_usd
+            peak = max(peak, balance)
+            max_drawdown = max(max_drawdown, peak - balance)
+            if balance < worst:
+                worst, worst_at = balance, open_trade.exit_timestamp
     return AccountMarkToMarketAudit(worst, max_drawdown, worst_at)

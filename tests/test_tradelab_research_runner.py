@@ -202,7 +202,9 @@ class InstrumentSeparationTests(unittest.TestCase):
         cfg = config(w, min_trades=3)
 
         with unittest.mock.patch("tradelab.research_runner.backtest_prepared_strategy", return_value=backtest_result) as mocked_bt:
-            evaluations = list(iter_research_evaluations([strategy], context, cfg))
+            evaluations = list(iter_research_evaluations(
+                [strategy], context, cfg, instruments=(Instrument.NQ, Instrument.MNQ)
+            ))
 
         self.assertEqual(mocked_bt.call_count, 1)  # shared once, not once per instrument
         self.assertEqual(len(evaluations), 2)
@@ -293,7 +295,7 @@ class PrefilterCorrectnessTests(unittest.TestCase):
             evaluations = list(iter_research_evaluations([strategy], context, cfg))
 
         mocked_bt.assert_not_called()
-        self.assertEqual(len(evaluations), 2)  # still one per instrument
+        self.assertEqual(len(evaluations), 1)  # production default: MNQ only
         for evaluation in evaluations:
             self.assertTrue(evaluation.prefiltered)
             self.assertFalse(evaluation.qualifies_frequency)
@@ -375,9 +377,9 @@ class OrderIndependenceTests(unittest.TestCase):
             backward = summarize(iter_research_evaluations([strategy_b, strategy_a], context, cfg))
 
         self.assertEqual(forward, backward)
-        self.assertTrue(forward[("s-a", "NQ")][0])
-        self.assertFalse(forward[("s-b", "NQ")][0])
-        self.assertTrue(forward[("s-b", "NQ")][2])  # prefiltered
+        self.assertTrue(forward[("s-a", "MNQ")][0])
+        self.assertFalse(forward[("s-b", "MNQ")][0])
+        self.assertTrue(forward[("s-b", "MNQ")][2])  # prefiltered
 
 
 class QualificationBoundaryTests(unittest.TestCase):

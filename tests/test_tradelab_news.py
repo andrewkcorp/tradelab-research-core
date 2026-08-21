@@ -6,7 +6,7 @@ No network access anywhere in this file: every event is built in-process.
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from tradelab.news import NewsEvent, is_entry_blocked, validate_news_events
+from tradelab.news import NewsBlackoutIndex, NewsEvent, is_entry_blocked, validate_news_events
 
 DEFAULT_TS = datetime(2026, 1, 13, 13, 30, tzinfo=timezone.utc)
 
@@ -212,6 +212,31 @@ class OverlappingWindowsTests(unittest.TestCase):
         blocked, events = is_entry_blocked(DEFAULT_TS + timedelta(minutes=6), [first, second])
         self.assertFalse(blocked)
         self.assertEqual(events, [])
+
+
+class NewsBlackoutIndexEquivalenceTests(unittest.TestCase):
+    def test_boolean_decision_matches_full_scan_at_every_minute(self):
+        events = [
+            make_event("a", DEFAULT_TS, "CPI"),
+            make_event("b", DEFAULT_TS + timedelta(minutes=10), "PPI"),
+            make_event("c", DEFAULT_TS + timedelta(hours=3), "NFP"),
+        ]
+        index = NewsBlackoutIndex.build(events)
+        for minute in range(-120, 301):
+            probe = DEFAULT_TS + timedelta(minutes=minute)
+            with self.subTest(probe=probe):
+                self.assertEqual(index.is_blocked(probe), is_entry_blocked(probe, events)[0])
+
+    def test_empty_index_never_blocks_and_naive_probe_is_rejected(self):
+        index = NewsBlackoutIndex.build([])
+        self.assertFalse(index.is_blocked(DEFAULT_TS))
+        with self.assertRaises(ValueError):
+            index.is_blocked(DEFAULT_TS.replace(tzinfo=None))
+
+    def test_offset_probe_is_normalized_to_utc(self):
+        index = NewsBlackoutIndex.build([make_event()])
+        offset_probe = DEFAULT_TS.astimezone(timezone(timedelta(hours=-5)))
+        self.assertTrue(index.is_blocked(offset_probe))
 
 
 class DstInvarianceTests(unittest.TestCase):

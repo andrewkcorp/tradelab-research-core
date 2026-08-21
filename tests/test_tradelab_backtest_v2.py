@@ -54,6 +54,7 @@ from tradelab.backtest_v2 import (
     run_production_backtest_v2,
     run_strategy_variant_backtest,
     run_strategy_variant_backtest_all_instruments,
+    simulate_both_direction_market_execution,
     simulate_market_execution,
     simulate_market_execution_batched,
     simulate_variant_execution,
@@ -62,12 +63,12 @@ from tradelab.bar import Bar1m
 from tradelab.bar_range_index import BarRangeIndex
 from tradelab.liquidity_target_index import LiquidityTargetIndex
 from tradelab.entry_signal_timeline import LONG, SHORT, EntryEvent, EntryEventKind
-from tradelab.entry_strategy_universe import ObservedEntry, discover_entry_strategy_universe
+from tradelab.entry_strategy_universe import EntryStrategyUniverseResult, ObservedEntry, discover_entry_strategy_universe
 from tradelab.equity import build_equity_curve
 from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, SourceType
 from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityLevel, LiquidityStatus, LiquidityType
 from tradelab.market_data_artifact import MarketDataArtifact, SeriesKind
-from tradelab.news import NewsEvent
+from tradelab.news import NewsBlackoutIndex, NewsEvent
 from tradelab.research_run import ProgressThrottle, RunReporter, create_run, read_leaderboard, read_live_status, read_progress_events, read_run_manifest
 from tradelab.sweep_fvg_setup import SweepFVGSetupEvent
 
@@ -119,6 +120,95 @@ class BothDirectionEntryMergeTests(unittest.TestCase):
         result = run_both_direction_variant_backtest(equivalence_class, ALL_EXIT_VARIANTS[0], Instrument.MNQ, context)
         self.assertEqual(result.trade_count, 0)
         self.assertEqual(result.skipped_entries_by_reason[ExecutionSkipReason.OPPOSING_SIGNALS_SAME_INSTANT.value], 2)
+
+    def test_both_batched_all_non_data_wick_variants_exactly_match_sequential_reference(self):
+        """Production ``both`` batching may only remove repeated work.
+
+        This exercises one mixed long/short position stream, all 15 exit
+        variants used by the no-data-wick production run, the bounded target
+        cache and the real liquidity index.  The sequential path deliberately
+        omits the index, so equality also proves that indexed target lookup
+        preserves target choice and all downstream trades/skips exactly.
+        """
+        context = build_synthetic_smoke_context()
+        timestamps = [context.bars_1m[index].timestamp for index in range(30, 780, 30)]
+        long_entries = tuple(
+            self._entry(f"long-{index}", timestamp, LONG)
+            for index, timestamp in enumerate(timestamps[::2])
+        )
+        short_entries = tuple(
+            self._entry(f"short-{index}", timestamp, SHORT)
+            for index, timestamp in enumerate(timestamps[1::2])
+        )
+        variants = tuple(variant for variant in ALL_EXIT_VARIANTS if variant.tp_kind != TPVariantKind.DATA_WICK)
+
+        sequential = {
+            variant.variant_id: simulate_both_direction_market_execution(
+                long_entries, short_entries, variant, context, f"equiv::{variant.variant_id}",
+                bar_range_index=BarRangeIndex.build(context.bars_1m),
+                entry_target_cache=EntryTargetCache(),
+            )
+            for variant in variants
+        }
+        merged, conflicts = merge_both_direction_entries(long_entries, short_entries)
+        batched = simulate_market_execution_batched(
+            merged, "both", variants, context, "equiv",
+            bar_range_index=BarRangeIndex.build(context.bars_1m),
+            entry_target_cache=EntryTargetCache(),
+            liquidity_target_index=LiquidityTargetIndex.build(
+                context.swing_equal_liquidity_results, context.session_liquidity_results,
+            ),
+        )
+
+        for variant in variants:
+            expected_trades, expected_skips = sequential[variant.variant_id]
+            actual_trades, actual_skips = batched[variant.variant_id]
+            self.assertEqual(actual_trades, expected_trades, variant.variant_id)
+            self.assertEqual(list(conflicts) + actual_skips, expected_skips, variant.variant_id)
+
+    def test_production_orchestrator_batches_pending_both_variants_once(self):
+        from tradelab.both_direction_universe import BothDirectionEquivalenceClass, BothDirectionUniverseResult
+
+        context = build_synthetic_smoke_context()
+        long = self._entry("long", context.bars_1m[30].timestamp, LONG)
+        short = self._entry("short", context.bars_1m[90].timestamp, SHORT)
+        both_class = BothDirectionEquivalenceClass(
+            "both-test", (long, short), (long,), (short,), (), object(), 0, 0,
+        )
+        both_universe = BothDirectionUniverseResult((both_class,), 1, 1)
+        empty_directional = EntryStrategyUniverseResult(
+            equivalence_classes=(), syntactically_enumerated_spec_count=0,
+            eligible_spec_count=0, specs_rejected_by_yearly_eligibility_count=0,
+            equivalence_class_count=0, spec_counts_by_primary_kind={},
+            spec_counts_by_direction={}, spec_counts_by_execution_timeframe={},
+            spec_counts_by_bias_requirement_pattern={},
+        )
+        variants = ALL_EXIT_VARIANTS[:3]
+        calls = []
+        original = simulate_market_execution_batched
+
+        def spy(*args, **kwargs):
+            calls.append(tuple(variant.variant_id for variant in args[2]))
+            return original(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={}, is_demo=True)
+            journal = _open_journal(
+                reporter, market_artifact_path=None, news_csv_path=None, parameters={},
+                risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG,
+                exit_variants=variants, instruments=(Instrument.MNQ,),
+            )
+            with patch("tradelab.backtest_v2.simulate_market_execution_batched", spy):
+                completed, _leaderboard = _expand_and_simulate(
+                    reporter, journal, empty_directional, variants, (Instrument.MNQ,), context,
+                    both_universe=both_universe, include_directional_variants=False,
+                    risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG,
+                    top_n_leaderboard=3, checkpoint_every=10,
+                )
+            journal.close()
+
+        self.assertEqual(completed, len(variants))
+        self.assertEqual(calls, [tuple(variant.variant_id for variant in variants)])
 
 
 def _write_smoke_market_artifact(tmp: Path) -> tuple[Path, Path]:
@@ -651,7 +741,12 @@ class TelemetryIntegrationTests(unittest.TestCase):
             status = read_live_status(run_dir)
             self.assertEqual(status.phase, "completed")
             self.assertIsNotNone(status.eligible_specs)
-            self.assertIsNotNone(status.backtests_completed)
+            # The deterministic smoke fixture currently contains only short
+            # directional specs. Production deliberately admits only a
+            # shared long+short system, so zero completed variants is the
+            # correct result rather than silently falling back to directional
+            # research.
+            self.assertIsNone(status.backtests_completed)
 
             events = read_progress_events(run_dir)
             phase_starts = [e["phase"] for e in events if e["event_type"] == "phase_started"]
@@ -1036,7 +1131,7 @@ class IncompatibleResumeRejectionTests(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 _open_journal(
                     reporter2, market_artifact_path=None, news_csv_path=None, parameters={"min_entries_per_year": 1},
-                    risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS, instruments=(Instrument.MNQ,),
+                    risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG, exit_variants=ALL_EXIT_VARIANTS, instruments=(Instrument.NQ,),
                 )
             self.assertIn("instruments_json", str(ctx.exception))
 
@@ -2225,6 +2320,34 @@ class BatchedExitVariantExecutionTests(unittest.TestCase):
             )
             self.assertEqual(indexed, plain)
 
+    def test_news_index_preserves_execution_skips_at_inclusive_boundaries(self):
+        start = DEFAULT_NEWS_TS = datetime(2026, 1, 13, 13, 0, tzinfo=UTC)
+        event = news(DEFAULT_NEWS_TS + timedelta(minutes=30))
+        context = build_minimal_context(
+            minute_bars(start, [(100.0, 101.0, 99.0, 100.0)] * 60), [event],
+        )
+        entries = tuple(
+            ObservedEntry(f"entry-{offset}", event.scheduled_at + timedelta(minutes=offset), LONG, object())
+            for offset in (-16, -15, 5, 6)
+        )
+        variant = ALL_EXIT_VARIANTS[0]
+        kwargs = dict(bar_range_index=BarRangeIndex.build(context.bars_1m), entry_target_cache=EntryTargetCache())
+        reference = simulate_market_execution(entries, "both", variant, context, "news", **kwargs)
+        indexed = simulate_market_execution(
+            entries, "both", variant, context, "news",
+            news_blackout_index=NewsBlackoutIndex.build(context.news_events), **kwargs,
+        )
+        self.assertEqual(indexed, reference)
+        self.assertEqual(
+            [skip.reason for skip in indexed[1]],
+            [
+                ExecutionSkipReason.MISSING_TP_TARGET,
+                ExecutionSkipReason.NEWS_BLOCK,
+                ExecutionSkipReason.NEWS_BLOCK,
+                ExecutionSkipReason.MISSING_TP_TARGET,
+            ],
+        )
+
 
 class InstrumentDedupTests(unittest.TestCase):
     """task 045, requirement 4: market execution runs exactly once per
@@ -2263,9 +2386,9 @@ class InstrumentDedupTests(unittest.TestCase):
             self.assertEqual(a.monthly, b.monthly)
             self.assertEqual(a.skipped_entries_by_reason, b.skipped_entries_by_reason)
 
-        # the two instrument results are genuinely distinct (different
-        # point value/sizing), not accidentally identical objects.
-        self.assertNotEqual(shared[Instrument.MNQ].strategy_variant_id, shared[Instrument.NQ].strategy_variant_id)
+        # Production defaults are deliberately MNQ-only. Instrument-sharing
+        # remains tested below by passing an explicit multi-instrument tuple.
+        self.assertEqual(tuple(shared), (Instrument.MNQ,))
 
     def test_market_execution_runs_exactly_once_regardless_of_instrument_count(self):
         context, equivalence_class, variant = self._one_real_variant()
@@ -2277,7 +2400,9 @@ class InstrumentDedupTests(unittest.TestCase):
             return orig(*args, **kwargs)
 
         with patch("tradelab.backtest_v2.simulate_variant_execution", spy):
-            run_strategy_variant_backtest_all_instruments(equivalence_class, variant, DEFAULT_INSTRUMENTS, context)
+            run_strategy_variant_backtest_all_instruments(
+                equivalence_class, variant, (Instrument.MNQ, Instrument.NQ), context
+            )
         self.assertEqual(len(calls), 1)  # never once per instrument, regardless of len(DEFAULT_INSTRUMENTS)
 
     def test_expand_and_simulate_shares_execution_across_instruments_on_resume_too(self):

@@ -74,7 +74,7 @@ class EntryTargetCacheTests(unittest.TestCase):
         cache = EntryTargetCache(max_entries=2)
         entry_a, entry_b, entry_c = _market_entry("A"), _market_entry("B"), _market_entry("C")
         with patch("tradelab.entry_target_cache.detect_tp_target_candidates") as mock_detect:
-            mock_detect.side_effect = lambda entry, *_args: f"RESULT-{entry.entry_id}"
+            mock_detect.side_effect = lambda entry, *_args, **_kwargs: f"RESULT-{entry.entry_id}"
             self.assertEqual(cache.tp_candidates(entry_a, {}, {}, None), "RESULT-A")
             self.assertEqual(cache.tp_candidates(entry_b, {}, {}, None), "RESULT-B")
             self.assertEqual(cache.tp_candidates(entry_a, {}, {}, None), "RESULT-A")  # A is now most recent
