@@ -364,9 +364,31 @@ class _DashboardRequestHandler(BaseHTTPRequestHandler):
             if live_status.phase == "simulating_backtests":
                 leaderboard = read_leaderboard(run_dir)
                 payload = leaderboard.to_dict() if leaderboard is not None else {"entries": []}
+                sort_key = query.get("sort", ["pnl"])[0]
+                direction = query.get("dir", ["desc"])[0]
+                column = _UNIVERSE_SORT_COLUMNS.get(sort_key, "net_pnl_usd")
+                entry_key = {
+                    "net_pnl_usd": "pnl", "roi": "roi", "win_rate": "win_rate",
+                    "trade_count": "trade_count", "max_drawdown_usd": "max_drawdown",
+                    "drawdowns_over_2000_count": "drawdowns_over_2000_count",
+                }[column]
+                # Sorting this atomic JSON snapshot is in-memory and tiny
+                # (top-N only), so it never holds a SQLite read lock against
+                # the active writer. It makes the live dashboard responsive
+                # while preserving the safety reason full-universe SQL is
+                # paused until completion.
+                payload["entries"] = sorted(
+                    payload.get("entries", []),
+                    key=lambda entry: (entry.get(entry_key) is None, entry.get(entry_key, 0.0), entry.get("strategy_id", "")),
+                    reverse=(direction != "asc"),
+                )
+                for rank, entry in enumerate(payload["entries"], start=1):
+                    entry["rank"] = rank
                 payload.update({
                     "universe_scope": "live_pnl_snapshot_only",
                     "filtering_available": False,
+                    "sort_key": sort_key,
+                    "sort_direction": direction,
                     "total_eligible": len(payload.get("entries", [])),
                     "notice": "Global filters are paused while the backtest writes its journal; they become available automatically after completion.",
                 })
