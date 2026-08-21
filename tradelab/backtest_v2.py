@@ -2350,7 +2350,9 @@ def _estimate_summary_row_bytes() -> int:
 
 
 def _iter_variant_combinations(
-    universe: EntryStrategyUniverseResult, exit_variants: tuple[ExitVariantSpec, ...], instruments: tuple[Instrument, ...]
+    universe: EntryStrategyUniverseResult | BothDirectionUniverseResult,
+    exit_variants: tuple[ExitVariantSpec, ...],
+    instruments: tuple[Instrument, ...],
 ):
     """The exact same nested enumeration order ``_expand_and_simulate`` uses
     for production -- reused here (never re-derived) so a preflight sample
@@ -2364,7 +2366,8 @@ def _iter_variant_combinations(
 
 
 def _measure_sample_throughput(
-    universe: EntryStrategyUniverseResult, exit_variants: tuple[ExitVariantSpec, ...], instruments: tuple[Instrument, ...],
+    universe: EntryStrategyUniverseResult | BothDirectionUniverseResult,
+    exit_variants: tuple[ExitVariantSpec, ...], instruments: tuple[Instrument, ...],
     context: PreparedBacktestContext, *, risk_config: RiskConfig, equity_config: EquityConfig, sample_size: int,
     reporter: RunReporter | None = None,
 ) -> dict[str, Any]:
@@ -2421,6 +2424,7 @@ def _measure_sample_throughput(
     start = time.perf_counter()
     entry_target_cache = EntryTargetCache(max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES)
     liquidity_target_index = LiquidityTargetIndex.build(context.swing_equal_liquidity_results, context.session_liquidity_results)
+    news_blackout_index = NewsBlackoutIndex.build(context.news_events)
     for _class_id, class_group_iter in itertools.groupby(combos, key=lambda c: c[0].class_id):
         class_group = list(class_group_iter)
         equivalence_class = class_group[0][0]
@@ -2445,19 +2449,41 @@ def _measure_sample_throughput(
             )
             on_bar_progress = bar_progress.maybe
             on_entry_progress = _entry_progress_callback(reporter, variant_id=lead_variant_id)
+        is_both = isinstance(equivalence_class, BothDirectionEquivalenceClass)
+        conflicts: SkippedEntryAudit
+        if is_both:
+            merged_entries, conflicts = merge_both_direction_entries(
+                equivalence_class.long_entries, equivalence_class.short_entries, compact_skip_counts=True,
+            )
+            execution_entries = merged_entries
+            execution_direction = "both"
+        else:
+            conflicts = []
+            execution_entries = equivalence_class.observed_entries
+            execution_direction = equivalence_class.representative_spec.primary.direction
         executions_by_variant = simulate_market_execution_batched(
-            equivalence_class.observed_entries, equivalence_class.representative_spec.primary.direction,
+            execution_entries, execution_direction,
             tuple(variant for variant, _instruments in pending_by_variant), context, equivalence_class.class_id,
             on_bar_progress=on_bar_progress, on_entry_progress=on_entry_progress, bar_range_index=bar_range_index,
             entry_target_cache=entry_target_cache, liquidity_target_index=liquidity_target_index,
+            news_blackout_index=news_blackout_index, compact_skip_counts=is_both,
         )
         for variant, group_instruments in pending_by_variant:
-            trades, skipped = executions_by_variant[variant.variant_id]
+            trades, variant_skipped = executions_by_variant[variant.variant_id]
+            skipped = _merge_skip_audits(conflicts, variant_skipped) if is_both else variant_skipped
             for instrument in group_instruments:
-                result = _build_variant_result_for_instrument(
-                    equivalence_class, variant, instrument, trades, skipped,
-                    risk_config=risk_config, equity_config=equity_config, bars_1m=context.bars_1m,
-                )
+                if is_both:
+                    result = _build_both_variant_result_for_instrument(
+                        equivalence_class, variant, instrument, trades, skipped, context,
+                        risk_config=risk_config, equity_config=equity_config,
+                        audit_bar_range_index=bar_range_index,
+                    )
+                else:
+                    result = _build_variant_result_for_instrument(
+                        equivalence_class, variant, instrument, trades, skipped,
+                        risk_config=risk_config, equity_config=equity_config, bars_1m=context.bars_1m,
+                        audit_bar_range_index=bar_range_index,
+                    )
                 row = VariantSummaryRow.from_result(result)
                 row_byte_sizes.append(len(json.dumps(row.to_dict()).encode("utf-8")))
                 completed += 1
@@ -2577,6 +2603,7 @@ def run_preflight_v2(
         reporter.phase_started(RunPhase.DISCOVERING_ENTRIES, items_total=1)
         universe = discover_entry_strategy_universe(
             context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result, min_entries_per_year=min_entries_per_year,
+            pair_yearly_eligibility_for_both=True,
             on_progress=_discovery_progress_callback(reporter),
         )
         reporter.progress(
@@ -2586,18 +2613,23 @@ def run_preflight_v2(
 
         reporter.phase_started(RunPhase.DEDUPLICATING_ENTRIES, items_total=1)
         both_universe = discover_both_direction_universe(universe)
+        directional_equivalence_class_count = universe.equivalence_class_count
         reporter.progress(
             items_completed=1,
-            unique_entry_classes=universe.equivalence_class_count + both_universe.equivalence_class_count,
+            unique_entry_classes=both_universe.equivalence_class_count,
         )
 
-        total_variant_simulations = universe.equivalence_class_count * len(exit_variants) * len(instruments)
+        # Production evaluates only one shared long+short system.  Preflight
+        # must measure that exact population rather than the legacy
+        # directional discovery container, otherwise its counts and sample
+        # throughput do not predict the run it is supposed to validate.
+        total_variant_simulations = both_universe.equivalence_class_count * len(exit_variants) * len(instruments)
 
         throughput_sample = None
         if throughput_sample_size > 0:
             reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=min(throughput_sample_size, total_variant_simulations))
             throughput_sample = _measure_sample_throughput(
-                universe, exit_variants, instruments, context, risk_config=risk_config, equity_config=equity_config,
+                both_universe, exit_variants, instruments, context, risk_config=risk_config, equity_config=equity_config,
                 sample_size=throughput_sample_size, reporter=reporter,
             )
             reporter.progress(items_completed=throughput_sample["sample_size_measured"])
@@ -2614,7 +2646,9 @@ def run_preflight_v2(
             },
             "syntactically_enumerated_spec_count": universe.syntactically_enumerated_spec_count,
             "eligible_spec_count": universe.eligible_spec_count,
-            "equivalence_class_count": universe.equivalence_class_count,
+            "equivalence_class_count": both_universe.equivalence_class_count,
+            "directional_equivalence_class_count": directional_equivalence_class_count,
+            "both_equivalence_class_count": both_universe.equivalence_class_count,
             "exit_variant_count": len(exit_variants),
             "instruments": [i.value for i in instruments],
             "total_strategy_variant_simulations": total_variant_simulations,
@@ -2627,7 +2661,9 @@ def run_preflight_v2(
 
         reporter.completed(
             summary={
-                "mode": "preflight", "equivalence_class_count": universe.equivalence_class_count,
+                "mode": "preflight", "equivalence_class_count": both_universe.equivalence_class_count,
+                "directional_equivalence_class_count": directional_equivalence_class_count,
+                "both_equivalence_class_count": both_universe.equivalence_class_count,
                 "exit_variant_count": len(exit_variants), "total_strategy_variant_simulations": total_variant_simulations,
             }
         )
@@ -3041,6 +3077,10 @@ def main(argv: list[str] | None = None) -> int:
     preflight.add_argument("--reclaim-window-bars", type=int, required=True)
     preflight.add_argument("--min-entries-per-year", type=int, default=100)
     preflight.add_argument(
+        "--exclude-data-wick", action="store_true",
+        help="Measure the same liquidity-TP-only variant set used by a production run with --exclude-data-wick.",
+    )
+    preflight.add_argument(
         "--throughput-sample-size", type=int, default=0,
         help="Optional: actually simulate this many variants (a small, bounded prefix) to measure real "
         "throughput and real per-row disk usage, clearly labelled as an estimate in preflight.json. "
@@ -3103,10 +3143,12 @@ def main(argv: list[str] | None = None) -> int:
             run_id=args.run_id, command="python3 -m tradelab.backtest_v2 run",
         )
     elif args.mode == "preflight":
+        exit_variants = tuple(v for v in ALL_EXIT_VARIANTS if v.tp_kind != TPVariantKind.DATA_WICK) if args.exclude_data_wick else ALL_EXIT_VARIANTS
         reporter = run_preflight_v2(
             market_artifact_path=args.market_artifact, news_csv_path=args.news_csv, runs_dir=args.runs_dir,
             pivot_strength=args.pivot_strength, reclaim_window_bars=args.reclaim_window_bars, min_entries_per_year=args.min_entries_per_year,
-            throughput_sample_size=args.throughput_sample_size, command="python3 -m tradelab.backtest_v2 preflight",
+            exit_variants=exit_variants, throughput_sample_size=args.throughput_sample_size,
+            command="python3 -m tradelab.backtest_v2 preflight",
         )
     elif args.mode == "benchmark":
         if args.market_artifact is not None:

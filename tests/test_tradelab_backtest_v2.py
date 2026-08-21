@@ -63,6 +63,7 @@ from tradelab.backtest_v2 import (
 )
 from tradelab.bar import Bar1m
 from tradelab.bar_range_index import BarRangeIndex
+from tradelab.both_direction_universe import discover_both_direction_universe
 from tradelab.liquidity_target_index import LiquidityTargetIndex
 from tradelab.entry_signal_timeline import LONG, SHORT, EntryEvent, EntryEventKind
 from tradelab.entry_strategy_universe import EntryStrategyUniverseResult, ObservedEntry, discover_entry_strategy_universe
@@ -1605,15 +1606,20 @@ class PreflightTests(unittest.TestCase):
             expected_universe = discover_entry_strategy_universe(
                 expected_context.fvg_results, expected_context.fvg_entry_result, expected_context.liquidity_entry_result,
                 expected_context.htf_bias_result, min_entries_per_year=1,
+                pair_yearly_eligibility_for_both=True,
             )
+            expected_both_universe = discover_both_direction_universe(expected_universe)
             self.assertGreater(expected_universe.equivalence_class_count, 0)
+            self.assertGreater(expected_both_universe.equivalence_class_count, 0)
             self.assertEqual(preflight["syntactically_enumerated_spec_count"], expected_universe.syntactically_enumerated_spec_count)
             self.assertEqual(preflight["eligible_spec_count"], expected_universe.eligible_spec_count)
-            self.assertEqual(preflight["equivalence_class_count"], expected_universe.equivalence_class_count)
+            self.assertEqual(preflight["directional_equivalence_class_count"], expected_universe.equivalence_class_count)
+            self.assertEqual(preflight["both_equivalence_class_count"], expected_both_universe.equivalence_class_count)
+            self.assertEqual(preflight["equivalence_class_count"], expected_both_universe.equivalence_class_count)
             self.assertEqual(preflight["exit_variant_count"], len(ALL_EXIT_VARIANTS))
             self.assertEqual(sorted(preflight["instruments"]), sorted(i.value for i in DEFAULT_INSTRUMENTS))
 
-            expected_total = expected_universe.equivalence_class_count * len(ALL_EXIT_VARIANTS) * len(DEFAULT_INSTRUMENTS)
+            expected_total = expected_both_universe.equivalence_class_count * len(ALL_EXIT_VARIANTS) * len(DEFAULT_INSTRUMENTS)
             self.assertEqual(preflight["total_strategy_variant_simulations"], expected_total)
             self.assertGreater(expected_total, 0)
 
@@ -1634,13 +1640,17 @@ class PreflightTests(unittest.TestCase):
             tmp = Path(tmp_str)
             manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
             runs_dir = tmp / "runs"
+            liquidity_only_variants = tuple(
+                variant for variant in ALL_EXIT_VARIANTS if variant.tp_kind != TPVariantKind.DATA_WICK
+            )
 
             reporter = run_preflight_v2(
                 market_artifact_path=manifest_path, news_csv_path=news_csv_path, runs_dir=runs_dir,
                 pivot_strength=2, reclaim_window_bars=3, tick_size=0.25, min_entries_per_year=1,
-                throughput_sample_size=4, command="test",
+                exit_variants=liquidity_only_variants, throughput_sample_size=4, command="test",
             )
             preflight = read_preflight(reporter.run_dir)
+            self.assertEqual(preflight["exit_variant_count"], 15)
             sample = preflight["throughput_estimate"]
             self.assertIsNotNone(sample)
             self.assertEqual(sample["sample_size_requested"], 4)
