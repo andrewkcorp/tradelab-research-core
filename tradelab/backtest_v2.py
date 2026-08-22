@@ -184,7 +184,7 @@ import itertools
 import json
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -220,6 +220,7 @@ from tradelab.entry_strategy_universe import (
 )
 from tradelab.entry_target_cache import EntryTargetCache
 from tradelab.trade_path_audit import AccountMarkToMarketAudit, audit_account_mark_to_market
+from tradelab.research_validation import PerformanceValidation, stop_slippage_sensitivity, summarize_account_result
 from tradelab.liquidity_target_index import LiquidityTargetIndex
 from tradelab.equity import EquityConfig, EquityResult, build_equity_curve
 from tradelab.fvg import DEFAULT_TICK_SIZE
@@ -1129,6 +1130,8 @@ class StrategyVariantResult:
     apex_eod_audit: ApexEODAudit | None = None
     mark_to_market_audit: AccountMarkToMarketAudit | None = None
     ambiguous_same_bar_exit_count: int = 0
+    performance_validation: PerformanceValidation | None = None
+    stop_slippage_sensitivity_usd: Mapping[int, float] = field(default_factory=dict)
 
 
 def _complete_2000_loss_limits(
@@ -1340,6 +1343,8 @@ def _build_variant_result_for_instrument(
         skipped_by_reason[untradeable.reason.value] = skipped_by_reason.get(untradeable.reason.value, 0) + 1
 
     yearly, monthly = _yearly_monthly_breakdown(account_result, equity_result)
+    performance_validation = summarize_account_result(account_result)
+    slippage_sensitivity = stop_slippage_sensitivity(account_result, tick_size=0.25)
 
     return StrategyVariantResult(
         strategy_variant_id=variant_id, equivalence_class_id=equivalence_class.class_id, exit_variant=variant,
@@ -1354,6 +1359,8 @@ def _build_variant_result_for_instrument(
             _ambiguous_same_bar_exit_count(trades, bars_1m, audit_bar_range_index)
             if bars_1m is not None else 0
         ),
+        performance_validation=performance_validation,
+        stop_slippage_sensitivity_usd=slippage_sensitivity,
     )
 
 
@@ -1475,6 +1482,8 @@ def _build_both_variant_result_for_instrument(
         ambiguous_same_bar_exit_count=_ambiguous_same_bar_exit_count(
             trades, context.bars_1m, audit_bar_range_index,
         ),
+        performance_validation=summarize_account_result(account_result),
+        stop_slippage_sensitivity_usd=stop_slippage_sensitivity(account_result, tick_size=0.25),
     )
 
 
@@ -1572,6 +1581,8 @@ class VariantSummaryRow:
     monthly: Mapping[str, Mapping[str, float | int]]
     apex_eod_audit: Mapping[str, Any] | None = None
     mark_to_market_audit: Mapping[str, Any] | None = None
+    performance_validation: Mapping[str, Any] | None = None
+    stop_slippage_sensitivity_usd: Mapping[str, float] | None = None
 
     @staticmethod
     def from_result(
@@ -1598,6 +1609,12 @@ class VariantSummaryRow:
             skipped_entries_by_reason=dict(result.skipped_entries_by_reason), yearly=dict(result.yearly), monthly=dict(result.monthly),
             apex_eod_audit=_apex_audit_summary(result.apex_eod_audit),
             mark_to_market_audit=_mark_to_market_audit_summary(result.mark_to_market_audit),
+            performance_validation=(
+                None if result.performance_validation is None else {
+                    key: value for key, value in result.performance_validation.__dict__.items()
+                }
+            ),
+            stop_slippage_sensitivity_usd={str(k): v for k, v in result.stop_slippage_sensitivity_usd.items()},
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1616,6 +1633,8 @@ class VariantSummaryRow:
             "skipped_entries_by_reason": dict(self.skipped_entries_by_reason), "yearly": dict(self.yearly), "monthly": dict(self.monthly),
             "apex_eod_audit": None if self.apex_eod_audit is None else dict(self.apex_eod_audit),
             "mark_to_market_audit": None if self.mark_to_market_audit is None else dict(self.mark_to_market_audit),
+            "performance_validation": None if self.performance_validation is None else dict(self.performance_validation),
+            "stop_slippage_sensitivity_usd": None if self.stop_slippage_sensitivity_usd is None else dict(self.stop_slippage_sensitivity_usd),
         }
 
 

@@ -49,6 +49,10 @@ UNIVERSE_PAGE_MAX = 250
 UNIVERSE_CACHE_SECONDS = 60.0
 UNIVERSE_CACHE_MAX_ORDERS = 2
 _LOSS_LIMITS_2000_SQL = "__loss_limits_2000__"
+_PERF_JSON = "performance_validation_json"
+def _perf_sql(field: str) -> str:
+    return f"json_extract({_PERF_JSON}, '$.{field}')"
+
 _UNIVERSE_SORT_COLUMNS = {
     "rank": "net_pnl_usd",
     "pnl": "net_pnl_usd",
@@ -61,6 +65,11 @@ _UNIVERSE_SORT_COLUMNS = {
     # threshold-entry edges.  Ordering by the underlying drawdown is exactly
     # monotonic with floor(drawdown / 2000) and avoids an expression index.
     "drawdowns_over_2000_count": _LOSS_LIMITS_2000_SQL,
+    "profit_factor": _perf_sql("profit_factor"),
+    "average_r": _perf_sql("average_r"),
+    "daily_sharpe": _perf_sql("annualized_daily_sharpe"),
+    "expectancy": _perf_sql("expectancy_usd"),
+    "top_winner_share": _perf_sql("top_winner_share_of_positive_pnl"),
 }
 _RANGE_FILTER_COLUMNS = {
     "pnl": "net_pnl_usd", "roi": "roi", "win_rate": "win_rate",
@@ -69,6 +78,11 @@ _RANGE_FILTER_COLUMNS = {
     "completed_trades_2024": "completed_trades_2024",
     "completed_trades_2025": "completed_trades_2025",
     "mtm_max_drawdown": "mtm_max_drawdown_usd",
+    "profit_factor": _perf_sql("profit_factor"),
+    "average_r": _perf_sql("average_r"),
+    "daily_sharpe": _perf_sql("annualized_daily_sharpe"),
+    "expectancy": _perf_sql("expectancy_usd"),
+    "top_winner_share": _perf_sql("top_winner_share_of_positive_pnl"),
 }
 _BOOLEAN_FILTER_COLUMNS = {"apex_has_breach": "apex_has_breach"}
 
@@ -154,6 +168,8 @@ def _build_universe_order(run_dir: Path, *, sort_key: str, direction: str, min_t
         )
         if sort_column == _LOSS_LIMITS_2000_SQL:
             sort_column = f"CAST(({loss_drawdown_column}) / 2000.0 AS INTEGER)"
+        elif _PERF_JSON in sort_column and _PERF_JSON not in columns:
+            sort_column = "net_pnl_usd"
         order = "ASC" if direction == "asc" else "DESC"
         clauses = ["trade_count >= ?"]
         values: list[object] = [min_trades]
@@ -165,7 +181,9 @@ def _build_universe_order(run_dir: Path, *, sort_key: str, direction: str, min_t
         for key, filter_column in _RANGE_FILTER_COLUMNS.items():
             if filter_column == _LOSS_LIMITS_2000_SQL:
                 filter_column = f"CAST(({loss_drawdown_column}) / 2000.0 AS INTEGER)"
-            elif filter_column not in columns:
+            elif _PERF_JSON in filter_column and _PERF_JSON not in columns:
+                continue
+            elif _PERF_JSON not in filter_column and filter_column not in columns:
                 continue
             if f"{key}_min" in filters:
                 clauses.append(f"{filter_column} >= ?"); values.append(filters[f"{key}_min"])
@@ -262,6 +280,8 @@ def _read_universe_leaders(
                    , {optional_column('mtm_max_drawdown_usd', 'NULL')}
                    , {optional_column('mtm_worst_equity_at', 'NULL')}
                    , {optional_column('ambiguous_same_bar_exit_count', '0')}
+                   , {optional_column('performance_validation_json', "'{}'")}
+                   , {optional_column('stop_slippage_sensitivity_json', "'{}'")}
             FROM variant_summaries
             WHERE rowid IN ({placeholders})""",
             requested_rowids,
@@ -278,7 +298,10 @@ def _read_universe_leaders(
          apex_has_breach, apex_breach_count, apex_max_daily_loss,
          apex_largest_eod_breach, monthly_json, research_eligible,
          completed_trades_2024, completed_trades_2025, mtm_worst_equity,
-         mtm_max_drawdown, mtm_worst_equity_at, ambiguous_same_bar_exit_count) = by_rowid[rowid]
+         mtm_max_drawdown, mtm_worst_equity_at, ambiguous_same_bar_exit_count,
+         performance_validation_json, stop_slippage_sensitivity_json) = by_rowid[rowid]
+        performance_validation = json.loads(performance_validation_json or "{}")
+        slippage_sensitivity = json.loads(stop_slippage_sensitivity_json or "{}")
         detailed = detailed_by_id.get(strategy_id)
         if detailed is not None:
             # leaderboard.json retains rich trade detail but predates the
@@ -297,6 +320,8 @@ def _read_universe_leaders(
                 "mtm_max_drawdown_usd": mtm_max_drawdown,
                 "mtm_worst_equity_at": mtm_worst_equity_at,
                 "ambiguous_same_bar_exit_count": ambiguous_same_bar_exit_count,
+                "performance_validation": performance_validation,
+                "stop_slippage_sensitivity_usd": slippage_sensitivity,
             })
             detailed["drawdowns_over_2000_count"] = _loss_limits_2000(
                 max_drawdown_usd=max_drawdown, mtm_max_drawdown_usd=mtm_max_drawdown,
@@ -328,6 +353,8 @@ def _read_universe_leaders(
             "mtm_max_drawdown_usd": mtm_max_drawdown,
             "mtm_worst_equity_at": mtm_worst_equity_at,
             "ambiguous_same_bar_exit_count": ambiguous_same_bar_exit_count,
+            "performance_validation": performance_validation,
+            "stop_slippage_sensitivity_usd": slippage_sensitivity,
             "equity_curve": _monthly_equity_curve(monthly),
             "trade_pnls": [],
             "trades_by_month": trades_by_month,
@@ -460,6 +487,15 @@ class _DashboardRequestHandler(BaseHTTPRequestHandler):
                             mtm_max_drawdown_usd=entry.get("mtm_max_drawdown_usd"),
                         )
                     entry_key = "drawdowns_over_2000_count"
+                elif _PERF_JSON in column:
+                    field = {
+                        "profit_factor": "profit_factor", "average_r": "average_r",
+                        "daily_sharpe": "annualized_daily_sharpe", "expectancy": "expectancy_usd",
+                        "top_winner_share": "top_winner_share_of_positive_pnl",
+                    }[sort_key]
+                    for entry in payload.get("entries", []):
+                        entry[sort_key] = (entry.get("performance_validation") or {}).get(field)
+                    entry_key = sort_key
                 else:
                     entry_key = {
                         "net_pnl_usd": "pnl", "roi": "roi", "win_rate": "win_rate",
@@ -732,6 +768,11 @@ DASHBOARD_HTML = r"""<!doctype html>
       <input id="f-win-rate-min" type="number" step="0.01" placeholder="Min win rate (0.30 = 30%)"><input id="f-win-rate-max" type="number" step="0.01" placeholder="Max win rate (0.30 = 30%)">
       <input id="f-trade-count-min" type="number" value="100" placeholder="Min trades"><input id="f-trade-count-max" type="number" placeholder="Max trades">
       <input id="f-max-drawdown-min" type="number" placeholder="Min max DD ($)"><input id="f-max-drawdown-max" type="number" placeholder="Max max DD ($)">
+      <input id="f-profit-factor-min" type="number" step="0.01" placeholder="Min profit factor"><input id="f-profit-factor-max" type="number" step="0.01" placeholder="Max profit factor">
+      <input id="f-average-r-min" type="number" step="0.01" placeholder="Min average R"><input id="f-average-r-max" type="number" step="0.01" placeholder="Max average R">
+      <input id="f-daily-sharpe-min" type="number" step="0.01" placeholder="Min daily Sharpe"><input id="f-daily-sharpe-max" type="number" step="0.01" placeholder="Max daily Sharpe">
+      <input id="f-expectancy-min" type="number" placeholder="Min expectancy ($)"><input id="f-expectancy-max" type="number" placeholder="Max expectancy ($)">
+      <input id="f-top-winner-share-min" type="number" step="0.01" placeholder="Min top-winner share"><input id="f-top-winner-share-max" type="number" step="0.01" placeholder="Max top-winner share">
       <div class="check-group"><span class="group-label">Direction</span><label><input type="checkbox" data-filter="direction" value="long">Long</label><label><input type="checkbox" data-filter="direction" value="short">Short</label><label><input type="checkbox" data-filter="direction" value="both">Both</label></div>
       <div class="check-group"><span class="group-label">Instrument</span><label><input type="checkbox" data-filter="instrument" value="MNQ">MNQ</label></div>
       <div class="check-group"><span class="group-label">Apex EOD audit</span><label><input id="f-apex-pass" type="checkbox">No recorded breach</label><label><input id="f-apex-breach" type="checkbox">Recorded breach</label></div>
@@ -748,7 +789,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       <table id="leaders-table" style="display:none">
         <thead><tr>
           <th class="num">Position</th><th>Strategy</th><th class="num"><button class="sort-button" data-sort-key="pnl">P&amp;L <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="roi">ROI <span class="sort-indicator"></span></button></th>
-          <th class="num"><button class="sort-button" data-sort-key="win_rate">Win rate <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="trade_count">Trades <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="max_drawdown">Max DD <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="drawdowns_over_2000_count">$2k limits <span class="sort-indicator"></span></button></th>
+          <th class="num"><button class="sort-button" data-sort-key="win_rate">Win rate <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="trade_count">Trades <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="max_drawdown">Max DD <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="profit_factor">PF <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="average_r">Avg R <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="daily_sharpe">Sharpe <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="drawdowns_over_2000_count">$2k limits <span class="sort-indicator"></span></button></th>
         </tr></thead>
         <tbody id="leaders-tbody"></tbody>
       </table>
@@ -938,11 +979,12 @@ function renderActiveWork(status) {
   }
 }
 
-const SORT_LABELS = {rank:"original rank", pnl:"realised P&L", roi:"ROI", win_rate:"win rate", trade_count:"trade count", max_drawdown:"max drawdown", drawdowns_over_2000_count:"$2k loss limits consumed"};
+const SORT_LABELS = {rank:"original rank", pnl:"realised P&L", roi:"ROI", win_rate:"win rate", trade_count:"trade count", max_drawdown:"max drawdown", profit_factor:"profit factor", average_r:"average R", daily_sharpe:"daily Sharpe", expectancy:"expectancy", top_winner_share:"top-winner concentration", drawdowns_over_2000_count:"$2k loss limits consumed"};
 function sortedEntries(leaderboard) {
   const sign = leaderboardSort.dir === "asc" ? 1 : -1;
   return ((leaderboard && leaderboard.entries) || []).slice().sort((a,b) => {
-    const av = Number(a[leaderboardSort.key]), bv = Number(b[leaderboardSort.key]);
+    const metric = e => ({profit_factor:e.performance_validation?.profit_factor, average_r:e.performance_validation?.average_r, daily_sharpe:e.performance_validation?.annualized_daily_sharpe, expectancy:e.performance_validation?.expectancy_usd, top_winner_share:e.performance_validation?.top_winner_share_of_positive_pnl}[leaderboardSort.key] ?? e[leaderboardSort.key]);
+    const av = Number(metric(a)), bv = Number(metric(b));
     if (av === bv) return a.rank - b.rank;
     return (av - bv) * sign;
   });
@@ -980,6 +1022,8 @@ function renderStrategySummary(leaderboard) {
   const biggestWin = wins.length ? Math.max(...wins) : null;
   const biggestLoss = losses.length ? Math.min(...losses) : null;
   const outlierShare = biggestWin && entry.pnl > 0 ? biggestWin / entry.pnl : null;
+  const validation = entry.performance_validation || {};
+  const slippage3 = (entry.stop_slippage_sensitivity_usd || {})["3"];
   box.innerHTML = `
     <div class="card"><div class="label">#${entry.rank} · selected setup</div><div class="strategy-name">${escapeHtml(entry.strategy_id)}</div></div>
     <div class="card"><div class="label">Realised P&amp;L</div><div class="value pnl-value ${pnlClass}">${fmtMoney(entry.pnl)}</div><div class="subtle">after modelled costs</div></div>
@@ -996,6 +1040,11 @@ function renderStrategySummary(leaderboard) {
     <div class="card"><div class="label">Average trade</div><div class="value ${averageTrade >= 0 ? "pnl-pos" : "pnl-neg"}">${fmtMoney(averageTrade)}</div><div class="subtle">net realised P&amp;L</div></div>
     <div class="card"><div class="label">Largest win</div><div class="value pnl-pos">${fmtMoney(biggestWin)}</div><div class="subtle">share of P&amp;L: ${outlierShare === null ? "–" : fmtPct(outlierShare)}</div></div>
     <div class="card"><div class="label">Largest loss</div><div class="value pnl-neg">${fmtMoney(biggestLoss)}</div><div class="subtle">realised single-trade loss</div></div>`;
+  box.innerHTML += `
+    <div class="card"><div class="label">Average R</div><div class="value">${fmtNum(validation.average_r)}</div><div class="subtle">net P&amp;L ÷ planned stop risk</div></div>
+    <div class="card"><div class="label">Daily Sharpe</div><div class="value">${fmtNum(validation.annualized_daily_sharpe)}</div><div class="subtle">annualized · no-trade weekdays = 0</div></div>
+    <div class="card"><div class="label">P&amp;L with +3 stop ticks</div><div class="value ${slippage3 >= 0 ? "pnl-pos" : "pnl-neg"}">${fmtMoney(slippage3)}</div><div class="subtle">analytic sensitivity, signals unchanged</div></div>
+    <div class="card"><div class="label">Top-winner concentration</div><div class="value">${fmtPct(validation.top_winner_share_of_positive_pnl)}</div><div class="subtle">largest win ÷ all positive P&amp;L</div></div>`;
 }
 
 function renderLeaders(leaderboard) {
@@ -1014,6 +1063,9 @@ function renderLeaders(leaderboard) {
       <td class="num">${fmtPct(e.win_rate)}</td>
       <td class="num">${fmtNum(e.trade_count)}</td>
       <td class="num">${fmtMoney(e.max_drawdown)}</td>
+      <td class="num">${fmtNum(e.performance_validation?.profit_factor)}</td>
+      <td class="num">${fmtNum(e.performance_validation?.average_r)}</td>
+      <td class="num">${fmtNum(e.performance_validation?.annualized_daily_sharpe)}</td>
       <td class="num">${fmtNum(e.drawdowns_over_2000_count)}</td>
     </tr>`).join("");
   document.querySelectorAll("#leaders-tbody tr").forEach(row => row.addEventListener("click", () => {
@@ -1230,7 +1282,7 @@ async function loadLeaderboardPage(reset = false) {
   if (reset) { leaderboardOffset = 0; leaderboardTotal = 0; lastLeaderboard = null; }
   const offset = reset ? 0 : leaderboardOffset;
   const filters = new URLSearchParams();
-  const fieldMap = {"pnl-min":"pnl_min","pnl-max":"pnl_max","roi-min":"roi_min","roi-max":"roi_max","win-rate-min":"win_rate_min","win-rate-max":"win_rate_max","trade-count-min":"min_trades","trade-count-max":"trade_count_max","max-drawdown-min":"max_drawdown_min","max-drawdown-max":"max_drawdown_max","contains":"contains"};
+  const fieldMap = {"pnl-min":"pnl_min","pnl-max":"pnl_max","roi-min":"roi_min","roi-max":"roi_max","win-rate-min":"win_rate_min","win-rate-max":"win_rate_max","trade-count-min":"min_trades","trade-count-max":"trade_count_max","max-drawdown-min":"max_drawdown_min","max-drawdown-max":"max_drawdown_max","profit-factor-min":"profit_factor_min","profit-factor-max":"profit_factor_max","average-r-min":"average_r_min","average-r-max":"average_r_max","daily-sharpe-min":"daily_sharpe_min","daily-sharpe-max":"daily_sharpe_max","expectancy-min":"expectancy_min","expectancy-max":"expectancy_max","top-winner-share-min":"top_winner_share_min","top-winner-share-max":"top_winner_share_max","contains":"contains"};
   Object.entries(fieldMap).forEach(([id,key]) => { const value = document.getElementById("f-"+id).value.trim(); if (value) filters.set(key,value); });
   ["direction","instrument","tp_kind","sl_kind","confluence","session"].forEach(key => { const values = [...document.querySelectorAll(`[data-filter="${key}"]:checked`)].map(el => el.value); if (values.length) filters.set(key, values.join(",")); });
   const apexPass = document.getElementById("f-apex-pass").checked, apexBreach = document.getElementById("f-apex-breach").checked;

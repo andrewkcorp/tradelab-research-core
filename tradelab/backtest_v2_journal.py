@@ -108,6 +108,8 @@ CREATE TABLE IF NOT EXISTS variant_summaries (
     skipped_entries_by_reason_json TEXT NOT NULL,
     yearly_json TEXT NOT NULL,
     monthly_json TEXT NOT NULL,
+    performance_validation_json TEXT NOT NULL DEFAULT '{}',
+    stop_slippage_sensitivity_json TEXT NOT NULL DEFAULT '{}',
     committed_at TEXT NOT NULL
 );
 """
@@ -127,6 +129,7 @@ _SUMMARY_COLUMNS = (
     "apex_max_daily_loss_usd", "apex_largest_eod_drawdown_breach_usd",
     "mtm_worst_equity_usd", "mtm_max_drawdown_usd", "mtm_worst_equity_at",
     "skipped_entries_by_reason_json", "yearly_json", "monthly_json",
+    "performance_validation_json", "stop_slippage_sensitivity_json",
 )
 
 
@@ -175,6 +178,8 @@ class JournalVariantSummary:
     skipped_entries_by_reason: Mapping[str, int]
     yearly: Mapping[str, Mapping[str, float | int]]
     monthly: Mapping[str, Mapping[str, float | int]]
+    performance_validation: Mapping[str, Any]
+    stop_slippage_sensitivity_usd: Mapping[str, float]
 
     @staticmethod
     def from_row(row: tuple) -> "JournalVariantSummary":
@@ -186,6 +191,7 @@ class JournalVariantSummary:
             apex_has_breach, apex_breach_count, apex_breached_trading_day_count, apex_max_daily_loss_usd,
             apex_largest_eod_drawdown_breach_usd, mtm_worst_equity_usd, mtm_max_drawdown_usd,
             mtm_worst_equity_at, skipped_json, yearly_json, monthly_json,
+            performance_validation_json, stop_slippage_sensitivity_json,
         ) = row
         return JournalVariantSummary(
             strategy_variant_id=strategy_variant_id, equivalence_class_id=equivalence_class_id, direction=direction,
@@ -203,6 +209,8 @@ class JournalVariantSummary:
             mtm_worst_equity_usd=mtm_worst_equity_usd, mtm_max_drawdown_usd=mtm_max_drawdown_usd,
             mtm_worst_equity_at=mtm_worst_equity_at,
             skipped_entries_by_reason=json.loads(skipped_json), yearly=json.loads(yearly_json), monthly=json.loads(monthly_json),
+            performance_validation=json.loads(performance_validation_json),
+            stop_slippage_sensitivity_usd=json.loads(stop_slippage_sensitivity_json),
         )
 
 
@@ -367,6 +375,8 @@ class BacktestV2Journal:
                     (row.get("mark_to_market_audit") or {}).get("timestamp_of_worst_equity"),
                     json.dumps(dict(row["skipped_entries_by_reason"]), sort_keys=True),
                     json.dumps(dict(row["yearly"]), sort_keys=True), json.dumps(dict(row["monthly"]), sort_keys=True),
+                    json.dumps(dict(row.get("performance_validation") or {}), sort_keys=True),
+                    json.dumps(dict(row.get("stop_slippage_sensitivity_usd") or {}), sort_keys=True),
                     _utc_now_iso(),
                 ),
             )
@@ -411,6 +421,8 @@ _SUMMARY_MIGRATION_COLUMNS = {
     "mtm_worst_equity_usd": "REAL",
     "mtm_max_drawdown_usd": "REAL",
     "mtm_worst_equity_at": "TEXT",
+    "performance_validation_json": "TEXT NOT NULL DEFAULT '{}'",
+    "stop_slippage_sensitivity_json": "TEXT NOT NULL DEFAULT '{}'",
 }
 
 
