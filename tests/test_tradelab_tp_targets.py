@@ -213,6 +213,23 @@ class TopThreeNearestTests(unittest.TestCase):
         for t in result.data_wick_targets:
             self.assertIsNone(t.rank)
 
+    def test_data_wick_work_can_be_explicitly_skipped_for_liquidity_only_runs(self):
+        e = entry(direction=LONG, entry_price=100.0)
+        events = [
+            wick_event(level_price=101.0, event_ids=("E1",), known_at=T0 - timedelta(minutes=25)),
+            wick_event(level_price=105.0, event_ids=("E2",), known_at=T0 - timedelta(minutes=24)),
+        ]
+
+        result = detect_tp_target_candidates(
+            e,
+            EMPTY_LIQ,
+            EMPTY_LIQ,
+            wick_result(*events),
+            include_data_wick_targets=False,
+        )
+
+        self.assertEqual(result.data_wick_targets, [])
+
     def test_deterministic_sort_order_on_repeated_calls(self):
         e = entry(direction=LONG, entry_price=100.0)
         levels = [level(level_id="L1", price=110.0), level(level_id="L2", price=101.0), level(level_id="L3", price=105.0)]

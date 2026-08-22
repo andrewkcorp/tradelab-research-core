@@ -1886,7 +1886,11 @@ def _expand_and_simulate(
         reporter.progress(items_completed=completed, backtests_completed=completed)
         reporter.update_leaderboard(_merged_leaderboard(durable_top_n, top_n, top_n_leaderboard))
 
-    entry_target_cache = EntryTargetCache(max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES)
+    include_data_wick_targets = any(variant.tp_kind == TPVariantKind.DATA_WICK for variant in exit_variants)
+    entry_target_cache = EntryTargetCache(
+        max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES,
+        include_data_wick_targets=include_data_wick_targets,
+    )
     directional_classes = universe.equivalence_classes if include_directional_variants and universe is not None else ()
     for equivalence_class in directional_classes:
         # One bounded cache survives the whole prepared run. Multiple
@@ -1965,7 +1969,10 @@ def _expand_and_simulate(
     # directional universe, so ranking/filtering sees one coherent research
     # population.
     if both_universe is not None:
-        both_target_cache = EntryTargetCache(max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES)
+        both_target_cache = EntryTargetCache(
+            max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES,
+            include_data_wick_targets=include_data_wick_targets,
+        )
         for equivalence_class in both_universe.equivalence_classes:
             pending_by_variant: list[tuple[ExitVariantSpec, tuple[Instrument, ...]]] = []
             for variant in exit_variants:

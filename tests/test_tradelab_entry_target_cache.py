@@ -44,6 +44,15 @@ class EntryTargetCacheTests(unittest.TestCase):
         self.assertEqual(r3, "RESULT")
         self.assertEqual(len(cache), 2)
 
+    def test_tp_candidate_cache_can_skip_unneeded_data_wick_work(self):
+        cache = EntryTargetCache(include_data_wick_targets=False)
+
+        with patch("tradelab.entry_target_cache.detect_tp_target_candidates") as mock_detect:
+            mock_detect.return_value = "RESULT"
+            cache.tp_candidates(_market_entry("A"), {}, {}, None)
+
+        self.assertFalse(mock_detect.call_args.kwargs["include_data_wick_targets"])
+
     def test_sl_candidates_memoized_per_entry_id_and_confluence_key(self):
         cache = EntryTargetCache()
         entry_a = _market_entry("A")

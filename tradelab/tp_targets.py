@@ -183,6 +183,7 @@ def detect_tp_target_candidates(
     data_wick_result: DataWickDetectionResult,
     *,
     liquidity_index: LiquidityTargetIndex | None = None,
+    include_data_wick_targets: bool = True,
 ) -> TPTargetCandidateResult:
     """Build the ordered TP target candidates for ``entry``.
 
@@ -195,7 +196,11 @@ def detect_tp_target_candidates(
     swing high is just as valid a target as a 1m one.
     """
     liquidity_candidates = _liquidity_candidates(entry, swing_equal_results, session_results, liquidity_index=liquidity_index)
-    data_wick_candidates = _data_wick_candidates(entry, data_wick_result)
+    # A run without data-wick TP variants must not materialize every
+    # historical wick for every entry just to discard the result.  This is
+    # an exact execution-preserving switch: liquidity targets are unchanged,
+    # and callers that can select a data wick retain the default ``True``.
+    data_wick_candidates = _data_wick_candidates(entry, data_wick_result) if include_data_wick_targets else []
 
     liquidity_candidates.sort(key=lambda c: (c.distance, c.known_at, c.target_id))
     liquidity_candidates = liquidity_candidates[:MAX_LIQUIDITY_TARGETS]

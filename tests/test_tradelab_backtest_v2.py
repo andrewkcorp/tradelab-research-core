@@ -2472,6 +2472,39 @@ class BatchedExitVariantExecutionTests(unittest.TestCase):
             for variant in ALL_EXIT_VARIANTS:
                 self.assertEqual(actual[variant.variant_id], expected[variant.variant_id], msg=variant.variant_id)
 
+    def test_skipping_data_wick_candidate_materialization_preserves_liquidity_only_results(self):
+        """A run which cannot select a data-wick TP must get precisely the
+        same fills and exits when those unused candidates are not built."""
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result,
+            context.htf_bias_result, min_entries_per_year=1,
+        )
+        equivalence_class = universe.equivalence_classes[0]
+        variants = tuple(variant for variant in ALL_EXIT_VARIANTS if variant.tp_kind != TPVariantKind.DATA_WICK)
+        index = BarRangeIndex.build(context.bars_1m)
+
+        expected = simulate_market_execution_batched(
+            equivalence_class.observed_entries,
+            equivalence_class.representative_spec.primary.direction,
+            variants,
+            context,
+            equivalence_class.class_id,
+            bar_range_index=index,
+            entry_target_cache=EntryTargetCache(),
+        )
+        actual = simulate_market_execution_batched(
+            equivalence_class.observed_entries,
+            equivalence_class.representative_spec.primary.direction,
+            variants,
+            context,
+            equivalence_class.class_id,
+            bar_range_index=index,
+            entry_target_cache=EntryTargetCache(include_data_wick_targets=False),
+        )
+
+        self.assertEqual(actual, expected)
+
     def test_batched_matches_independent_execution_for_randomized_long_and_short_classes(self):
         rng = random.Random(48048)
         directions_seen = set()

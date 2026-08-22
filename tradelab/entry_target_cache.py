@@ -86,10 +86,16 @@ class EntryTargetCache:
     loop, on one thread, exactly like ``tradelab.bar_range_index.
     BarRangeIndex`` is built once and reused, but never concurrently)."""
 
-    def __init__(self, *, max_entries: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        max_entries: int | None = None,
+        include_data_wick_targets: bool = True,
+    ) -> None:
         if max_entries is not None and max_entries <= 0:
             raise ValueError("EntryTargetCache.max_entries must be positive or None")
         self._max_entries = max_entries
+        self._include_data_wick_targets = include_data_wick_targets
         self._tp: dict[str, TPTargetCandidateResult] = {}
         self._sl: dict[tuple[str, str | None], SLTargetCandidateResult] = {}
         # One LRU order across both namespaces. Eviction is strictly a
@@ -121,7 +127,11 @@ class EntryTargetCache:
         if cached is not None:
             self._touch(("tp", market_entry.entry_id))
             return cached
-        result = detect_tp_target_candidates(market_entry, swing_equal_results, session_results, data_wick_result, liquidity_index=liquidity_index)
+        result = detect_tp_target_candidates(
+            market_entry, swing_equal_results, session_results, data_wick_result,
+            liquidity_index=liquidity_index,
+            include_data_wick_targets=self._include_data_wick_targets,
+        )
         self._tp[market_entry.entry_id] = result
         self._touch(("tp", market_entry.entry_id))
         return result
