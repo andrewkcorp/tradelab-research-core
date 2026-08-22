@@ -34,10 +34,10 @@ def _make_bars(count: int, base: datetime = datetime(2024, 1, 2, 14, 30, tzinfo=
     return [
         Bar1m(
             timestamp=base + timedelta(minutes=i),
-            open=100.0 + i * 0.1,
-            high=100.5 + i * 0.1,
-            low=99.5 + i * 0.1,
-            close=100.2 + i * 0.1,
+            open=100.0 + i * 0.25,
+            high=100.5 + i * 0.25,
+            low=99.5 + i * 0.25,
+            close=100.25 + i * 0.25,
             volume=10.0,
             contract="MNQ_CONTINUOUS",
         )
