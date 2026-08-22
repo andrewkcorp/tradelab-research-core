@@ -123,6 +123,7 @@ from tradelab.entry_signal_timeline import (
 )
 from tradelab.fvg import BEARISH, BULLISH, FVGDetectionResult, FVGMitigationEvent
 from tradelab.bias import HTFBiasResult
+from tradelab.session_calendar import SpecialSessionSchedule
 from tradelab.fvg_entry import FVGEntryCandidateResult
 from tradelab.fvg_entry import SourceType as FVGCandidateSourceType
 from tradelab.liquidity import LiquidityDetectionResult
@@ -265,7 +266,12 @@ def profile_research_context(
     news_sha256 = hashlib.sha256(news_csv_path.read_bytes()).hexdigest()
 
     context = prepare_backtest_context(
-        bars, news_events, tick_size=TICK_SIZE_MNQ, pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS
+        bars,
+        news_events,
+        tick_size=TICK_SIZE_MNQ,
+        pivot_strength=PIVOT_STRENGTH,
+        reclaim_window_bars=RECLAIM_WINDOW_BARS,
+        special_schedule=series_result.special_session_schedule,
     )
     _report("preparation", preparation_start)
 
@@ -372,7 +378,10 @@ def _build_profile(
             "bar_count_1m": len(bars),
             "coverage_start": bars[0].timestamp.isoformat() if bars else None,
             "coverage_end": bars[-1].timestamp.isoformat() if bars else None,
-            "aggregated_bar_counts": _aggregated_bar_counts(bars),
+            "aggregated_bar_counts": _aggregated_bar_counts(
+                bars,
+                context.special_session_schedule,
+            ),
         },
         "fvg": {
             "zone_counts_by_timeframe_direction": _fvg_zone_counts(context.fvg_results),
@@ -463,9 +472,21 @@ def _news_coverage_notes(news_events: list[NewsEvent], observed_start: datetime 
     }
 
 
-def _aggregated_bar_counts(bars_1m: tuple[Bar1m, ...]) -> dict[str, int]:
+def _aggregated_bar_counts(
+    bars_1m: tuple[Bar1m, ...],
+    special_schedule: SpecialSessionSchedule | None = None,
+) -> dict[str, int]:
     bars_list = list(bars_1m)
-    return {timeframe: len(aggregate_bars(bars_list, timeframe)) for timeframe in _AGGREGATE_TIMEFRAMES}
+    return {
+        timeframe: len(
+            aggregate_bars(
+                bars_list,
+                timeframe,
+                special_schedule=special_schedule,
+            )
+        )
+        for timeframe in _AGGREGATE_TIMEFRAMES
+    }
 
 
 def _fvg_zone_counts(fvg_results: Mapping[str, FVGDetectionResult]) -> dict[str, dict[str, int]]:

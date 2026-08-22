@@ -24,7 +24,12 @@ ONE_MINUTE = timedelta(minutes=1)
 # local hour equal to this value is fully within the break" -- i.e. minutes
 # 17:00 through 17:59 NY are closed, and 18:00 NY is open again.
 DAILY_BREAK_START_HOUR = 17
-SPECIAL_SCHEDULE_SCHEMA_VERSION = "cme-special-session-schedule-v1"
+LEGACY_SPECIAL_SCHEDULE_SCHEMA_VERSION = "cme-special-session-schedule-v1"
+SPECIAL_SCHEDULE_SCHEMA_VERSION = "cme-special-session-schedule-v2"
+SUPPORTED_SPECIAL_SCHEDULE_SCHEMA_VERSIONS = {
+    LEGACY_SPECIAL_SCHEDULE_SCHEMA_VERSION,
+    SPECIAL_SCHEDULE_SCHEMA_VERSION,
+}
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,8 @@ class ClosedInterval:
     start_utc: datetime
     end_utc: datetime
     reason: str
+    source_url: str | None = None
+    source_reference: str | None = None
 
     def __post_init__(self) -> None:
         if self.start_utc.tzinfo is None or self.end_utc.tzinfo is None:
@@ -42,6 +49,13 @@ class ClosedInterval:
             raise ValueError("special-session interval start_utc must precede end_utc")
         if not self.reason.strip():
             raise ValueError("special-session interval reason must be non-empty")
+        if (self.source_url is None) != (self.source_reference is None):
+            raise ValueError("special-session interval source_url and source_reference must be supplied together")
+        if self.source_url is not None:
+            if not self.source_url.startswith("https://www.cmegroup.com/"):
+                raise ValueError("special-session interval source_url must be an official HTTPS cmegroup.com URL")
+            if not self.source_reference.strip():
+                raise ValueError("special-session interval source_reference must be non-empty")
 
 
 @dataclass(frozen=True)
@@ -49,13 +63,17 @@ class SpecialSessionSchedule:
     source_url: str
     retrieved_at: datetime
     closed_intervals: tuple[ClosedInterval, ...]
+    coverage_start_utc: datetime | None = None
+    coverage_end_utc: datetime | None = None
+    instrument_roots: tuple[str, ...] = ()
+    source_documents: tuple[str, ...] = ()
     schema_version: str = SPECIAL_SCHEDULE_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != SPECIAL_SCHEDULE_SCHEMA_VERSION:
+        if self.schema_version not in SUPPORTED_SPECIAL_SCHEDULE_SCHEMA_VERSIONS:
             raise ValueError(f"unsupported special-session schedule schema {self.schema_version!r}")
-        if not self.source_url.strip():
-            raise ValueError("special-session schedule source_url must be non-empty")
+        if not self.source_url.startswith("https://www.cmegroup.com/"):
+            raise ValueError("special-session schedule source_url must be an official HTTPS cmegroup.com URL")
         if self.retrieved_at.tzinfo is None:
             raise ValueError("special-session schedule retrieved_at must be timezone-aware")
         ordered = tuple(sorted(self.closed_intervals, key=lambda item: item.start_utc))
@@ -64,9 +82,43 @@ class SpecialSessionSchedule:
         for previous, current in zip(ordered, ordered[1:]):
             if current.start_utc < previous.end_utc:
                 raise ValueError("special-session closed intervals must not overlap")
+        if self.schema_version == SPECIAL_SCHEDULE_SCHEMA_VERSION:
+            if self.coverage_start_utc is None or self.coverage_end_utc is None:
+                raise ValueError("v2 special-session schedule requires coverage_start_utc and coverage_end_utc")
+            if not self.coverage_start_utc < self.coverage_end_utc:
+                raise ValueError("special-session schedule coverage_start_utc must precede coverage_end_utc")
+            if not self.instrument_roots or any(not root.strip() or root != root.upper() for root in self.instrument_roots):
+                raise ValueError("v2 special-session schedule requires uppercase instrument_roots")
+            if not self.source_documents:
+                raise ValueError("v2 special-session schedule requires source_documents")
+            if any(not url.startswith("https://www.cmegroup.com/") for url in self.source_documents):
+                raise ValueError("v2 source_documents must contain only official HTTPS cmegroup.com URLs")
+            for interval in self.closed_intervals:
+                if interval.source_url is None:
+                    raise ValueError("every v2 closed interval requires source_url and source_reference")
+                if interval.source_url not in self.source_documents:
+                    raise ValueError("closed interval source_url must be declared in source_documents")
+                if interval.start_utc < self.coverage_start_utc or interval.end_utc > self.coverage_end_utc:
+                    raise ValueError("closed interval lies outside the declared schedule coverage")
 
     def is_closed(self, minute_start_utc: datetime) -> bool:
         return any(item.start_utc <= minute_start_utc < item.end_utc for item in self.closed_intervals)
+
+    def is_auditable_for(self, *, instrument_root: str, start_utc: datetime, end_utc: datetime) -> bool:
+        """Whether this schedule is a provenance-complete v2 schedule for
+        the requested instrument and half-open market-data interval.
+
+        Legacy v1 fixtures remain loadable for backwards-compatible library
+        use, but deliberately cannot unlock a production research run.
+        """
+        return bool(
+            self.schema_version == SPECIAL_SCHEDULE_SCHEMA_VERSION
+            and self.coverage_start_utc is not None
+            and self.coverage_end_utc is not None
+            and instrument_root in self.instrument_roots
+            and self.coverage_start_utc <= start_utc
+            and end_utc <= self.coverage_end_utc
+        )
 
 
 def _parse_utc(value: str) -> datetime:
@@ -87,6 +139,8 @@ def load_special_session_schedule(path: Path | str) -> SpecialSessionSchedule:
                 start_utc=_parse_utc(item["start_utc"]),
                 end_utc=_parse_utc(item["end_utc"]),
                 reason=item["reason"],
+                source_url=item.get("source_url"),
+                source_reference=item.get("source_reference"),
             )
             for item in raw["closed_intervals"]
         )
@@ -95,6 +149,10 @@ def load_special_session_schedule(path: Path | str) -> SpecialSessionSchedule:
             source_url=raw["source_url"],
             retrieved_at=datetime.fromisoformat(raw["retrieved_at"].replace("Z", "+00:00")),
             closed_intervals=intervals,
+            coverage_start_utc=None if raw.get("coverage_start_utc") is None else _parse_utc(raw["coverage_start_utc"]),
+            coverage_end_utc=None if raw.get("coverage_end_utc") is None else _parse_utc(raw["coverage_end_utc"]),
+            instrument_roots=tuple(raw.get("instrument_roots", ())),
+            source_documents=tuple(raw.get("source_documents", ())),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"invalid special-session schedule {path}: {error}") from error

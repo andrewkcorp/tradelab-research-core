@@ -179,6 +179,7 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
+import hashlib
 import heapq
 import itertools
 import json
@@ -228,6 +229,7 @@ from tradelab.fvg_entry import FVGEntryCandidate
 from tradelab.news import NewsBlackoutIndex, is_entry_blocked
 from tradelab.research_run import LeaderboardEntry, ProgressThrottle, RunPhase, RunReporter, append_jsonl, atomic_write_json, create_run, read_run_manifest
 from tradelab.research_run import _git_provenance as _current_git_provenance
+from tradelab.session_calendar import load_special_session_schedule
 from tradelab.research_run import _sha256_of_file as _hash_file
 from tradelab.sl_targets import FVG_SL_TIMEFRAMES, SelectedFVGConfluence, SLTargetCandidate, detect_sl_target_candidates
 from tradelab.stage_timings import StageTimings
@@ -2267,6 +2269,29 @@ def run_production_backtest_v2(
             "production run requires a checksum-linked official CME holiday/early-close schedule; "
             "run the pre-run quality audit to inspect the incomplete artifact"
         )
+    schedule_path = Path(artifact_gate.session_schedule_path)
+    if not schedule_path.is_absolute():
+        schedule_path = Path(market_artifact_path).parent / schedule_path
+    try:
+        schedule_bytes = schedule_path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"cannot read production session schedule {schedule_path}: {error}") from error
+    schedule_sha256 = hashlib.sha256(schedule_bytes).hexdigest()
+    if schedule_sha256 != artifact_gate.session_schedule_sha256:
+        raise ValueError(
+            "production session schedule checksum mismatch: "
+            f"manifest={artifact_gate.session_schedule_sha256}, actual={schedule_sha256}"
+        )
+    production_schedule = load_special_session_schedule(schedule_path)
+    if not production_schedule.is_auditable_for(
+        instrument_root=artifact_gate.instrument_root.value,
+        start_utc=artifact_gate.coverage_start,
+        end_utc=artifact_gate.coverage_end,
+    ):
+        raise ValueError(
+            "production session schedule must use the provenance-complete v2 schema and cover the "
+            "artifact instrument and full half-open data interval"
+        )
     runs_dir = Path(runs_dir)
     resuming = run_id is not None and (runs_dir / run_id / "backtest_v2_journal.sqlite3").is_file()
 
@@ -2310,6 +2335,7 @@ def run_production_backtest_v2(
         reporter.progress(items_completed=3)
         context = prepare_backtest_context(
             list(series_result.bars), list(news_events), tick_size=tick_size, pivot_strength=pivot_strength, reclaim_window_bars=reclaim_window_bars,
+            special_schedule=series_result.special_session_schedule,
             phase_callback=_prepare_data_phase_callback(reporter),
         )
         reporter.progress(items_completed=4)
@@ -2648,6 +2674,7 @@ def run_preflight_v2(
         reporter.progress(items_completed=3)
         context = prepare_backtest_context(
             list(series_result.bars), list(news_events), tick_size=tick_size, pivot_strength=pivot_strength, reclaim_window_bars=reclaim_window_bars,
+            special_schedule=series_result.special_session_schedule,
             phase_callback=_prepare_data_phase_callback(reporter),
         )
         reporter.progress(items_completed=4)
@@ -3219,7 +3246,13 @@ def main(argv: list[str] | None = None) -> int:
             if args.prefix_bars is not None:
                 bars = bars[: args.prefix_bars]
             news_events = list(read_news_events_csv(args.news_csv)) if args.news_csv is not None else []
-            context = prepare_backtest_context(bars, news_events, pivot_strength=args.pivot_strength, reclaim_window_bars=args.reclaim_window_bars)
+            context = prepare_backtest_context(
+                bars,
+                news_events,
+                pivot_strength=args.pivot_strength,
+                reclaim_window_bars=args.reclaim_window_bars,
+                special_schedule=series_result.special_session_schedule,
+            )
         else:
             context = build_synthetic_smoke_context()
         universe = discover_entry_strategy_universe(
@@ -3241,7 +3274,13 @@ def main(argv: list[str] | None = None) -> int:
             if args.prefix_bars is not None:
                 bars = bars[: args.prefix_bars]
             news_events = list(read_news_events_csv(args.news_csv)) if args.news_csv is not None else []
-            context = prepare_backtest_context(bars, news_events, pivot_strength=args.pivot_strength, reclaim_window_bars=args.reclaim_window_bars)
+            context = prepare_backtest_context(
+                bars,
+                news_events,
+                pivot_strength=args.pivot_strength,
+                reclaim_window_bars=args.reclaim_window_bars,
+                special_schedule=series_result.special_session_schedule,
+            )
         else:
             context = build_synthetic_smoke_context()
         universe = discover_entry_strategy_universe(

@@ -67,11 +67,11 @@ reimplemented here) is already UTC by the time this module sees it.
 **No synthetic bars, ever.** A gap between two observed 1-minute bars
 is reported -- as a warning/metric on the audit report, using ``tradelab
 .validation``'s own existing missing-minutes registry -- never filled
-in, interpolated, or otherwise fabricated. This module also never
-assumes its own CME holiday/early-close calendar (mirroring ``tradelab.
-validation``'s own documented limitation): a real holiday and a genuine
-data problem both surface as the same kind of reported gap, left for a
-human (or a calendar this package does not yet have) to tell apart.
+in, interpolated, or otherwise fabricated. A manifest may checksum-link
+a provenance-bearing CME holiday/early-close schedule. Only intervals
+declared closed by that schedule are removed from the expected-minute
+set; every remaining missing expected-open minute stays visible as a
+data-quality gap.
 
 **The audit never mutates its input** and never raises on a data-
 quality problem -- ``audit_market_data_artifact`` always returns a
@@ -96,7 +96,7 @@ from tradelab.continuous_futures import ContinuousSeriesResult, RollAdjustment, 
 from tradelab.databento_parent_csv import read_databento_parent_csv
 from tradelab.loaders import _parse_timestamp, read_csv_bars, read_parquet_bars
 from tradelab.validation import MissingMinutesGap, validate_bars, validate_price_grid
-from tradelab.session_calendar import load_special_session_schedule
+from tradelab.session_calendar import SpecialSessionSchedule, load_special_session_schedule
 from tradelab.volume_roll_continuous import build_volume_front_month_continuous_series
 
 SCHEMA_VERSION = "1.0"
@@ -465,6 +465,21 @@ def audit_market_data_artifact(
                         category="session_schedule_invalid",
                         message=str(error),
                     ))
+                else:
+                    if not special_schedule.is_auditable_for(
+                        instrument_root=artifact.instrument_root.value,
+                        start_utc=artifact.coverage_start,
+                        end_utc=artifact.coverage_end,
+                    ):
+                        findings.append(AuditFinding(
+                            severity=AuditSeverity.CRITICAL,
+                            category="session_schedule_coverage_incomplete",
+                            message=(
+                                "declared session schedule is not a provenance-complete v2 schedule covering "
+                                f"{artifact.instrument_root.value} and the full artifact interval "
+                                f"[{artifact.coverage_start.isoformat()}, {artifact.coverage_end.isoformat()})"
+                            ),
+                        ))
     else:
         findings.append(AuditFinding(
             severity=AuditSeverity.WARNING,
@@ -578,11 +593,14 @@ class MarketDataSeriesResult:
     full ``tradelab.continuous_futures`` audit trail, present only when
     normalization actually ran (``series_kind=raw_quarterly``) -- ``None``
     for an already-continuous artifact, which this module passes
-    through unchanged."""
+    through unchanged. ``special_session_schedule`` is the exact linked
+    schedule already accepted by the artifact audit and must be forwarded
+    into downstream validation and aggregation."""
 
     bars: tuple[Bar1m, ...]
     audit_report: MarketDataArtifactAuditReport
     continuous_series_result: ContinuousSeriesResult | None
+    special_session_schedule: SpecialSessionSchedule | None
 
 
 def load_market_data_series(
@@ -627,6 +645,7 @@ def load_market_data_series(
             bars=selection.continuous_series_result.normalized_bars,
             audit_report=audit_report,
             continuous_series_result=selection.continuous_series_result,
+            special_session_schedule=_load_linked_special_schedule(artifact, base_dir),
         )
 
     data_path = _resolve_path(artifact.data_path, base_dir)
@@ -639,9 +658,32 @@ def load_market_data_series(
         roll_manifest_path = _resolve_path(artifact.roll_manifest_path, base_dir)
         rolls = read_roll_manifest(roll_manifest_path)
         continuous_result = build_back_adjusted_continuous_series(bars, rolls, label)
-        return MarketDataSeriesResult(bars=continuous_result.normalized_bars, audit_report=audit_report, continuous_series_result=continuous_result)
+        return MarketDataSeriesResult(
+            bars=continuous_result.normalized_bars,
+            audit_report=audit_report,
+            continuous_series_result=continuous_result,
+            special_session_schedule=_load_linked_special_schedule(artifact, base_dir),
+        )
 
-    return MarketDataSeriesResult(bars=tuple(bars), audit_report=audit_report, continuous_series_result=None)
+    return MarketDataSeriesResult(
+        bars=tuple(bars),
+        audit_report=audit_report,
+        continuous_series_result=None,
+        special_session_schedule=_load_linked_special_schedule(artifact, base_dir),
+    )
+
+
+def _load_linked_special_schedule(
+    artifact: MarketDataArtifact,
+    base_dir: Path | str | None,
+) -> SpecialSessionSchedule | None:
+    """Return the exact schedule whose path/checksum the artifact audit
+    already accepted, so downstream validation and HTF aggregation use the
+    same session facts rather than silently reverting to the weekly calendar.
+    """
+    if artifact.session_schedule_path is None:
+        return None
+    return load_special_session_schedule(_resolve_path(artifact.session_schedule_path, base_dir))
 
 
 def _raise_if_critical(artifact: MarketDataArtifact, audit_report: MarketDataArtifactAuditReport) -> None:

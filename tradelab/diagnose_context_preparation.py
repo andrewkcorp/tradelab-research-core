@@ -60,6 +60,7 @@ from tradelab.backtest import PreparedBacktestContext, _peak_rss_bytes, prepare_
 from tradelab.bar import Bar1m
 from tradelab.market_data_artifact import load_market_data_artifact, load_market_data_series
 from tradelab.news import NewsEvent
+from tradelab.session_calendar import SpecialSessionSchedule
 from tradelab.news_loaders import read_news_events_csv
 
 # Identical to tradelab.profile_research_context's own explicit MNQ
@@ -119,7 +120,10 @@ def _print_context_summary(context: PreparedBacktestContext) -> None:
 
 
 def diagnose_one_prefix(
-    all_bars: tuple[Bar1m, ...], news_events: tuple[NewsEvent, ...], prefix_bars: int
+    all_bars: tuple[Bar1m, ...],
+    news_events: tuple[NewsEvent, ...],
+    prefix_bars: int,
+    special_schedule: SpecialSessionSchedule | None = None,
 ) -> PreparedBacktestContext:
     """Run ``prepare_backtest_context`` on the deterministic first
     ``prefix_bars`` bars of ``all_bars`` (paired with the full,
@@ -136,6 +140,7 @@ def diagnose_one_prefix(
         tick_size=TICK_SIZE_MNQ,
         pivot_strength=PIVOT_STRENGTH,
         reclaim_window_bars=RECLAIM_WINDOW_BARS,
+        special_schedule=special_schedule,
         phase_callback=_print_phase,
     )
     _print_context_summary(context)
@@ -186,7 +191,12 @@ def main(argv: list[str] | None = None) -> int:
         print()
 
         for prefix_bars in prefix_sizes:
-            diagnose_one_prefix(all_bars, news_events, prefix_bars)
+            diagnose_one_prefix(
+                all_bars,
+                news_events,
+                prefix_bars,
+                series_result.special_session_schedule,
+            )
     except (ValueError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

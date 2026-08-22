@@ -278,9 +278,13 @@ def _write_smoke_market_artifact(tmp: Path) -> tuple[Path, Path]:
 
     schedule_path = tmp / "special_sessions.json"
     schedule_path.write_text(json.dumps({
-        "schema_version": "cme-special-session-schedule-v1",
-        "source_url": "https://www.cmegroup.com/trading-hours.html#synthetic-test-fixture",
+        "schema_version": "cme-special-session-schedule-v2",
+        "source_url": "https://www.cmegroup.com/trading-hours.html",
         "retrieved_at": "2026-08-22T00:00:00Z",
+        "coverage_start_utc": start.isoformat(),
+        "coverage_end_utc": (start + timedelta(minutes=900)).isoformat(),
+        "instrument_roots": ["NQ"],
+        "source_documents": ["https://www.cmegroup.com/trading-hours.html"],
         "closed_intervals": [],
     }), encoding="utf-8")
     schedule_sha256 = hashlib.sha256(schedule_path.read_bytes()).hexdigest()
@@ -1390,6 +1394,34 @@ class ProductionInputReadinessGateTests(unittest.TestCase):
                     )
 
             self.assertFalse((runs_dir / "must-not-exist").exists())
+
+    def test_legacy_schedule_cannot_unlock_production(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
+            schedule_path = tmp / "special_sessions.json"
+            schedule_path.write_text(json.dumps({
+                "schema_version": "cme-special-session-schedule-v1",
+                "source_url": "https://www.cmegroup.com/trading-hours.html",
+                "retrieved_at": "2026-08-22T00:00:00Z",
+                "closed_intervals": [],
+            }), encoding="utf-8")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["session_schedule_sha256"] = hashlib.sha256(schedule_path.read_bytes()).hexdigest()
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with patch("tradelab.backtest_v2._current_git_provenance", return_value=("test-commit", False)):
+                with self.assertRaisesRegex(ValueError, "provenance-complete v2"):
+                    run_production_backtest_v2(
+                        market_artifact_path=manifest_path,
+                        news_csv_path=news_csv_path,
+                        runs_dir=tmp / "runs",
+                        pivot_strength=2,
+                        reclaim_window_bars=3,
+                        min_entries_per_year=1,
+                        run_id="legacy-must-not-run",
+                        command="test",
+                    )
 
 
 class DirtyWorkingTreeRejectionTests(unittest.TestCase):

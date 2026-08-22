@@ -29,13 +29,10 @@ fabricate highs/lows/closes that were never actually observed, which can
 manufacture spurious FVGs, liquidity sweeps and bias in any downstream
 research that reads this data.
 
-Because ``tradelab.session_calendar`` has no notion of CME holidays or
-early closes (see its module docstring), a bucket touching such a day will
-also be rejected here -- there is no separate "unsupported schedule" marker,
-it just never appears in the output, same as a bucket with a real data gap.
-Callers who need to know *why* a period has no aggregate should cross
-reference ``tradelab.validation.validate_bars``' missing-minutes registry
-against the input.
+Holiday and early-close exceptions are applied when the caller supplies the
+same checksum-linked ``SpecialSessionSchedule`` that was used to audit the
+market artifact.  Without it, a bucket touching such an exception remains
+conservatively incomplete and is rejected rather than fabricated.
 """
 from __future__ import annotations
 
@@ -44,7 +41,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from tradelab.bar import Bar1m
-from tradelab.session_calendar import expected_open_minutes
+from tradelab.session_calendar import SpecialSessionSchedule, expected_open_minutes
 
 NY = ZoneInfo("America/New_York")
 TRADING_DAY_START_HOUR = 18
@@ -69,7 +66,12 @@ class AggregatedBar:
     known_at: datetime  # UTC instant at/after which this bar may be treated as known
 
 
-def aggregate_bars(bars: list[Bar1m], timeframe: str) -> list[AggregatedBar]:
+def aggregate_bars(
+    bars: list[Bar1m],
+    timeframe: str,
+    *,
+    special_schedule: SpecialSessionSchedule | None = None,
+) -> list[AggregatedBar]:
     if timeframe not in SUPPORTED_TIMEFRAMES:
         raise ValueError(f"Unsupported timeframe {timeframe!r}; expected one of {sorted(SUPPORTED_TIMEFRAMES)}")
     if not bars:
@@ -92,7 +94,11 @@ def aggregate_bars(bars: list[Bar1m], timeframe: str) -> list[AggregatedBar]:
         # silently misjudge magnitude across a DST transition.
         bucket_start_utc = bucket_start_ny.astimezone(timezone.utc)
         bucket_end_utc = bucket_end_ny.astimezone(timezone.utc)
-        expected = expected_open_minutes(bucket_start_utc, bucket_end_utc)
+        expected = expected_open_minutes(
+            bucket_start_utc,
+            bucket_end_utc,
+            special_schedule=special_schedule,
+        )
         actual = [b.timestamp for b in acc]
         if actual != expected:
             return  # missing an expected-open minute, or data outside the regular schedule

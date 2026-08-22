@@ -6,7 +6,12 @@ from zoneinfo import ZoneInfo
 
 from tradelab.aggregate import _bucket_start, _four_hour_bucket_start, _trading_day_start, aggregate_bars
 from tradelab.bar import Bar1m
-from tradelab.session_calendar import expected_open_minutes
+from tradelab.session_calendar import (
+    ClosedInterval,
+    LEGACY_SPECIAL_SCHEDULE_SCHEMA_VERSION,
+    SpecialSessionSchedule,
+    expected_open_minutes,
+)
 
 NY = ZoneInfo("America/New_York")
 CONTRACT = "NQZ25"
@@ -158,6 +163,39 @@ class DailyBreakCompletenessTests(unittest.TestCase):
         self.assertEqual(agg.known_at, bars[-1].timestamp + timedelta(minutes=1))
         self.assertEqual(agg.open, bars[0].open)
         self.assertEqual(agg.close, bars[-1].close)
+
+    def test_official_early_close_schedule_makes_the_shortened_daily_bucket_complete(self):
+        start_utc = datetime(2025, 11, 26, 18, 0, tzinfo=NY).astimezone(timezone.utc)
+        end_utc = datetime(2025, 11, 27, 18, 0, tzinfo=NY).astimezone(timezone.utc)
+        schedule = SpecialSessionSchedule(
+            schema_version=LEGACY_SPECIAL_SCHEDULE_SCHEMA_VERSION,
+            source_url="https://www.cmegroup.com/trading-hours.html",
+            retrieved_at=datetime(2026, 8, 22, tzinfo=timezone.utc),
+            closed_intervals=(
+                ClosedInterval(
+                    start_utc=datetime(2025, 11, 27, 18, 0, tzinfo=timezone.utc),
+                    end_utc=datetime(2025, 11, 27, 22, 0, tzinfo=timezone.utc),
+                    reason="Thanksgiving equity-index early close",
+                ),
+            ),
+        )
+        bars = [
+            bar_at_utc(timestamp)
+            for timestamp in expected_open_minutes(
+                start_utc,
+                end_utc,
+                special_schedule=schedule,
+            )
+        ]
+
+        self.assertEqual(aggregate_bars(bars, "1D"), [])
+        [aggregate] = aggregate_bars(
+            bars,
+            "1D",
+            special_schedule=schedule,
+        )
+        self.assertEqual(aggregate.timestamp, start_utc)
+        self.assertEqual(aggregate.known_at, datetime(2025, 11, 27, 18, 0, tzinfo=timezone.utc))
 
     def test_4h_bucket_14_to_18_with_180_active_minutes_is_returned(self):
         start_utc = datetime(2026, 1, 6, 14, 0, tzinfo=NY).astimezone(timezone.utc)

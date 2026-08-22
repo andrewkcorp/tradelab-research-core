@@ -706,7 +706,14 @@ def _run_cli(argv: list[str] | None = None) -> int:
         bars = select_deterministic_prefix(bars, args.prefix_bars)
     news_events = read_news_events_csv(args.news_csv)
 
-    context = prepare_backtest_context(bars, news_events, tick_size=TICK_SIZE_MNQ, pivot_strength=PIVOT_STRENGTH, reclaim_window_bars=RECLAIM_WINDOW_BARS)
+    context = prepare_backtest_context(
+        bars,
+        news_events,
+        tick_size=TICK_SIZE_MNQ,
+        pivot_strength=PIVOT_STRENGTH,
+        reclaim_window_bars=RECLAIM_WINDOW_BARS,
+        special_schedule=series_result.special_session_schedule,
+    )
     result = discover_entry_strategy_universe(
         context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result, context.htf_bias_result,
         min_entries_per_year=args.min_entries_per_year,

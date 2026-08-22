@@ -94,6 +94,37 @@ class ExpectedOpenMinutesTests(unittest.TestCase):
                 special_schedule=schedule,
             ), [])
 
+    def test_v2_schedule_proves_instrument_and_half_open_coverage(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "schedule-v2.json"
+            path.write_text(json.dumps({
+                "schema_version": "cme-special-session-schedule-v2",
+                "source_url": "https://www.cmegroup.com/trading-hours.html",
+                "retrieved_at": "2026-08-22T00:00:00Z",
+                "coverage_start_utc": "2026-01-01T00:00:00Z",
+                "coverage_end_utc": "2027-01-01T00:00:00Z",
+                "instrument_roots": ["MNQ"],
+                "source_documents": ["https://www.cmegroup.com/trading-hours.html"],
+                "closed_intervals": [{
+                    "start_utc": "2026-01-19T18:00:00Z",
+                    "end_utc": "2026-01-19T22:00:00Z",
+                    "reason": "Martin Luther King Jr. Day early close",
+                    "source_url": "https://www.cmegroup.com/trading-hours.html",
+                    "source_reference": "2026 CME Globex Trading Schedule",
+                }],
+            }), encoding="utf-8")
+            schedule = load_special_session_schedule(path)
+            self.assertTrue(schedule.is_auditable_for(
+                instrument_root="MNQ",
+                start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                end_utc=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            ))
+            self.assertFalse(schedule.is_auditable_for(
+                instrument_root="NQ",
+                start_utc=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                end_utc=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            ))
+
 
 if __name__ == "__main__":
     unittest.main()

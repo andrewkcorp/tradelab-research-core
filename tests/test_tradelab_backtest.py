@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 
 from tradelab.bar import Bar1m
 from tradelab.news import NewsEvent
+from tradelab.session_calendar import LEGACY_SPECIAL_SCHEDULE_SCHEMA_VERSION, SpecialSessionSchedule
 from tradelab.sl_targets import SLSourceType
 from tradelab.strategy_spec import LONG, SHORT, BiasPolicy, SLChoice, StrategySpec, TPChoice
 from tradelab.tp_targets import TPSourceType
@@ -921,6 +922,32 @@ class PhaseCallbackTests(unittest.TestCase):
             phase_callback=lambda phase, duration, peak_rss: observed.append(phase),
         )
         self.assertEqual(observed, _EXPECTED_PHASE_ORDER)
+
+    def test_special_schedule_is_retained_and_forwarded_to_every_aggregate(self):
+        schedule = SpecialSessionSchedule(
+            schema_version=LEGACY_SPECIAL_SCHEDULE_SCHEMA_VERSION,
+            source_url="https://www.cmegroup.com/trading-hours.html",
+            retrieved_at=datetime(2026, 8, 22, tzinfo=UTC),
+            closed_intervals=(),
+        )
+        with unittest.mock.patch.object(
+            backtest_module,
+            "aggregate_bars",
+            wraps=backtest_module.aggregate_bars,
+        ) as aggregate_mock:
+            context = prepare_backtest_context(
+                long_base_bars(),
+                [],
+                pivot_strength=PIVOT_STRENGTH,
+                reclaim_window_bars=RECLAIM_WINDOW_BARS,
+                special_schedule=schedule,
+            )
+
+        self.assertIs(context.special_session_schedule, schedule)
+        self.assertEqual(aggregate_mock.call_count, 5)
+        self.assertTrue(
+            all(call.kwargs["special_schedule"] is schedule for call in aggregate_mock.call_args_list)
+        )
 
     def test_phase_order_is_identical_across_repeated_calls(self):
         first_run: list[str] = []

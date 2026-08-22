@@ -184,6 +184,7 @@ from tradelab.liquidity import SUPPORTED_TIMEFRAMES as _LIQUIDITY_TIMEFRAMES
 from tradelab.liquidity_entry import SUPPORTED_TIMEFRAMES as _LIQUIDITY_ENTRY_TIMEFRAMES
 from tradelab.liquidity_entry import LiquidityEntryCandidateResult, detect_liquidity_entry_candidates
 from tradelab.news import NewsEvent, is_entry_blocked
+from tradelab.session_calendar import SpecialSessionSchedule
 from tradelab.session_liquidity import SUPPORTED_TIMEFRAMES as _SESSION_TIMEFRAMES
 from tradelab.session_liquidity import detect_session_liquidity
 from tradelab.sl_targets import SLSourceType, SLTargetCandidate, SelectedFVGConfluence, detect_sl_target_candidates
@@ -266,7 +267,7 @@ class PreparedBacktestContext:
     strategies as needed.
 
     ``bars_1m``/``news_events``/``tick_size``/``pivot_strength``/
-    ``reclaim_window_bars`` are the exact inputs this context was built
+    ``reclaim_window_bars``/``special_session_schedule`` are the exact inputs this context was built
     from -- kept here for audit/reproducibility, not recomputed from
     anything else. ``fvg_results``/``fvg_touch_results`` are keyed by
     every native FVG timeframe (fvg_touch_results only 1m/5m/15m,
@@ -322,6 +323,7 @@ class PreparedBacktestContext:
     data_wick_result: DataWickDetectionResult
     htf_bias_result: HTFBiasResult
     timeline: EntrySignalTimeline
+    special_session_schedule: SpecialSessionSchedule | None = None
 
 
 @dataclass(frozen=True)
@@ -366,6 +368,7 @@ def prepare_backtest_context(
     tick_size: float = DEFAULT_TICK_SIZE,
     pivot_strength: int,
     reclaim_window_bars: int,
+    special_schedule: SpecialSessionSchedule | None = None,
     phase_callback: Callable[[str, float, int | None], None] | None = None,
 ) -> PreparedBacktestContext:
     """Validate ``bars_1m`` and run every strategy-independent detector
@@ -378,6 +381,11 @@ def prepare_backtest_context(
     ``tradelab.session_liquidity`` already enforce, since both are meant
     to be swept by a future parameter grid) are passed straight through
     to every detector that needs them.
+
+    ``special_schedule`` is forwarded unchanged to both 1-minute gap
+    validation and every higher-timeframe aggregate. This guarantees an
+    official early close cannot pass artifact audit and then be silently
+    treated as missing data while constructing 5m/15m/1H/4H/1D candles.
 
     ``phase_callback``, if given, is called with ``(phase_name,
     duration_seconds, peak_rss_bytes)`` as each diagnostic phase
@@ -419,7 +427,7 @@ def prepare_backtest_context(
     bars_1m = tuple(bars_1m)
     news_events = tuple(news_events)
 
-    validate_bars(bars_1m)
+    validate_bars(bars_1m, special_schedule=special_schedule)
     candles: dict[str, list] = {"1m": [from_bar1m(b) for b in bars_1m]}
     _report("1m_validation_loading", validation_start)
 
@@ -428,7 +436,14 @@ def prepare_backtest_context(
     # aggregate_bars does not (and cannot) produce from itself.
     aggregation_start = time.perf_counter()
     for tf in _AGGREGATE_TIMEFRAMES:
-        candles[tf] = [from_aggregated_bar(b) for b in aggregate_bars(bars_1m, tf)]
+        candles[tf] = [
+            from_aggregated_bar(b)
+            for b in aggregate_bars(
+                bars_1m,
+                tf,
+                special_schedule=special_schedule,
+            )
+        ]
     _report("timeframe_aggregation", aggregation_start)
 
     fvg_results: dict[str, FVGDetectionResult] = {}
@@ -486,6 +501,7 @@ def prepare_backtest_context(
         tick_size=tick_size,
         pivot_strength=pivot_strength,
         reclaim_window_bars=reclaim_window_bars,
+        special_session_schedule=special_schedule,
         fvg_results=MappingProxyType(fvg_results),
         fvg_touch_results=MappingProxyType(touch_results),
         fvg_entry_result=fvg_entry_result,
@@ -506,6 +522,7 @@ def backtest_strategy(
     tick_size: float = DEFAULT_TICK_SIZE,
     pivot_strength: int,
     reclaim_window_bars: int,
+    special_schedule: SpecialSessionSchedule | None = None,
 ) -> BacktestResult:
     """Backtest exactly one ``StrategySpec`` against a 1-minute OHLCV
     series and a set of red-folder news events -- a thin convenience
@@ -516,7 +533,12 @@ def backtest_strategy(
     paying the detection cost more than once (see the module docstring).
     """
     context = prepare_backtest_context(
-        bars_1m, news_events, tick_size=tick_size, pivot_strength=pivot_strength, reclaim_window_bars=reclaim_window_bars
+        bars_1m,
+        news_events,
+        tick_size=tick_size,
+        pivot_strength=pivot_strength,
+        reclaim_window_bars=reclaim_window_bars,
+        special_schedule=special_schedule,
     )
     return backtest_prepared_strategy(strategy, context)
 
