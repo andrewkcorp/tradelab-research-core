@@ -97,7 +97,7 @@ class EntryTargetCache:
         self._max_entries = max_entries
         self._include_data_wick_targets = include_data_wick_targets
         self._tp: dict[str, TPTargetCandidateResult] = {}
-        self._sl: dict[tuple[str, str | None], SLTargetCandidateResult] = {}
+        self._sl: dict[tuple[str, str | None, int | None], SLTargetCandidateResult] = {}
         # One LRU order across both namespaces. Eviction is strictly a
         # performance/memory decision: a missing item is recomputed by the
         # same exact detector, never approximated.
@@ -145,13 +145,21 @@ class EntryTargetCache:
         session_results,
         *,
         liquidity_index: LiquidityTargetIndex | None = None,
+        max_fvg_targets: int | None = None,
     ) -> SLTargetCandidateResult:
-        key = (market_entry.entry_id, confluence_key)
+        key = (market_entry.entry_id, confluence_key, max_fvg_targets)
         cached = self._sl.get(key)
         if cached is not None:
             self._touch(("sl", key))
             return cached
-        result = detect_sl_target_candidates(market_entry, confluence, swing_equal_results, session_results, liquidity_index=liquidity_index)
+        result = detect_sl_target_candidates(
+            market_entry,
+            confluence,
+            swing_equal_results,
+            session_results,
+            liquidity_index=liquidity_index,
+            max_fvg_targets=max_fvg_targets,
+        )
         self._sl[key] = result
         self._touch(("sl", key))
         return result

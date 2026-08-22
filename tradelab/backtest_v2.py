@@ -247,7 +247,10 @@ DEFAULT_APEX_EOD_CONFIG = ApexEODConfig()
 # in accounting preserves small legacy/unit fixtures, but it is no longer
 # enumerated by the strategy generator or production CLI defaults.
 DEFAULT_INSTRUMENTS: tuple[Instrument, ...] = (Instrument.MNQ,)
-_PRODUCTION_TARGET_CACHE_MAX_ENTRIES = 100_000
+# This cache is an exact speed optimisation only: eviction recomputes a
+# candidate and never changes a fill.  Keep it bounded tightly enough that a
+# pathological dense 1m class cannot dominate the process footprint.
+_PRODUCTION_TARGET_CACHE_MAX_ENTRIES = 10_000
 
 
 # ---------------------------------------------------------------------------
@@ -515,13 +518,21 @@ def _resolve_sl_candidate(
     if not linked:
         return None
     confluence = SelectedFVGConfluence(entry_id=market_entry.entry_id, fvg_candidates=linked)
-    confluence_key = "|".join(
-        (variant.sl_fvg_timeframe, *(candidate.zone_id for candidate in linked))
-    )
+    # ``entry_id`` already uniquely fixes its linked FVG set.  Keeping every
+    # active zone id in the cache key made dense 1m entries allocate huge
+    # strings solely for memoisation; timeframe is the only remaining cache
+    # dimension for this one entry.
+    confluence_key = variant.sl_fvg_timeframe
     if entry_target_cache is not None:
-        result = entry_target_cache.sl_candidates(market_entry, confluence_key, confluence, swing_equal_results, session_results, liquidity_index=liquidity_target_index)
+        result = entry_target_cache.sl_candidates(
+            market_entry, confluence_key, confluence, swing_equal_results, session_results,
+            liquidity_index=liquidity_target_index, max_fvg_targets=1,
+        )
     else:
-        result = detect_sl_target_candidates(market_entry, confluence, swing_equal_results, session_results, liquidity_index=liquidity_target_index)
+        result = detect_sl_target_candidates(
+            market_entry, confluence, swing_equal_results, session_results,
+            liquidity_index=liquidity_target_index, max_fvg_targets=1,
+        )
     return result.fvg_targets[0] if result.fvg_targets else None
 
 

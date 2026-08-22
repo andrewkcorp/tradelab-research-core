@@ -219,6 +219,19 @@ class FVGBoundaryTimeframeAndLinkTests(unittest.TestCase):
         self.assertEqual(len(result.fvg_targets), 2)
         self.assertEqual({t.zone_id for t in result.fvg_targets}, {"5m-FVG-1", "15m-FVG-1"})
 
+    def test_limited_fvg_targets_keeps_the_same_nearest_stop(self):
+        e = entry(direction=LONG, entry_price=100.0)
+        candidates = tuple(
+            fvg_candidate(zone_id=f"5m-FVG-{index}", lower=99.0 - index, upper=100.0 - index)
+            for index in range(20)
+        )
+        full = detect_sl_target_candidates(e, selected("e1", *candidates), EMPTY_LIQ, {})
+        limited = detect_sl_target_candidates(
+            e, selected("e1", *candidates), EMPTY_LIQ, {}, max_fvg_targets=1,
+        )
+        self.assertEqual(len(limited.fvg_targets), 1)
+        self.assertEqual(limited.fvg_targets[0], full.fvg_targets[0])
+
     def test_ifvg_confluence_boundary_also_qualifies(self):
         e = entry(direction=LONG, entry_price=100.0)
         c = fvg_candidate(source_type=FVGSourceType.IFVG, direction=LONG, lower=95.0, upper=97.0)

@@ -172,6 +172,7 @@ def detect_sl_target_candidates(
     session_results: dict[str, LiquidityDetectionResult],
     *,
     liquidity_index: LiquidityTargetIndex | None = None,
+    max_fvg_targets: int | None = None,
 ) -> SLTargetCandidateResult:
     """Build the ordered SL target candidates for ``entry``.
 
@@ -186,8 +187,11 @@ def detect_sl_target_candidates(
             f"SelectedFVGConfluence.entry_id {selected_fvg.entry_id!r} does not match entry.entry_id {entry.entry_id!r}"
         )
 
+    if max_fvg_targets is not None and max_fvg_targets < 1:
+        raise ValueError("max_fvg_targets must be positive or None")
+
     liquidity_candidates = _liquidity_sl_candidates(entry, swing_equal_results, session_results, liquidity_index=liquidity_index)
-    fvg_candidates = _fvg_sl_candidates(entry, selected_fvg)
+    fvg_candidates = _fvg_sl_candidates(entry, selected_fvg, max_targets=max_fvg_targets)
 
     liquidity_candidates.sort(key=lambda c: (c.distance, c.known_at, c.sl_target_id))
     liquidity_candidates = liquidity_candidates[:MAX_LIQUIDITY_SL_TARGETS]
@@ -326,7 +330,22 @@ def _candidates_from_levels(
     return out
 
 
-def _fvg_sl_candidates(entry: MarketEntryContext, selected_fvg: SelectedFVGConfluence) -> list[SLTargetCandidate]:
+def _fvg_sl_candidates(
+    entry: MarketEntryContext,
+    selected_fvg: SelectedFVGConfluence,
+    *,
+    max_targets: int | None = None,
+) -> list[SLTargetCandidate]:
+    """Return valid FVG-boundary stops, optionally retaining only nearest.
+
+    Production always selects ``fvg_targets[0]``.  A dense 1m entry can be
+    linked to thousands of active zones, so materialising every candidate only
+    to retain index zero in a cache is a severe allocation bug.  With
+    ``max_targets=1`` this maintains the exact same deterministic minimum as
+    the historical ``sort(...)[0]`` path while retaining one object.
+    """
+    if max_targets is not None and max_targets < 1:
+        raise ValueError("max_targets must be positive or None")
     out: list[SLTargetCandidate] = []
     for candidate in selected_fvg.fvg_candidates:
         if isinstance(candidate, FVGEntryCandidate):
@@ -358,8 +377,7 @@ def _fvg_sl_candidates(entry: MarketEntryContext, selected_fvg: SelectedFVGConfl
         if entry.direction == SHORT and price <= entry.entry_price:
             continue
 
-        out.append(
-            SLTargetCandidate(
+        resolved = SLTargetCandidate(
                 sl_target_id=f"sl-fvg_boundary-{entry.entry_id}-{candidate.zone_id}",
                 entry_id=entry.entry_id,
                 source_type=SLSourceType.FVG_BOUNDARY,
@@ -379,5 +397,11 @@ def _fvg_sl_candidates(entry: MarketEntryContext, selected_fvg: SelectedFVGConfl
                 fvg_candidate_id=candidate_id,
                 fvg_timeframe=candidate.timeframe,
             )
-        )
+        if max_targets == 1:
+            if not out or (resolved.distance, resolved.known_at, resolved.sl_target_id) < (
+                out[0].distance, out[0].known_at, out[0].sl_target_id
+            ):
+                out[:] = [resolved]
+        else:
+            out.append(resolved)
     return out
