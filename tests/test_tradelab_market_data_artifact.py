@@ -54,6 +54,11 @@ DUPLICATE_TIMESTAMP_CSV = (
     "2024-01-02T14:30:00Z,100,101,99,100.5,10,NQ_CONTINUOUS\n"
 )
 
+OFF_TICK_CSV = (
+    "timestamp,open,high,low,close,volume,contract\n"
+    "2024-01-02T14:30:00Z,100,101,99,100.2,10,NQ_CONTINUOUS\n"
+)
+
 ROLL_MANIFEST = [
     {"outgoing_contract": "NQZ24", "incoming_contract": "NQH25", "effective_at": "2024-01-02T14:32:00Z", "adjustment_points": 50.0}
 ]
@@ -227,6 +232,23 @@ class DuplicateTimestampTests(unittest.TestCase):
             report = audit_market_data_artifact(artifact, bars, base_dir=tmp)
             self.assertTrue(report.has_critical_findings)
             self.assertIn("bar_series_invalid", [f.category for f in report.findings])
+
+
+class PriceGridArtifactTests(unittest.TestCase):
+    def test_off_tick_vendor_price_is_critical_and_blocks_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            csv_path = write(tmp, "bars.csv", OFF_TICK_CSV)
+            artifact = continuous_artifact(sha256_of(csv_path), coverage_end=T0.replace(minute=31))
+
+            with self.assertRaises(ValueError):
+                load_market_data_series(artifact, base_dir=tmp)
+
+            from tradelab.loaders import read_csv_bars
+
+            report = audit_market_data_artifact(artifact, read_csv_bars(csv_path), base_dir=tmp)
+            self.assertTrue(report.has_critical_findings)
+            self.assertIn("price_grid_invalid", [finding.category for finding in report.findings])
 
 
 class ReportDeterminismTests(unittest.TestCase):

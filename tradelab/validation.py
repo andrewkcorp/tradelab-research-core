@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import math
+from collections.abc import Sequence
 
 from tradelab.bar import Bar1m
 from tradelab.session_calendar import expected_open_minutes
@@ -50,7 +52,7 @@ class ValidationResult:
     gaps: tuple[MissingMinutesGap, ...]
 
 
-def validate_bars(bars: list[Bar1m]) -> ValidationResult:
+def validate_bars(bars: Sequence[Bar1m]) -> ValidationResult:
     """Validate a 1-minute bar series and build its missing-minutes registry.
 
     Raises ``ValueError`` on: out-of-order or duplicate timestamps, an
@@ -80,6 +82,26 @@ def validate_bars(bars: list[Bar1m]) -> ValidationResult:
         previous = bar
 
     return ValidationResult(gaps=tuple(gaps))
+
+
+def validate_price_grid(bars: Sequence[Bar1m], tick_size: float) -> None:
+    """Require every OHLC price to lie on the instrument tick grid.
+
+    This is a hard execution invariant, separate from missing-minute quality
+    reporting.  It catches malformed vendor/adjustment output before a
+    detector can create an untradeable fractional-tick entry, TP or SL.
+    """
+    if not math.isfinite(tick_size) or tick_size <= 0:
+        raise ValueError(f"tick_size must be finite and positive, got {tick_size!r}")
+    for index, bar in enumerate(bars):
+        for field in ("open", "high", "low", "close"):
+            price = getattr(bar, field)
+            ticks = price / tick_size
+            if not math.isclose(ticks, round(ticks), rel_tol=0.0, abs_tol=1e-8):
+                raise ValueError(
+                    f"Row {index}: {field} price {price!r} at {bar.timestamp} is not aligned "
+                    f"to tick_size={tick_size!r}"
+                )
 
 
 def _group_contiguous_runs(minutes: list[datetime]) -> list[MissingMinutesGap]:

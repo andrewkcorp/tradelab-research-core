@@ -90,12 +90,12 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 
-from tradelab.accounting import Instrument
+from tradelab.accounting import Instrument, instrument_tick_size
 from tradelab.bar import Bar1m
 from tradelab.continuous_futures import ContinuousSeriesResult, RollAdjustment, build_back_adjusted_continuous_series
 from tradelab.databento_parent_csv import read_databento_parent_csv
 from tradelab.loaders import _parse_timestamp, read_csv_bars, read_parquet_bars
-from tradelab.validation import MissingMinutesGap, validate_bars
+from tradelab.validation import MissingMinutesGap, validate_bars, validate_price_grid
 from tradelab.volume_roll_continuous import build_volume_front_month_continuous_series
 
 SCHEMA_VERSION = "1.0"
@@ -374,6 +374,11 @@ def audit_market_data_artifact(
     except ValueError as error:
         findings.append(AuditFinding(severity=AuditSeverity.CRITICAL, category="bar_series_invalid", message=str(error)))
         gaps = ()
+
+    try:
+        validate_price_grid(bars, instrument_tick_size(artifact.instrument_root))
+    except ValueError as error:
+        findings.append(AuditFinding(severity=AuditSeverity.CRITICAL, category="price_grid_invalid", message=str(error)))
 
     observed_start = bars[0].timestamp if bars else None
     observed_end = bars[-1].timestamp if bars else None

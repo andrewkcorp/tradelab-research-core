@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from tradelab.bar import Bar1m
-from tradelab.validation import validate_bars
+from tradelab.validation import validate_bars, validate_price_grid
 
 NY = ZoneInfo("America/New_York")
 CONTRACT = "NQZ25"
@@ -54,6 +54,17 @@ class HardInvariantTests(unittest.TestCase):
     def test_empty_series_is_valid(self):
         result = validate_bars([])
         self.assertEqual(result.gaps, ())
+
+    def test_mnq_tick_grid_accepts_quarter_point_ohlc(self):
+        validate_price_grid([bar(0, o=100.0, h=100.5, l=99.5, c=100.25)], 0.25)
+
+    def test_mnq_tick_grid_rejects_fractional_tick_price(self):
+        with self.assertRaisesRegex(ValueError, "not aligned"):
+            validate_price_grid([bar(0, c=100.2)], 0.25)
+
+    def test_invalid_tick_size_is_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_price_grid([bar(0)], 0.0)
 
 
 class MissingMinutesRegistryTests(unittest.TestCase):
