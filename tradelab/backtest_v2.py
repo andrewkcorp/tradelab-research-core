@@ -189,7 +189,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Mapping, Union
+from typing import Any, Callable, Iterable, Mapping, TypeVar, Union
 
 from tradelab.accounting import AccountBacktestResult, Instrument, RiskConfig, apply_accounting
 from tradelab.apex_eod import ApexEODAudit, ApexEODConfig, audit_apex_eod
@@ -238,6 +238,7 @@ from tradelab.tp_targets import MarketEntryContext, TPTargetCandidate, detect_tp
 
 _UTC = timezone.utc
 _DIRECTIONS = (LONG, SHORT)
+_BatchValue = TypeVar("_BatchValue")
 
 DEFAULT_RISK_CONFIG = RiskConfig()
 DEFAULT_EQUITY_CONFIG = EquityConfig()
@@ -1544,8 +1545,7 @@ def _to_leaderboard_entry(result: StrategyVariantResult, rank: int) -> Leaderboa
 # ---------------------------------------------------------------------------
 # Memory-bounded production orchestration: a durable summary row per
 # variant (every variant, no trade/equity detail) + a bounded top-N
-# tracker of full results (at most top_n_leaderboard at a time) -- see
-# module docstring's "Memory-bounded production orchestration" section.
+# tracker of dashboard entries (never full StrategyVariantResult objects).
 # ---------------------------------------------------------------------------
 
 
@@ -1673,28 +1673,33 @@ def _leaderboard_sort_key(result: StrategyVariantResult) -> tuple[float, float, 
 
 
 class _TopNTracker:
-    """A size-capped min-heap holding at most ``n`` full
-    ``StrategyVariantResult`` objects at any time -- the current top-N
-    by :func:`_leaderboard_sort_key`, regardless of how many total
-    variants are ever offered to it. Never grows past ``n`` entries;
-    everything that doesn't make the current cut is discarded
-    immediately, not merely deferred."""
+    """A size-capped min-heap holding dashboard entries, not full results.
+
+    A ``StrategyVariantResult`` retains its raw executed/accounted trade
+    objects and accounting audits.  Keeping the top 25 of those objects made
+    peak memory depend on the longest-running strategies.  The dashboard
+    needs only its serialisable view, so ``offer`` immediately projects a
+    result to ``LeaderboardEntry`` and releases the raw result to the caller.
+    This is an exact memory optimisation: ranking uses the same key and the
+    projected entry contains every field rendered by the dashboard.
+    """
 
     def __init__(self, n: int) -> None:
         if n < 1:
             raise ValueError(f"_TopNTracker size must be >= 1, got {n!r}")
         self._n = n
-        self._heap: list[tuple[float, float, str, StrategyVariantResult]] = []
+        self._heap: list[tuple[float, float, str, LeaderboardEntry]] = []
 
     def offer(self, result: StrategyVariantResult) -> None:
         key = _leaderboard_sort_key(result)
+        entry = _to_leaderboard_entry(result, rank=1)
         if len(self._heap) < self._n:
-            heapq.heappush(self._heap, (*key, result))
+            heapq.heappush(self._heap, (*key, entry))
         elif key > self._heap[0][:3]:
-            heapq.heappushpop(self._heap, (*key, result))
+            heapq.heappushpop(self._heap, (*key, entry))
         # else: not in the current top N -- discarded, never retained.
 
-    def top_results(self) -> list[StrategyVariantResult]:
+    def top_entries(self) -> list[LeaderboardEntry]:
         """Best-first (rank 1 first) -- an O(n log n) sort over at most
         ``n`` entries, never over the full population ever offered."""
         return [entry[-1] for entry in sorted(self._heap, key=lambda entry: entry[:3], reverse=True)]
@@ -1730,6 +1735,30 @@ _EARLY_PHASE_CHECKPOINT_RESUMABLE_NOTE = (
 )
 
 _LEADERBOARD_PUBLISH_INTERVAL_SECONDS = 30.0
+# A dense 1m entry class can produce many thousands of trades per exit
+# variant.  Executing all 15 TP/SL variants in one call retains every one of
+# those trade lists until accounting starts, which is what caused the 25GB
+# physical-memory peak in the real MNQ run.  A one-variant batch has exactly
+# the same fills and target choices (the shared bounded EntryTargetCache still
+# avoids re-discovering candidates), but releases each trade list immediately
+# after its summary is committed.  This is deliberately a memory bound, not a
+# sampling or strategy restriction.
+_PRODUCTION_EXIT_VARIANTS_PER_EXECUTION_BATCH = 1
+
+
+def _iter_execution_batches(
+    values: list[_BatchValue], *, max_batch_size: int = _PRODUCTION_EXIT_VARIANTS_PER_EXECUTION_BATCH
+) -> Iterable[list[_BatchValue]]:
+    """Yield contiguous, non-empty production execution batches.
+
+    Contiguity preserves deterministic variant/report ordering; batching is
+    only an allocation-lifetime optimisation.  A non-positive size is always
+    a programmer error rather than silently producing no simulations.
+    """
+    if max_batch_size < 1:
+        raise ValueError("max_batch_size must be >= 1")
+    for start in range(0, len(values), max_batch_size):
+        yield values[start : start + max_batch_size]
 
 
 def _leaderboard_entry_from_journal_summary(summary: JournalVariantSummary, rank: int = 1) -> LeaderboardEntry:
@@ -1761,7 +1790,7 @@ def _merged_leaderboard(durable_top_n: list[LeaderboardEntry], tracker: _TopNTra
     so concatenating both already-correct top-N lists, re-sorting by
     the identical ranking key, and truncating to ``n`` is exact, not an
     approximation."""
-    fresh = [_to_leaderboard_entry(r, 1) for r in tracker.top_results()]  # rank is a placeholder -- re-ranked below
+    fresh = tracker.top_entries()
     combined = list(durable_top_n) + fresh
     combined.sort(key=lambda e: (e.pnl, -e.max_drawdown, e.strategy_id), reverse=True)
     return [dataclasses.replace(e, rank=i) for i, e in enumerate(combined[:n], start=1)]
@@ -1926,42 +1955,43 @@ def _expand_and_simulate(
             )
         )
         direction = equivalence_class.representative_spec.primary.direction
-        executions_by_variant = simulate_market_execution_batched(
-            equivalence_class.observed_entries, direction,
-            tuple(variant for variant, _pending in pending_by_variant), context, equivalence_class.class_id,
-            on_bar_progress=bar_progress.maybe,
-            on_entry_progress=_entry_progress_callback(reporter, variant_id=lead_variant_id),
-            bar_range_index=bar_range_index, entry_target_cache=entry_target_cache,
-            liquidity_target_index=liquidity_target_index, news_blackout_index=news_blackout_index,
-        )
+        for variant_batch in _iter_execution_batches(pending_by_variant):
+            executions_by_variant = simulate_market_execution_batched(
+                equivalence_class.observed_entries, direction,
+                tuple(variant for variant, _pending in variant_batch), context, equivalence_class.class_id,
+                on_bar_progress=bar_progress.maybe,
+                on_entry_progress=_entry_progress_callback(reporter, variant_id=lead_variant_id),
+                bar_range_index=bar_range_index, entry_target_cache=entry_target_cache,
+                liquidity_target_index=liquidity_target_index, news_blackout_index=news_blackout_index,
+            )
 
-        for variant, pending_instruments in pending_by_variant:
-            trades, skipped = executions_by_variant[variant.variant_id]
-            for instrument in pending_instruments:
-                result = _build_variant_result_for_instrument(
-                    equivalence_class, variant, instrument, trades, skipped,
-                    risk_config=risk_config, equity_config=equity_config, bars_1m=context.bars_1m,
-                    audit_bar_range_index=bar_range_index,
-                )
-                row = VariantSummaryRow.from_result(
-                    result, min_completed_trades_per_year=min_completed_trades_per_year,
-                )
-                journal.commit_summary(row.to_dict())  # durable, authoritative -- BEFORE anything below reports it as done
-                append_jsonl(summary_path, row.to_dict())  # plain-text export/audit mirror only, never read back for resume
-                if row.research_eligible:
-                    top_n.offer(result)
-                completed += 1
-                if completed % checkpoint_every == 0 or completed == total_variant_runs:
-                    reporter.progress(items_completed=completed, backtests_completed=completed)
-                    reporter.record_resource_usage()
-                    reporter.checkpoint_written(
-                        cursor={"stage": "simulating_backtests", "completed": completed, "total": total_variant_runs},
-                        resumable=True, resumable_note=_CHECKPOINT_RESUMABLE_NOTE,
+            for variant, pending_instruments in variant_batch:
+                trades, skipped = executions_by_variant[variant.variant_id]
+                for instrument in pending_instruments:
+                    result = _build_variant_result_for_instrument(
+                        equivalence_class, variant, instrument, trades, skipped,
+                        risk_config=risk_config, equity_config=equity_config, bars_1m=context.bars_1m,
+                        audit_bar_range_index=bar_range_index,
                     )
-                    now = time.monotonic()
-                    if completed == total_variant_runs or now - last_leaderboard_publish_at >= _LEADERBOARD_PUBLISH_INTERVAL_SECONDS:
-                        reporter.update_leaderboard(_merged_leaderboard(durable_top_n, top_n, top_n_leaderboard))
-                        last_leaderboard_publish_at = now
+                    row = VariantSummaryRow.from_result(
+                        result, min_completed_trades_per_year=min_completed_trades_per_year,
+                    )
+                    journal.commit_summary(row.to_dict())  # durable, authoritative -- BEFORE anything below reports it as done
+                    append_jsonl(summary_path, row.to_dict())  # plain-text export/audit mirror only, never read back for resume
+                    if row.research_eligible:
+                        top_n.offer(result)
+                    completed += 1
+                    if completed % checkpoint_every == 0 or completed == total_variant_runs:
+                        reporter.progress(items_completed=completed, backtests_completed=completed)
+                        reporter.record_resource_usage()
+                        reporter.checkpoint_written(
+                            cursor={"stage": "simulating_backtests", "completed": completed, "total": total_variant_runs},
+                            resumable=True, resumable_note=_CHECKPOINT_RESUMABLE_NOTE,
+                        )
+                        now = time.monotonic()
+                        if completed == total_variant_runs or now - last_leaderboard_publish_at >= _LEADERBOARD_PUBLISH_INTERVAL_SECONDS:
+                            reporter.update_leaderboard(_merged_leaderboard(durable_top_n, top_n, top_n_leaderboard))
+                            last_leaderboard_publish_at = now
 
     # A ``both`` class is deliberately simulated through one position state,
     # not assembled from two separately profitable directional curves.  It
@@ -2004,44 +2034,45 @@ def _expand_and_simulate(
             merged_entries, conflicts = merge_both_direction_entries(
                 equivalence_class.long_entries, equivalence_class.short_entries, compact_skip_counts=True,
             )
-            executions_by_variant = simulate_market_execution_batched(
-                merged_entries, "both", tuple(variant for variant, _pending in pending_by_variant),
-                context, equivalence_class.class_id,
-                on_bar_progress=bar_progress.maybe,
-                on_entry_progress=_entry_progress_callback(reporter, variant_id=lead_variant_id),
-                bar_range_index=bar_range_index, entry_target_cache=both_target_cache,
-                liquidity_target_index=liquidity_target_index, news_blackout_index=news_blackout_index,
-                compact_skip_counts=True,
-            )
+            for variant_batch in _iter_execution_batches(pending_by_variant):
+                executions_by_variant = simulate_market_execution_batched(
+                    merged_entries, "both", tuple(variant for variant, _pending in variant_batch),
+                    context, equivalence_class.class_id,
+                    on_bar_progress=bar_progress.maybe,
+                    on_entry_progress=_entry_progress_callback(reporter, variant_id=lead_variant_id),
+                    bar_range_index=bar_range_index, entry_target_cache=both_target_cache,
+                    liquidity_target_index=liquidity_target_index, news_blackout_index=news_blackout_index,
+                    compact_skip_counts=True,
+                )
 
-            for variant, pending_instruments in pending_by_variant:
-                trades, variant_skipped = executions_by_variant[variant.variant_id]
-                skipped = _merge_skip_audits(conflicts, variant_skipped)
-                for instrument in pending_instruments:
-                    result = _build_both_variant_result_for_instrument(
-                        equivalence_class, variant, instrument, trades, skipped, context,
-                        risk_config=risk_config, equity_config=equity_config,
-                        audit_bar_range_index=bar_range_index,
-                    )
-                    row = VariantSummaryRow.from_result(
-                        result, min_completed_trades_per_year=min_completed_trades_per_year,
-                    )
-                    journal.commit_summary(row.to_dict())
-                    append_jsonl(summary_path, row.to_dict())
-                    if row.research_eligible:
-                        top_n.offer(result)
-                    completed += 1
-                    if completed % checkpoint_every == 0 or completed == total_variant_runs:
-                        reporter.progress(items_completed=completed, backtests_completed=completed)
-                        reporter.record_resource_usage()
-                        reporter.checkpoint_written(
-                            cursor={"stage": "simulating_backtests", "completed": completed, "total": total_variant_runs},
-                            resumable=True, resumable_note=_CHECKPOINT_RESUMABLE_NOTE,
+                for variant, pending_instruments in variant_batch:
+                    trades, variant_skipped = executions_by_variant[variant.variant_id]
+                    skipped = _merge_skip_audits(conflicts, variant_skipped)
+                    for instrument in pending_instruments:
+                        result = _build_both_variant_result_for_instrument(
+                            equivalence_class, variant, instrument, trades, skipped, context,
+                            risk_config=risk_config, equity_config=equity_config,
+                            audit_bar_range_index=bar_range_index,
                         )
-                        now = time.monotonic()
-                        if completed == total_variant_runs or now - last_leaderboard_publish_at >= _LEADERBOARD_PUBLISH_INTERVAL_SECONDS:
-                            reporter.update_leaderboard(_merged_leaderboard(durable_top_n, top_n, top_n_leaderboard))
-                            last_leaderboard_publish_at = now
+                        row = VariantSummaryRow.from_result(
+                            result, min_completed_trades_per_year=min_completed_trades_per_year,
+                        )
+                        journal.commit_summary(row.to_dict())
+                        append_jsonl(summary_path, row.to_dict())
+                        if row.research_eligible:
+                            top_n.offer(result)
+                        completed += 1
+                        if completed % checkpoint_every == 0 or completed == total_variant_runs:
+                            reporter.progress(items_completed=completed, backtests_completed=completed)
+                            reporter.record_resource_usage()
+                            reporter.checkpoint_written(
+                                cursor={"stage": "simulating_backtests", "completed": completed, "total": total_variant_runs},
+                                resumable=True, resumable_note=_CHECKPOINT_RESUMABLE_NOTE,
+                            )
+                            now = time.monotonic()
+                            if completed == total_variant_runs or now - last_leaderboard_publish_at >= _LEADERBOARD_PUBLISH_INTERVAL_SECONDS:
+                                reporter.update_leaderboard(_merged_leaderboard(durable_top_n, top_n, top_n_leaderboard))
+                                last_leaderboard_publish_at = now
 
     reporter.phase_started(RunPhase.RANKING_RESULTS, items_total=1)
     final_leaderboard = _merged_leaderboard(durable_top_n, top_n, top_n_leaderboard)

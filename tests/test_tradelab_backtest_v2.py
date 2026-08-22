@@ -244,7 +244,10 @@ class BothDirectionEntryMergeTests(unittest.TestCase):
             journal.close()
 
         self.assertEqual(completed, len(variants))
-        self.assertEqual(calls, [tuple(variant.variant_id for variant in variants)])
+        # Dense production classes are deliberately memory-bounded to one
+        # exit variant per execution pass.  Together, the calls must still
+        # cover every requested variant exactly once and in input order.
+        self.assertEqual(calls, [(variant.variant_id,) for variant in variants])
 
 
 def _write_smoke_market_artifact(tmp: Path) -> tuple[Path, Path]:
@@ -909,7 +912,7 @@ class TopNTrackerTests(unittest.TestCase):
         tracker = _TopNTracker(5)
         for r in results:
             tracker.offer(r)
-        actual = [r.strategy_variant_id for r in tracker.top_results()]
+        actual = [r.strategy_id for r in tracker.top_entries()]
         expected = [r.strategy_variant_id for r in sorted(results, key=_leaderboard_sort_key, reverse=True)[:5]]
         self.assertEqual(actual, expected)
 
@@ -922,10 +925,10 @@ class TopNTrackerTests(unittest.TestCase):
         tracker.offer(self._make_result("s-low-dd", net_pnl_usd=100.0, max_drawdown_usd=100.0))
         tracker.offer(self._make_result("s-tied-b", net_pnl_usd=100.0, max_drawdown_usd=100.0))
         tracker.offer(self._make_result("s-tied-a", net_pnl_usd=100.0, max_drawdown_usd=100.0))
-        top = tracker.top_results()
+        top = tracker.top_entries()
         self.assertEqual(len(top), 2)
-        self.assertEqual(top[0].strategy_variant_id, "s-tied-b")  # "s-tied-b" > "s-tied-a" lexicographically
-        self.assertEqual(top[1].strategy_variant_id, "s-tied-a")
+        self.assertEqual(top[0].strategy_id, "s-tied-b")  # "s-tied-b" > "s-tied-a" lexicographically
+        self.assertEqual(top[1].strategy_id, "s-tied-a")
 
     def test_rejects_non_positive_size(self):
         with self.assertRaises(ValueError):
@@ -2471,6 +2474,33 @@ class BatchedExitVariantExecutionTests(unittest.TestCase):
             self.assertEqual(set(actual), {variant.variant_id for variant in ALL_EXIT_VARIANTS})
             for variant in ALL_EXIT_VARIANTS:
                 self.assertEqual(actual[variant.variant_id], expected[variant.variant_id], msg=variant.variant_id)
+
+    def test_single_variant_execution_batches_match_one_large_batch(self):
+        """The production memory bound may split a dense class into one
+        exit variant at a time.  It must be observationally identical to
+        the original all-variants-in-one-call optimisation."""
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result,
+            context.htf_bias_result, min_entries_per_year=1,
+        )
+        equivalence_class = universe.equivalence_classes[0]
+        index = BarRangeIndex.build(context.bars_1m)
+        direction = equivalence_class.representative_spec.primary.direction
+        expected = simulate_market_execution_batched(
+            equivalence_class.observed_entries, direction, ALL_EXIT_VARIANTS,
+            context, equivalence_class.class_id, bar_range_index=index,
+            entry_target_cache=EntryTargetCache(),
+        )
+        actual = {}
+        cache = EntryTargetCache()
+        for variant in ALL_EXIT_VARIANTS:
+            actual.update(simulate_market_execution_batched(
+                equivalence_class.observed_entries, direction, (variant,),
+                context, equivalence_class.class_id, bar_range_index=index,
+                entry_target_cache=cache,
+            ))
+        self.assertEqual(actual, expected)
 
     def test_skipping_data_wick_candidate_materialization_preserves_liquidity_only_results(self):
         """A run which cannot select a data-wick TP must get precisely the
