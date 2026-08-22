@@ -13,6 +13,7 @@ from tradelab.liquidity import (
     LiquidityType,
     ReclaimOutcome,
     detect_liquidity,
+    liquidity_levels_at,
 )
 
 T0 = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)
@@ -161,6 +162,30 @@ class EqualHighsLowsTests(unittest.TestCase):
         clusters = [lv for lv in result.levels if lv.liquidity_type == LiquidityType.EQUAL_HIGHS]
         self.assertEqual(len(clusters), 1)  # still exactly one level, not a second one
         self.assertEqual(clusters[0].member_count, 3)
+
+    def test_cluster_geometry_history_is_causal(self):
+        candles = two_swing_highs(0.2) + [
+            candle(6, 99.7, 99.75, 99.3, 99.5),
+            candle(7, 99.6, 99.85, 99.4, 99.7),
+            candle(8, 99.6, 99.7, 99.4, 99.5),
+        ]
+        result = detect_liquidity(candles, "1m", pivot_strength=1, reclaim_window_bars=3, tick_size=TICK)
+        before_third = liquidity_levels_at(result, candles[5].known_at)
+        after_third = liquidity_levels_at(result, candles[8].known_at)
+        early_cluster = next(level for level in before_third if level.liquidity_type == LiquidityType.EQUAL_HIGHS)
+        late_cluster = next(level for level in after_third if level.liquidity_type == LiquidityType.EQUAL_HIGHS)
+        self.assertEqual(early_cluster.member_count, 2)
+        self.assertEqual(late_cluster.member_count, 3)
+        self.assertEqual(early_cluster.lower, 99.8)
+        self.assertEqual(late_cluster.lower, 99.8)
+
+    def test_standalone_swing_is_visible_before_later_absorption(self):
+        result = detect_liquidity(two_swing_highs(0.2), "1m", pivot_strength=1, reclaim_window_bars=3, tick_size=TICK)
+        first_formed_at = min(revision.effective_at for revision in result.level_revisions)
+        early = liquidity_levels_at(result, first_formed_at)
+        self.assertEqual(sum(level.status == LiquidityStatus.ACTIVE for level in early), 1)
+        late = liquidity_levels_at(result, max(revision.effective_at for revision in result.level_revisions))
+        self.assertTrue(any(level.status == LiquidityStatus.ABSORBED_IN_EQUAL_CLUSTER for level in late))
 
     def test_cluster_known_at_is_the_second_swings_confirmation_not_the_first(self):
         candles = two_swing_highs(0.2)

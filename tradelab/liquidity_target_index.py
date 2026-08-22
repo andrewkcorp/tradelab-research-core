@@ -18,11 +18,19 @@ from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityLev
 
 
 @dataclass(frozen=True)
+class _IndexedLevel:
+    price: float
+    level: LiquidityLevel
+    effective_from: datetime
+    effective_until: datetime | None
+
+
+@dataclass(frozen=True)
 class LiquidityTargetIndex:
     _high_prices: tuple[float, ...]
-    _high_levels: tuple[LiquidityLevel, ...]
+    _high_levels: tuple[_IndexedLevel, ...]
     _low_prices: tuple[float, ...]
-    _low_levels: tuple[LiquidityLevel, ...]
+    _low_levels: tuple[_IndexedLevel, ...]
 
     @classmethod
     def build(
@@ -30,7 +38,7 @@ class LiquidityTargetIndex:
         swing_equal_results: Mapping[str, LiquidityDetectionResult],
         session_results: Mapping[str, LiquidityDetectionResult],
     ) -> "LiquidityTargetIndex":
-        by_side: dict[str, list[tuple[float, LiquidityLevel]]] = {HIGH: [], LOW: []}
+        by_side: dict[str, list[_IndexedLevel]] = {HIGH: [], LOW: []}
         seen: set[str] = set()
         for results in (swing_equal_results, session_results):
             for timeframe, result in results.items():
@@ -42,18 +50,30 @@ class LiquidityTargetIndex:
                     seen.add(level.level_id)
                     if level.status == LiquidityStatus.TAKEN and (level.taken_at is None or level.taken_at <= level.formed_at):
                         raise ValueError(f"LiquidityLevel {level.level_id!r} has invalid taken_at")
-                    price = level.upper if level.side == HIGH else level.lower
-                    if price <= 0:
-                        raise ValueError(f"LiquidityLevel {level.level_id!r} has non-positive target price {price!r}")
-                    by_side[level.side].append((price, level))
-        high = sorted(by_side[HIGH], key=lambda item: (item[0], item[1].formed_at, item[1].level_id))
-        low = sorted(by_side[LOW], key=lambda item: (item[0], item[1].formed_at, item[1].level_id))
-        return cls(tuple(p for p, _ in high), tuple(level for _, level in high), tuple(p for p, _ in low), tuple(level for _, level in low))
+
+                revisions_by_id: dict[str, list[tuple[datetime, LiquidityLevel]]] = {}
+                for revision in result.level_revisions:
+                    revisions_by_id.setdefault(revision.level.level_id, []).append((revision.effective_at, revision.level))
+                for level in result.levels:
+                    revisions = revisions_by_id.get(level.level_id, [(level.formed_at, level)])
+                    revisions.sort(key=lambda item: item[0])
+                    for index, (effective_from, version) in enumerate(revisions):
+                        price = version.upper if version.side == HIGH else version.lower
+                        if price <= 0:
+                            raise ValueError(f"LiquidityLevel {version.level_id!r} has non-positive target price {price!r}")
+                        effective_until = revisions[index + 1][0] if index + 1 < len(revisions) else None
+                        by_side[version.side].append(_IndexedLevel(price, version, effective_from, effective_until))
+        high = sorted(by_side[HIGH], key=lambda item: (item.price, item.effective_from, item.level.level_id))
+        low = sorted(by_side[LOW], key=lambda item: (item.price, item.effective_from, item.level.level_id))
+        return cls(tuple(item.price for item in high), tuple(high), tuple(item.price for item in low), tuple(low))
 
     @staticmethod
-    def _eligible(level: LiquidityLevel, known_at: datetime) -> bool:
+    def _eligible(indexed: _IndexedLevel, known_at: datetime) -> bool:
+        level = indexed.level
         return (
-            level.status != LiquidityStatus.ABSORBED_IN_EQUAL_CLUSTER
+            indexed.effective_from <= known_at
+            and (indexed.effective_until is None or known_at < indexed.effective_until)
+            and level.status != LiquidityStatus.ABSORBED_IN_EQUAL_CLUSTER
             and level.formed_at <= known_at
             and not (level.status == LiquidityStatus.TAKEN and level.taken_at <= known_at)
         )
@@ -77,7 +97,7 @@ class LiquidityTargetIndex:
                 while index >= 0 and prices[index] == price:
                     index -= 1
                 group = levels[index + 1:start + 1]
-            found.extend(level for level in group if self._eligible(level, entry_known_at))
+            found.extend(indexed.level for indexed in group if self._eligible(indexed, entry_known_at))
             if len(found) >= count:
                 break  # all later groups have strictly larger distance
         return tuple(sorted(found, key=lambda level: (abs((level.upper if side == HIGH else level.lower) - entry_price), level.formed_at, level.level_id))[:count])

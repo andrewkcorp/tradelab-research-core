@@ -179,10 +179,41 @@ class ReclaimResult:
 
 
 @dataclass(frozen=True)
+class LiquidityLevelRevision:
+    """One causally knowable version of a liquidity level.
+
+    Equal clusters can gain members and standalone swings can later be
+    absorbed or taken.  Keeping only the final ``LiquidityLevel`` leaks that
+    later geometry/state into entries that happened earlier. ``effective_at``
+    is the first instant at which this exact version was knowable.
+    """
+
+    effective_at: datetime
+    level: LiquidityLevel
+
+
+@dataclass(frozen=True)
 class LiquidityDetectionResult:
     levels: list[LiquidityLevel]
     takes: list[LiquidityTakeEvent]
     reclaims: list[ReclaimResult]
+    level_revisions: tuple[LiquidityLevelRevision, ...] = ()
+
+
+def liquidity_levels_at(result: LiquidityDetectionResult, known_at: datetime) -> tuple[LiquidityLevel, ...]:
+    """Return the latest version of every level knowable at ``known_at``.
+
+    Hand-built legacy fixtures without revisions retain their historical
+    behavior. Detector-produced results always include revisions.
+    """
+    if not result.level_revisions:
+        return tuple(level for level in result.levels if level.formed_at <= known_at)
+    latest: dict[str, LiquidityLevel] = {}
+    for revision in result.level_revisions:
+        if revision.effective_at > known_at:
+            break
+        latest[revision.level.level_id] = revision.level
+    return tuple(sorted(latest.values(), key=lambda level: (level.formed_at, level.level_id)))
 
 
 @dataclass
@@ -236,6 +267,7 @@ def detect_liquidity(
     reclaim_watches: list[_ReclaimWatch] = []
 
     all_levels: dict[str, LiquidityLevel] = {}
+    level_revisions: list[LiquidityLevelRevision] = []
     takes: list[LiquidityTakeEvent] = []
     reclaims: list[ReclaimResult] = []
     next_number = 1
@@ -291,6 +323,7 @@ def detect_liquidity(
                 takes.append(take_event)
                 taken_level = replace(level, status=LiquidityStatus.TAKEN, taken_at=candle.known_at)
                 all_levels[level_id] = taken_level
+                level_revisions.append(LiquidityLevelRevision(candle.known_at, taken_level))
                 del active_levels[level_id]
                 newly_taken_watches.append(_ReclaimWatch(level=taken_level, take_event=take_event))
                 # A taken cluster is consumed: it must stop absorbing new
@@ -339,6 +372,7 @@ def detect_liquidity(
                 )
                 active_levels[level_id] = swing_level
                 all_levels[level_id] = swing_level
+                level_revisions.append(LiquidityLevelRevision(swing_level.formed_at, swing_level))
 
                 # This swing may immediately become an equal-highs/lows
                 # cluster member; if so, it stops being independently
@@ -353,6 +387,7 @@ def detect_liquidity(
                     unclustered=unclustered[side],
                     active_levels=active_levels,
                     all_levels=all_levels,
+                    level_revisions=level_revisions,
                     next_number=next_number,
                 )
 
@@ -370,7 +405,12 @@ def detect_liquidity(
         )
 
     ordered_levels = sorted(all_levels.values(), key=lambda lv: (lv.formed_at, lv.level_id))
-    return LiquidityDetectionResult(levels=ordered_levels, takes=takes, reclaims=reclaims)
+    return LiquidityDetectionResult(
+        levels=ordered_levels,
+        takes=takes,
+        reclaims=reclaims,
+        level_revisions=tuple(sorted(level_revisions, key=lambda revision: (revision.effective_at, revision.level.level_id))),
+    )
 
 
 def _is_swing_high(candles: list[Candle], pivot_index: int, pivot_strength: int) -> bool:
@@ -427,6 +467,8 @@ def _absorb_into_cluster(
     absorbed_by_level_id: str,
     active_levels: dict[str, LiquidityLevel],
     all_levels: dict[str, LiquidityLevel],
+    level_revisions: list[LiquidityLevelRevision],
+    effective_at: datetime,
 ) -> None:
     """A swing that has just become an equal-highs/lows cluster member
     stops being independently active: it can no longer be taken, and it
@@ -440,6 +482,7 @@ def _absorb_into_cluster(
         absorbed_by_level_id=absorbed_by_level_id,
     )
     all_levels[level_id] = absorbed_level
+    level_revisions.append(LiquidityLevelRevision(effective_at, absorbed_level))
 
 
 def _join_or_form_cluster(
@@ -453,6 +496,7 @@ def _join_or_form_cluster(
     unclustered: list[LiquidityLevel],
     active_levels: dict[str, LiquidityLevel],
     all_levels: dict[str, LiquidityLevel],
+    level_revisions: list[LiquidityLevelRevision],
     next_number: int,
 ) -> int:
     """Try to join ``swing_level`` into an existing (still-ACTIVE) cluster,
@@ -486,7 +530,11 @@ def _join_or_form_cluster(
             cluster.level = updated_level
             active_levels[updated_level.level_id] = updated_level
             all_levels[updated_level.level_id] = updated_level
-            _absorb_into_cluster(swing_level.level_id, updated_level.level_id, active_levels, all_levels)
+            level_revisions.append(LiquidityLevelRevision(formed_at, updated_level))
+            _absorb_into_cluster(
+                swing_level.level_id, updated_level.level_id, active_levels, all_levels,
+                level_revisions, formed_at,
+            )
             return next_number
 
     for lone_index, lone in enumerate(unclustered):
@@ -513,6 +561,7 @@ def _join_or_form_cluster(
             )
             active_levels[level_id] = cluster_level
             all_levels[level_id] = cluster_level
+            level_revisions.append(LiquidityLevelRevision(formed_at, cluster_level))
             open_clusters.append(
                 _OpenCluster(
                     lower=new_lower,
@@ -523,8 +572,8 @@ def _join_or_form_cluster(
                     level=cluster_level,
                 )
             )
-            _absorb_into_cluster(lone.level_id, level_id, active_levels, all_levels)
-            _absorb_into_cluster(swing_level.level_id, level_id, active_levels, all_levels)
+            _absorb_into_cluster(lone.level_id, level_id, active_levels, all_levels, level_revisions, formed_at)
+            _absorb_into_cluster(swing_level.level_id, level_id, active_levels, all_levels, level_revisions, formed_at)
             return next_number
 
     # No match: this swing remains a standalone ACTIVE level and becomes

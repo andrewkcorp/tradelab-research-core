@@ -85,7 +85,7 @@ from enum import Enum
 from tradelab.fvg_entry import FVGEntryCandidate
 from tradelab.fvg_entry import SourceType as FVGSourceType
 from tradelab.fvg import FVGZone
-from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityStatus, LiquidityType
+from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityStatus, LiquidityType, liquidity_levels_at
 from tradelab.liquidity import SUPPORTED_TIMEFRAMES as _SWING_EQUAL_TIMEFRAMES
 from tradelab.session_liquidity import SUPPORTED_TIMEFRAMES as _SESSION_TIMEFRAMES
 from tradelab.tp_targets import LONG, SHORT  # noqa: F401  (re-exported)
@@ -264,7 +264,7 @@ def _candidates_from_levels(
 
     seen_level_ids: set[str] = set()
     out: list[SLTargetCandidate] = []
-    for level in result.levels:
+    for level in liquidity_levels_at(result, entry.entry_known_at):
         if level.timeframe != timeframe:
             raise ValueError(f"LiquidityLevel {level.level_id!r} has timeframe {level.timeframe!r}, expected {timeframe!r}")
         family = _liquidity_source_family(level.liquidity_type)

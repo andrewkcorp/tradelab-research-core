@@ -12,7 +12,8 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from tradelab.data_wicks import DataWickDetectionResult, DataWickDirection, DataWickEvent
-from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityLevel, LiquidityStatus, LiquidityType
+from tradelab.fvg import Candle
+from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityLevel, LiquidityStatus, LiquidityType, detect_liquidity
 from tradelab.tp_targets import (
     LONG,
     SHORT,
@@ -95,6 +96,18 @@ EMPTY_WICKS = wick_result()
 
 
 class LongShortSymmetryTests(unittest.TestCase):
+    def test_standalone_target_is_not_hidden_by_future_absorption(self):
+        def bar(offset, high):
+            ts = T0 + timedelta(minutes=offset)
+            return Candle(ts, 99.5, high, 99.0, 99.5, ts + timedelta(minutes=1))
+        candles = [bar(0, 99.6), bar(1, 100.0), bar(2, 99.6), bar(3, 99.6), bar(4, 99.75), bar(5, 99.6)]
+        detected = detect_liquidity(candles, "1m", pivot_strength=1, reclaim_window_bars=3, tick_size=0.25)
+        early = detect_tp_target_candidates(
+            entry(entry_price=90.0, entry_known_at=candles[2].known_at), {"1m": detected}, {}, EMPTY_WICKS
+        )
+        self.assertTrue(any(target.liquidity_type == LiquidityType.SWING_HIGH and target.price == 100.0
+                            for target in early.liquidity_targets))
+
     def test_long_liquidity_tp_is_a_high_above_entry(self):
         e = entry(direction=LONG, entry_price=100.0)
         lvl = level(side=HIGH, price=105.0)

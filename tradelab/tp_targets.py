@@ -67,7 +67,9 @@ from datetime import datetime, timezone
 from enum import Enum
 
 from tradelab.data_wicks import DataWickDetectionResult, DataWickDirection, DataWickEvent
-from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityLevel, LiquidityStatus, LiquidityType
+from tradelab.liquidity import (
+    HIGH, LOW, LiquidityDetectionResult, LiquidityLevel, LiquidityStatus, LiquidityType, liquidity_levels_at,
+)
 from tradelab.liquidity import SUPPORTED_TIMEFRAMES as _SWING_EQUAL_TIMEFRAMES
 from tradelab.session_liquidity import SUPPORTED_TIMEFRAMES as _SESSION_TIMEFRAMES
 from tradelab.liquidity_target_index import LiquidityTargetIndex
@@ -270,7 +272,7 @@ def _candidates_from_levels(
 
     seen_level_ids: set[str] = set()
     out: list[TPTargetCandidate] = []
-    for level in result.levels:
+    for level in liquidity_levels_at(result, entry.entry_known_at):
         if level.timeframe != timeframe:
             raise ValueError(f"LiquidityLevel {level.level_id!r} has timeframe {level.timeframe!r}, expected {timeframe!r}")
         family = _liquidity_source_family(level.liquidity_type)
