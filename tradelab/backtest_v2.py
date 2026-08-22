@@ -1131,6 +1131,24 @@ class StrategyVariantResult:
     ambiguous_same_bar_exit_count: int = 0
 
 
+def _complete_2000_loss_limits(
+    realised_max_drawdown_usd: float,
+    mark_to_market_audit: AccountMarkToMarketAudit | None,
+) -> int:
+    """Complete $2k loss limits contained in the worst observed drawdown.
+
+    This is audit/reporting only. It never blocks a fill or changes the
+    strategy path. The old implementation counted threshold-entry episodes,
+    which made a $180k collapse look like one event; the requested semantic
+    is floor(worst realised/MTM drawdown / $2,000).
+    """
+    mtm_drawdown = (
+        mark_to_market_audit.max_mark_to_market_drawdown_usd
+        if mark_to_market_audit is not None else 0.0
+    )
+    return int(max(0.0, realised_max_drawdown_usd, mtm_drawdown) // 2_000.0)
+
+
 def _ambiguous_same_bar_exit_count(
     trades: list[ExecutedTrade] | tuple[ExecutedTrade, ...],
     bars_1m: tuple[Bar1m, ...] | list[Bar1m],
@@ -1328,7 +1346,8 @@ def _build_variant_result_for_instrument(
         instrument=instrument, direction=direction, trades=tuple(trades), account_result=account_result, equity_result=equity_result,
         net_pnl_usd=equity_result.net_cash_pnl_usd, roi=(equity_result.net_cash_pnl_usd / equity_config.initial_balance_usd),
         win_rate=_win_rate(account_result), trade_count=len(account_result.accounted_trades),
-        max_drawdown_usd=equity_result.max_drawdown_usd, drawdowns_over_2000_count=equity_result.drawdown_over_threshold_episode_count,
+        max_drawdown_usd=equity_result.max_drawdown_usd,
+        drawdowns_over_2000_count=_complete_2000_loss_limits(equity_result.max_drawdown_usd, mark_to_market_audit),
         skipped_entries_by_reason=skipped_by_reason, yearly=yearly, monthly=monthly, apex_eod_audit=apex_eod_audit,
         mark_to_market_audit=mark_to_market_audit,
         ambiguous_same_bar_exit_count=(
@@ -1430,6 +1449,11 @@ def _build_both_variant_result_for_instrument(
     )
     account_result = apply_accounting(backtest_result, instrument, risk_config)
     equity_result = build_equity_curve(account_result, equity_config)
+    mark_to_market_audit = audit_account_mark_to_market(
+        trades, account_result, context.bars_1m,
+        initial_balance_usd=equity_config.initial_balance_usd,
+        bar_range_index=audit_bar_range_index,
+    )
     skipped_by_reason = _merge_skip_audits(skipped)
     for untradeable in account_result.untradeable_trades:
         skipped_by_reason[untradeable.reason.value] = skipped_by_reason.get(untradeable.reason.value, 0) + 1
@@ -1441,17 +1465,13 @@ def _build_both_variant_result_for_instrument(
         roi=equity_result.net_cash_pnl_usd / equity_config.initial_balance_usd,
         win_rate=_win_rate(account_result), trade_count=len(account_result.accounted_trades),
         max_drawdown_usd=equity_result.max_drawdown_usd,
-        drawdowns_over_2000_count=equity_result.drawdown_over_threshold_episode_count,
+        drawdowns_over_2000_count=_complete_2000_loss_limits(equity_result.max_drawdown_usd, mark_to_market_audit),
         skipped_entries_by_reason=skipped_by_reason, yearly=yearly, monthly=monthly,
         apex_eod_audit=audit_apex_eod(
             account_result, DEFAULT_APEX_EOD_CONFIG,
             bars=context.bars_1m, bar_range_index=audit_bar_range_index,
         ),
-        mark_to_market_audit=audit_account_mark_to_market(
-            trades, account_result, context.bars_1m,
-            initial_balance_usd=equity_config.initial_balance_usd,
-            bar_range_index=audit_bar_range_index,
-        ),
+        mark_to_market_audit=mark_to_market_audit,
         ambiguous_same_bar_exit_count=_ambiguous_same_bar_exit_count(
             trades, context.bars_1m, audit_bar_range_index,
         ),
@@ -1542,6 +1562,7 @@ class VariantSummaryRow:
     trade_count: int
     max_drawdown_usd: float
     drawdowns_over_2000_count: int
+    drawdown_over_2000_episode_count: int
     research_eligible: bool
     completed_trades_2024: int
     completed_trades_2025: int
@@ -1567,6 +1588,7 @@ class VariantSummaryRow:
             tp_kind=v.tp_kind.value, tp_rank=v.tp_rank, sl_kind=v.sl_kind.value, sl_rank=v.sl_rank, sl_fvg_timeframe=v.sl_fvg_timeframe,
             net_pnl_usd=result.net_pnl_usd, roi=result.roi, win_rate=result.win_rate, trade_count=result.trade_count,
             max_drawdown_usd=result.max_drawdown_usd, drawdowns_over_2000_count=result.drawdowns_over_2000_count,
+            drawdown_over_2000_episode_count=result.equity_result.drawdown_over_threshold_episode_count,
             research_eligible=(
                 completed_2024 >= min_completed_trades_per_year
                 and completed_2025 >= min_completed_trades_per_year
@@ -1586,6 +1608,7 @@ class VariantSummaryRow:
             "sl_fvg_timeframe": self.sl_fvg_timeframe, "net_pnl_usd": self.net_pnl_usd, "roi": self.roi,
             "win_rate": self.win_rate, "trade_count": self.trade_count, "max_drawdown_usd": self.max_drawdown_usd,
             "drawdowns_over_2000_count": self.drawdowns_over_2000_count,
+            "drawdown_over_2000_episode_count": self.drawdown_over_2000_episode_count,
             "research_eligible": self.research_eligible,
             "completed_trades_2024": self.completed_trades_2024,
             "completed_trades_2025": self.completed_trades_2025,
@@ -2333,6 +2356,7 @@ _TEMPLATE_SUMMARY_ROW = VariantSummaryRow(
     exit_variant_id="tp_first_swing_high_r1__sl_first_swing_low_r1", tp_kind="first_swing_high", tp_rank=1,
     sl_kind="first_swing_low", sl_rank=1, sl_fvg_timeframe=None, net_pnl_usd=1234.56, roi=0.1234, win_rate=0.55,
     trade_count=42, max_drawdown_usd=567.89, drawdowns_over_2000_count=1,
+    drawdown_over_2000_episode_count=0,
     research_eligible=False, completed_trades_2024=20, completed_trades_2025=22,
     ambiguous_same_bar_exit_count=0,
     skipped_entries_by_reason={"news_block": 3, "infeasible_size": 1},

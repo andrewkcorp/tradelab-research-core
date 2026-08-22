@@ -695,8 +695,13 @@ def _build_selected_fvg_confluence(
 
 
 def _check_exit(position: _OpenPosition, bar: Bar1m) -> tuple[TradeExitReason, float] | None:
-    """SL-first same-candle tie-break (spec, this task): checked in this
-    literal order on every candle, including the entry candle itself."""
+    """Resolve one OHLC exit with conservative, executable fill rules.
+
+    SL wins an ambiguous same-candle TP/SL tie.  A stop is a market order:
+    when the candle opens through it, the executable fill is the worse open;
+    an intrabar touch without an opening gap fills at the stop level.  TP is
+    a limit order and therefore fills at its own level.
+    """
     tp_price = position.tp_candidate.price
     sl_price = position.sl_candidate.price
     if position.direction == LONG:
@@ -707,6 +712,10 @@ def _check_exit(position: _OpenPosition, bar: Bar1m) -> tuple[TradeExitReason, f
         tp_hit = bar.low <= tp_price
 
     if sl_hit:
+        if position.direction == LONG and bar.open < sl_price:
+            return TradeExitReason.SL_HIT, bar.open
+        if position.direction != LONG and bar.open > sl_price:
+            return TradeExitReason.SL_HIT, bar.open
         return TradeExitReason.SL_HIT, sl_price
     if tp_hit:
         return TradeExitReason.TP_HIT, tp_price

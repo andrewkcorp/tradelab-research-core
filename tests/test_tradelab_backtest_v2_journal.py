@@ -24,6 +24,7 @@ def _summary_row(variant_id: str, *, net_pnl_usd: float = 100.0, max_drawdown_us
         "exit_variant_id": "tp_first_swing_high_r1__sl_first_swing_low_r1", "tp_kind": "first_swing_high", "tp_rank": 1,
         "sl_kind": "first_swing_low", "sl_rank": 1, "sl_fvg_timeframe": None, "net_pnl_usd": net_pnl_usd, "roi": 0.1,
         "win_rate": 0.5, "trade_count": 10, "max_drawdown_usd": max_drawdown_usd, "drawdowns_over_2000_count": 0,
+        "drawdown_over_2000_episode_count": 0,
         "research_eligible": True, "completed_trades_2024": 100, "completed_trades_2025": 100,
         "skipped_entries_by_reason": {},
         "yearly": {"2024": {"trade_count": 100}, "2025": {"trade_count": 100}}, "monthly": {},
@@ -126,6 +127,18 @@ class ManifestCreateAndVerifyTests(unittest.TestCase):
 
 
 class CommitSummaryAndUniquenessTests(unittest.TestCase):
+    def test_persists_complete_loss_limits_separately_from_legacy_episodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _open(Path(tmp) / "journal.sqlite3")
+            row = _summary_row("large-loss")
+            row["drawdowns_over_2000_count"] = 90
+            row["drawdown_over_2000_episode_count"] = 1
+            j.commit_summary(row)
+            stored = j.top_n_summaries(1)[0]
+            self.assertEqual(stored.drawdowns_over_2000_count, 90)
+            self.assertEqual(stored.drawdown_over_2000_episode_count, 1)
+            j.close()
+
     def test_commit_summary_is_durable_and_readable_via_is_completed_and_completed_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "journal.sqlite3"

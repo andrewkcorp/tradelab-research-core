@@ -142,4 +142,10 @@ class TradePathAuditTests(unittest.TestCase):
             [first, second], account, [bar(0, 101, 99)],
             bar_range_index=BarRangeIndex.build([bar(0, 101, 99)]),
         )
-        self.assertLess(audit.worst_equity_usd, 50_000.0)
+        reference = _audit_account_mark_to_market_reference([first, second], account, [bar(0, 101, 99)])
+        # Both entry fees are charged and both sequential paths contribute;
+        # the old timestamp-keyed implementation silently retained only the
+        # second trade.
+        self.assertEqual(audit, reference)
+        self.assertEqual(audit.worst_equity_usd, 49_900.0)
+        self.assertEqual(audit.max_mark_to_market_drawdown_usd, 140.0)

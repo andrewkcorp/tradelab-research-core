@@ -102,58 +102,60 @@ def _audit_account_mark_to_market_reference(
 ) -> AccountMarkToMarketAudit:
     """Original full-bar replay retained as the equivalence oracle."""
     executions = {trade.trade_id: trade for trade in trades}
-    accounted = {trade.trade_id: trade for trade in account_result.accounted_trades}
     ordered_bars = tuple(bars)
     if not ordered_bars:
         return AccountMarkToMarketAudit(initial_balance_usd, 0.0, None)
     by_timestamp = {bar.timestamp: bar for bar in ordered_bars}
     if len(by_timestamp) != len(ordered_bars):
         raise ValueError("bars must have unique timestamps")
-    starts: dict[datetime, object] = {}
-    ends: dict[datetime, object] = {}
-    for trade_id, value in accounted.items():
-        if trade_id not in executions:
-            raise ValueError(f"accounted trade {trade_id!r} has no matching executed trade")
+    ordered_trades: list[tuple[int, object, int, int]] = []
+    by_timestamp_position = {bar.timestamp: position for position, bar in enumerate(ordered_bars)}
+    for sequence, value in enumerate(account_result.accounted_trades):
+        if value.trade_id not in executions:
+            raise ValueError(f"accounted trade {value.trade_id!r} has no matching executed trade")
         if value.entry_timestamp not in by_timestamp:
             raise ValueError(f"entry timestamp {value.entry_timestamp!r} is absent from bars")
-        starts[value.entry_timestamp] = value
+        start = by_timestamp_position[value.entry_timestamp]
         if value.exit_timestamp is not None:
             if value.exit_timestamp not in by_timestamp:
                 raise ValueError(f"exit timestamp {value.exit_timestamp!r} is absent from bars")
-            ends[value.exit_timestamp] = value
+            end = by_timestamp_position[value.exit_timestamp]
+        else:
+            end = len(ordered_bars) - 1
+        ordered_trades.append((sequence, value, start, end))
     balance = initial_balance_usd
     peak = balance
     max_drawdown = 0.0
     worst = balance
     worst_at: datetime | None = None
-    open_trade = None
-    for bar in ordered_bars:
-        if bar.timestamp in starts:
-            open_trade = starts[bar.timestamp]
-            balance -= open_trade.entry_cost_usd
-        adverse_marked = balance
-        favourable_marked = balance
-        if open_trade is not None:
+    previous_end = -1
+    for _, open_trade, start, end in sorted(ordered_trades, key=lambda item: (item[2], item[0])):
+        # Equality is valid: execution can close one position and enter the
+        # next on the same 1m candle.  A dict keyed by timestamp used to lose
+        # all but one such trade here.
+        if start < previous_end:
+            raise ValueError("accounted trades overlap; one-position MTM audit requires non-overlapping trades")
+        previous_end = end
+        balance -= open_trade.entry_cost_usd
+        for bar in ordered_bars[start:end + 1]:
             pv = point_value_usd(open_trade.instrument)
             adverse_price = bar.low if open_trade.direction == "long" else bar.high
             favourable_price = bar.high if open_trade.direction == "long" else bar.low
             adverse_points = (adverse_price - open_trade.entry_price) if open_trade.direction == "long" else (open_trade.entry_price - adverse_price)
             favourable_points = (favourable_price - open_trade.entry_price) if open_trade.direction == "long" else (open_trade.entry_price - favourable_price)
-            adverse_marked += adverse_points * pv * open_trade.quantity
-            favourable_marked += favourable_points * pv * open_trade.quantity
-        peak = max(peak, favourable_marked)
-        max_drawdown = max(max_drawdown, peak - adverse_marked)
-        if adverse_marked < worst:
-            worst, worst_at = adverse_marked, bar.timestamp
-        if bar.timestamp in ends:
-            closing = ends[bar.timestamp]
-            assert closing.gross_pnl_usd is not None
-            balance += closing.gross_pnl_usd
-            open_trade = None
+            adverse_marked = balance + adverse_points * pv * open_trade.quantity
+            favourable_marked = balance + favourable_points * pv * open_trade.quantity
+            peak = max(peak, favourable_marked)
+            max_drawdown = max(max_drawdown, peak - adverse_marked)
+            if adverse_marked < worst:
+                worst, worst_at = adverse_marked, bar.timestamp
+        if open_trade.exit_timestamp is not None:
+            assert open_trade.gross_pnl_usd is not None
+            balance += open_trade.gross_pnl_usd
             peak = max(peak, balance)
             max_drawdown = max(max_drawdown, peak - balance)
             if balance < worst:
-                worst, worst_at = balance, bar.timestamp
+                worst, worst_at = balance, open_trade.exit_timestamp
     return AccountMarkToMarketAudit(worst, max_drawdown, worst_at)
 
 
@@ -174,7 +176,6 @@ def audit_account_mark_to_market(
     never a silently optimistic risk result.
     """
     executions = {trade.trade_id: trade for trade in trades}
-    accounted = {trade.trade_id: trade for trade in account_result.accounted_trades}
     ordered_bars = tuple(bars)
     if not ordered_bars:
         return AccountMarkToMarketAudit(initial_balance_usd, 0.0, None)
@@ -186,16 +187,16 @@ def audit_account_mark_to_market(
             raise ValueError(f"timestamp {timestamp!r} is absent from bars")
         return position
 
-    starts: dict[datetime, tuple[object, int, int]] = {}
-    for trade_id, value in accounted.items():
-        if trade_id not in executions:
-            raise ValueError(f"accounted trade {trade_id!r} has no matching executed trade")
+    ordered_trades: list[tuple[int, object, int, int]] = []
+    for sequence, value in enumerate(account_result.accounted_trades):
+        if value.trade_id not in executions:
+            raise ValueError(f"accounted trade {value.trade_id!r} has no matching executed trade")
         start = exact_position(value.entry_timestamp)
         if value.exit_timestamp is not None:
             end = exact_position(value.exit_timestamp)
         else:
             end = len(ordered_bars) - 1
-        starts[value.entry_timestamp] = (value, start, end)
+        ordered_trades.append((sequence, value, start, end))
 
     balance = initial_balance_usd
     peak = balance
@@ -203,7 +204,7 @@ def audit_account_mark_to_market(
     worst = balance
     worst_at: datetime | None = None
     previous_end = -1
-    for open_trade, start, end in sorted(starts.values(), key=lambda item: item[1]):
+    for _, open_trade, start, end in sorted(ordered_trades, key=lambda item: (item[2], item[0])):
         # Multiple signals sharing a timestamp may each enter and resolve
         # immediately on that same 1m bar. They are sequential in execution
         # order and therefore valid when start == previous_end.

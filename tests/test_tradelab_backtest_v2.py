@@ -899,6 +899,7 @@ class TopNTrackerTests(unittest.TestCase):
         expected = [r.strategy_variant_id for r in sorted(results, key=_leaderboard_sort_key, reverse=True)[:5]]
         self.assertEqual(actual, expected)
 
+
     def test_deterministic_tie_break_by_drawdown_then_id(self):
         tracker = _TopNTracker(2)
         # identical net_pnl_usd -- lower max_drawdown wins; a further tie
@@ -915,6 +916,20 @@ class TopNTrackerTests(unittest.TestCase):
     def test_rejects_non_positive_size(self):
         with self.assertRaises(ValueError):
             _TopNTracker(0)
+
+
+class LossLimitSemanticsTests(unittest.TestCase):
+    def test_complete_limits_use_worst_of_realised_and_mark_to_market_drawdown(self):
+        from tradelab.backtest_v2 import _complete_2000_loss_limits
+        from tradelab.trade_path_audit import AccountMarkToMarketAudit
+
+        mtm = AccountMarkToMarketAudit(
+            worst_equity_usd=-130_000.0,
+            max_mark_to_market_drawdown_usd=180_999.0,
+            timestamp_of_worst_equity=None,
+        )
+        self.assertEqual(_complete_2000_loss_limits(12_000.0, mtm), 90)
+        self.assertEqual(_complete_2000_loss_limits(5_999.0, None), 2)
 
 
 class VariantSummaryRowTests(unittest.TestCase):
@@ -2096,6 +2111,22 @@ class FindFirstExitTests(unittest.TestCase):
         self.assertEqual(exit_index, 2)
         self.assertEqual(reason, TradeExitReason.SL_HIT)
         self.assertEqual(price, 110.0)
+
+    def test_long_stop_opening_gap_fills_at_worse_open(self):
+        position = self._position(LONG, tp_price=110.0, sl_price=90.0)
+        bars, index = self._bars_and_index([(100, 101, 99, 100), (85, 88, 84, 86)])
+        self.assertEqual(
+            _find_first_exit(bars, index, position, 0, len(bars)),
+            (1, TradeExitReason.SL_HIT, 85.0),
+        )
+
+    def test_short_stop_opening_gap_fills_at_worse_open(self):
+        position = self._position(SHORT, tp_price=90.0, sl_price=110.0)
+        bars, index = self._bars_and_index([(100, 101, 99, 100), (115, 118, 114, 116)])
+        self.assertEqual(
+            _find_first_exit(bars, index, position, 0, len(bars)),
+            (1, TradeExitReason.SL_HIT, 115.0),
+        )
 
     def test_same_bar_tp_and_sl_sl_wins(self):
         position = self._position(LONG, tp_price=110.0, sl_price=95.0)

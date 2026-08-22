@@ -159,17 +159,22 @@ class LongTradeTests(unittest.TestCase):
         self.assertEqual(result.sl_hit_count, 0)
         self.assertEqual(result.gross_pnl_points_total, 21.0)
 
-    def test_long_sl_hit_with_gap_through_the_level(self):
-        # low=85 gaps straight through SL=90 -- fills at the level (85 is
-        # not used: no finer-grained price path is available at 1m OHLC).
-        bars = long_base_bars() + [bar(13, 95, 96, 85, 88)]
+    def test_long_sl_hit_with_opening_gap_through_the_level(self):
+        # The bar opens below SL=90. A stop-market cannot fill at the now
+        # unavailable stop price, so the conservative executable fill is 85.
+        bars = long_base_bars() + [bar(13, 85, 96, 84, 88)]
         result = run(long_strategy(), bars)
         trade = result.trades[0]
         self.assertEqual(trade.exit_reason, TradeExitReason.SL_HIT)
-        self.assertEqual(trade.exit_price, 90.0)
-        self.assertEqual(trade.gross_pnl_points, -9.0)  # 90 - 99
+        self.assertEqual(trade.exit_price, 85.0)
+        self.assertEqual(trade.gross_pnl_points, -14.0)  # 85 - 99
         self.assertEqual(result.sl_hit_count, 1)
         self.assertEqual(result.tp_hit_count, 0)
+
+    def test_long_intrabar_stop_touch_without_opening_gap_fills_at_stop(self):
+        bars = long_base_bars() + [bar(13, 95, 96, 85, 88)]
+        trade = run(long_strategy(), bars).trades[0]
+        self.assertEqual((trade.exit_reason, trade.exit_price), (TradeExitReason.SL_HIT, 90.0))
 
     def test_same_candle_tp_and_sl_conflict_resolves_sl_first(self):
         bars = long_base_bars() + [bar(13, 100, 125, 80, 100)]  # both TP(120) and SL(90) touched
@@ -218,8 +223,13 @@ class ShortTradeTests(unittest.TestCase):
         result = run(short_strategy(), bars)
         trade = result.trades[0]
         self.assertEqual(trade.exit_reason, TradeExitReason.SL_HIT)
-        self.assertEqual(trade.exit_price, 120.0)
-        self.assertEqual(trade.gross_pnl_points, -19.0)  # 101 - 120
+        self.assertEqual(trade.exit_price, 121.0)
+        self.assertEqual(trade.gross_pnl_points, -20.0)  # 101 - 121
+
+    def test_short_intrabar_stop_touch_without_opening_gap_fills_at_stop(self):
+        bars = short_base_bars() + [bar(13, 119, 130, 118, 122)]
+        trade = run(short_strategy(), bars).trades[0]
+        self.assertEqual((trade.exit_reason, trade.exit_price), (TradeExitReason.SL_HIT, 120.0))
 
 
 class NewsBlockTests(unittest.TestCase):
