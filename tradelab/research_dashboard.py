@@ -70,6 +70,8 @@ _UNIVERSE_SORT_COLUMNS = {
     "daily_sharpe": _perf_sql("annualized_daily_sharpe"),
     "expectancy": _perf_sql("expectancy_usd"),
     "top_winner_share": _perf_sql("top_winner_share_of_positive_pnl"),
+    "profitable_years": _perf_sql("profitable_year_count"),
+    "worst_year_pnl": _perf_sql("minimum_year_net_pnl_usd"),
 }
 _RANGE_FILTER_COLUMNS = {
     "pnl": "net_pnl_usd", "roi": "roi", "win_rate": "win_rate",
@@ -83,6 +85,8 @@ _RANGE_FILTER_COLUMNS = {
     "daily_sharpe": _perf_sql("annualized_daily_sharpe"),
     "expectancy": _perf_sql("expectancy_usd"),
     "top_winner_share": _perf_sql("top_winner_share_of_positive_pnl"),
+    "profitable_years": _perf_sql("profitable_year_count"),
+    "worst_year_pnl": _perf_sql("minimum_year_net_pnl_usd"),
 }
 _BOOLEAN_FILTER_COLUMNS = {"apex_has_breach": "apex_has_breach"}
 
@@ -492,6 +496,7 @@ class _DashboardRequestHandler(BaseHTTPRequestHandler):
                         "profit_factor": "profit_factor", "average_r": "average_r",
                         "daily_sharpe": "annualized_daily_sharpe", "expectancy": "expectancy_usd",
                         "top_winner_share": "top_winner_share_of_positive_pnl",
+                        "profitable_years": "profitable_year_count", "worst_year_pnl": "minimum_year_net_pnl_usd",
                     }[sort_key]
                     for entry in payload.get("entries", []):
                         entry[sort_key] = (entry.get("performance_validation") or {}).get(field)
@@ -773,6 +778,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       <input id="f-daily-sharpe-min" type="number" step="0.01" placeholder="Min daily Sharpe"><input id="f-daily-sharpe-max" type="number" step="0.01" placeholder="Max daily Sharpe">
       <input id="f-expectancy-min" type="number" placeholder="Min expectancy ($)"><input id="f-expectancy-max" type="number" placeholder="Max expectancy ($)">
       <input id="f-top-winner-share-min" type="number" step="0.01" placeholder="Min top-winner share"><input id="f-top-winner-share-max" type="number" step="0.01" placeholder="Max top-winner share">
+      <input id="f-profitable-years-min" type="number" min="0" step="1" placeholder="Min profitable years"><input id="f-profitable-years-max" type="number" min="0" step="1" placeholder="Max profitable years">
+      <input id="f-worst-year-pnl-min" type="number" placeholder="Min worst-year P&amp;L ($)"><input id="f-worst-year-pnl-max" type="number" placeholder="Max worst-year P&amp;L ($)">
       <div class="check-group"><span class="group-label">Direction</span><label><input type="checkbox" data-filter="direction" value="long">Long</label><label><input type="checkbox" data-filter="direction" value="short">Short</label><label><input type="checkbox" data-filter="direction" value="both">Both</label></div>
       <div class="check-group"><span class="group-label">Instrument</span><label><input type="checkbox" data-filter="instrument" value="MNQ">MNQ</label></div>
       <div class="check-group"><span class="group-label">Apex EOD audit</span><label><input id="f-apex-pass" type="checkbox">No recorded breach</label><label><input id="f-apex-breach" type="checkbox">Recorded breach</label></div>
@@ -789,7 +796,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       <table id="leaders-table" style="display:none">
         <thead><tr>
           <th class="num">Position</th><th>Strategy</th><th class="num"><button class="sort-button" data-sort-key="pnl">P&amp;L <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="roi">ROI <span class="sort-indicator"></span></button></th>
-          <th class="num"><button class="sort-button" data-sort-key="win_rate">Win rate <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="trade_count">Trades <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="max_drawdown">Max DD <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="profit_factor">PF <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="average_r">Avg R <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="daily_sharpe">Sharpe <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="drawdowns_over_2000_count">$2k limits <span class="sort-indicator"></span></button></th>
+          <th class="num"><button class="sort-button" data-sort-key="win_rate">Win rate <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="trade_count">Trades <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="max_drawdown">Max DD <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="profit_factor">PF <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="average_r">Avg R <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="daily_sharpe">Sharpe <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="profitable_years">Positive years <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="worst_year_pnl">Worst year <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="drawdowns_over_2000_count">$2k limits <span class="sort-indicator"></span></button></th>
         </tr></thead>
         <tbody id="leaders-tbody"></tbody>
       </table>
@@ -979,11 +986,11 @@ function renderActiveWork(status) {
   }
 }
 
-const SORT_LABELS = {rank:"original rank", pnl:"realised P&L", roi:"ROI", win_rate:"win rate", trade_count:"trade count", max_drawdown:"max drawdown", profit_factor:"profit factor", average_r:"average R", daily_sharpe:"daily Sharpe", expectancy:"expectancy", top_winner_share:"top-winner concentration", drawdowns_over_2000_count:"$2k loss limits consumed"};
+const SORT_LABELS = {rank:"original rank", pnl:"realised P&L", roi:"ROI", win_rate:"win rate", trade_count:"trade count", max_drawdown:"max drawdown", profit_factor:"profit factor", average_r:"average R", daily_sharpe:"daily Sharpe", expectancy:"expectancy", top_winner_share:"top-winner concentration", profitable_years:"profitable years", worst_year_pnl:"worst-year P&L", drawdowns_over_2000_count:"$2k loss limits consumed"};
 function sortedEntries(leaderboard) {
   const sign = leaderboardSort.dir === "asc" ? 1 : -1;
   return ((leaderboard && leaderboard.entries) || []).slice().sort((a,b) => {
-    const metric = e => ({profit_factor:e.performance_validation?.profit_factor, average_r:e.performance_validation?.average_r, daily_sharpe:e.performance_validation?.annualized_daily_sharpe, expectancy:e.performance_validation?.expectancy_usd, top_winner_share:e.performance_validation?.top_winner_share_of_positive_pnl}[leaderboardSort.key] ?? e[leaderboardSort.key]);
+    const metric = e => ({profit_factor:e.performance_validation?.profit_factor, average_r:e.performance_validation?.average_r, daily_sharpe:e.performance_validation?.annualized_daily_sharpe, expectancy:e.performance_validation?.expectancy_usd, top_winner_share:e.performance_validation?.top_winner_share_of_positive_pnl, profitable_years:e.performance_validation?.profitable_year_count, worst_year_pnl:e.performance_validation?.minimum_year_net_pnl_usd}[leaderboardSort.key] ?? e[leaderboardSort.key]);
     const av = Number(metric(a)), bv = Number(metric(b));
     if (av === bv) return a.rank - b.rank;
     return (av - bv) * sign;
@@ -1045,6 +1052,9 @@ function renderStrategySummary(leaderboard) {
     <div class="card"><div class="label">Daily Sharpe</div><div class="value">${fmtNum(validation.annualized_daily_sharpe)}</div><div class="subtle">annualized · no-trade weekdays = 0</div></div>
     <div class="card"><div class="label">P&amp;L with +3 stop ticks</div><div class="value ${slippage3 >= 0 ? "pnl-pos" : "pnl-neg"}">${fmtMoney(slippage3)}</div><div class="subtle">analytic sensitivity, signals unchanged</div></div>
     <div class="card"><div class="label">Top-winner concentration</div><div class="value">${fmtPct(validation.top_winner_share_of_positive_pnl)}</div><div class="subtle">largest win ÷ all positive P&amp;L</div></div>`;
+  box.innerHTML += `
+    <div class="card"><div class="label">Profitable years</div><div class="value">${fmtNum(validation.profitable_year_count)} / ${fmtNum(validation.evaluated_year_count)}</div><div class="subtle">calendar-year net P&amp;L above zero</div></div>
+    <div class="card"><div class="label">Worst calendar year</div><div class="value ${(validation.minimum_year_net_pnl_usd ?? 0) >= 0 ? "pnl-pos" : "pnl-neg"}">${fmtMoney(validation.minimum_year_net_pnl_usd)}</div><div class="subtle">period-stability diagnostic</div></div>`;
 }
 
 function renderLeaders(leaderboard) {
@@ -1066,6 +1076,8 @@ function renderLeaders(leaderboard) {
       <td class="num">${fmtNum(e.performance_validation?.profit_factor)}</td>
       <td class="num">${fmtNum(e.performance_validation?.average_r)}</td>
       <td class="num">${fmtNum(e.performance_validation?.annualized_daily_sharpe)}</td>
+      <td class="num">${fmtNum(e.performance_validation?.profitable_year_count)} / ${fmtNum(e.performance_validation?.evaluated_year_count)}</td>
+      <td class="num ${(e.performance_validation?.minimum_year_net_pnl_usd ?? 0) >= 0 ? "pnl-pos" : "pnl-neg"}">${fmtMoney(e.performance_validation?.minimum_year_net_pnl_usd)}</td>
       <td class="num">${fmtNum(e.drawdowns_over_2000_count)}</td>
     </tr>`).join("");
   document.querySelectorAll("#leaders-tbody tr").forEach(row => row.addEventListener("click", () => {
@@ -1282,7 +1294,7 @@ async function loadLeaderboardPage(reset = false) {
   if (reset) { leaderboardOffset = 0; leaderboardTotal = 0; lastLeaderboard = null; }
   const offset = reset ? 0 : leaderboardOffset;
   const filters = new URLSearchParams();
-  const fieldMap = {"pnl-min":"pnl_min","pnl-max":"pnl_max","roi-min":"roi_min","roi-max":"roi_max","win-rate-min":"win_rate_min","win-rate-max":"win_rate_max","trade-count-min":"min_trades","trade-count-max":"trade_count_max","max-drawdown-min":"max_drawdown_min","max-drawdown-max":"max_drawdown_max","profit-factor-min":"profit_factor_min","profit-factor-max":"profit_factor_max","average-r-min":"average_r_min","average-r-max":"average_r_max","daily-sharpe-min":"daily_sharpe_min","daily-sharpe-max":"daily_sharpe_max","expectancy-min":"expectancy_min","expectancy-max":"expectancy_max","top-winner-share-min":"top_winner_share_min","top-winner-share-max":"top_winner_share_max","contains":"contains"};
+  const fieldMap = {"pnl-min":"pnl_min","pnl-max":"pnl_max","roi-min":"roi_min","roi-max":"roi_max","win-rate-min":"win_rate_min","win-rate-max":"win_rate_max","trade-count-min":"min_trades","trade-count-max":"trade_count_max","max-drawdown-min":"max_drawdown_min","max-drawdown-max":"max_drawdown_max","profit-factor-min":"profit_factor_min","profit-factor-max":"profit_factor_max","average-r-min":"average_r_min","average-r-max":"average_r_max","daily-sharpe-min":"daily_sharpe_min","daily-sharpe-max":"daily_sharpe_max","expectancy-min":"expectancy_min","expectancy-max":"expectancy_max","top-winner-share-min":"top_winner_share_min","top-winner-share-max":"top_winner_share_max","profitable-years-min":"profitable_years_min","profitable-years-max":"profitable_years_max","worst-year-pnl-min":"worst_year_pnl_min","worst-year-pnl-max":"worst_year_pnl_max","contains":"contains"};
   Object.entries(fieldMap).forEach(([id,key]) => { const value = document.getElementById("f-"+id).value.trim(); if (value) filters.set(key,value); });
   ["direction","instrument","tp_kind","sl_kind","confluence","session"].forEach(key => { const values = [...document.querySelectorAll(`[data-filter="${key}"]:checked`)].map(el => el.value); if (values.length) filters.set(key, values.join(",")); });
   const apexPass = document.getElementById("f-apex-pass").checked, apexBreach = document.getElementById("f-apex-breach").checked;

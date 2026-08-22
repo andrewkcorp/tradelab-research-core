@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 import math
 import random
+from statistics import NormalDist
 from typing import Iterable, Sequence
 
 from tradelab.accounting import AccountBacktestResult, point_value_usd
@@ -32,6 +33,11 @@ class PerformanceValidation:
     largest_winner_usd: float | None
     largest_loser_usd: float | None
     top_winner_share_of_positive_pnl: float | None
+    profitable_year_count: int
+    evaluated_year_count: int
+    minimum_year_net_pnl_usd: float | None
+    maximum_year_net_pnl_usd: float | None
+    yearly_net_pnl_usd: dict[str, float]
 
 
 def _weekday_dates(start: date, end: date) -> list[date]:
@@ -69,9 +75,12 @@ def summarize_account_result(account: AccountBacktestResult) -> PerformanceValid
     ]
 
     daily: dict[str, float] = {}
+    yearly: dict[str, float] = {}
     for trade in resolved:
         day = trading_day_id(trade.exit_timestamp or trade.entry_timestamp)
         daily[day] = daily.get(day, 0.0) + float(trade.net_pnl_usd)
+        year = day[:4]
+        yearly[year] = yearly.get(year, 0.0) + float(trade.net_pnl_usd)
     daily_values: list[float] = []
     if daily:
         first, last = date.fromisoformat(min(daily)), date.fromisoformat(max(daily))
@@ -91,7 +100,62 @@ def summarize_account_result(account: AccountBacktestResult) -> PerformanceValid
         largest_winner_usd=max(wins) if wins else None,
         largest_loser_usd=min(losses) if losses else None,
         top_winner_share_of_positive_pnl=(max(wins) / gross_profit if gross_profit > 0 else None),
+        profitable_year_count=sum(value > 0 for value in yearly.values()),
+        evaluated_year_count=len(yearly),
+        minimum_year_net_pnl_usd=(min(yearly.values()) if yearly else None),
+        maximum_year_net_pnl_usd=(max(yearly.values()) if yearly else None),
+        yearly_net_pnl_usd=dict(sorted(yearly.items())),
     )
+
+
+def deflated_sharpe_probability(
+    *,
+    observed_sharpe: float,
+    observations: int,
+    independent_trials: int,
+    trial_sharpe_variance: float,
+    return_skewness: float = 0.0,
+    return_kurtosis: float = 3.0,
+) -> float:
+    """Probability that Sharpe exceeds selection-inflated luck.
+
+    Implements the Bailey/Lopez de Prado Deflated Sharpe Ratio probability.
+    Inputs must use one consistent, *non-annualized* observation frequency;
+    for TradeLab that means daily Sharpe and daily return moments.  The
+    caller supplies the effective number of independent strategy trials --
+    using the raw number of highly correlated variants would be deliberately
+    conservative and must be reported as such.
+
+    This is post-selection validation only.  It never changes fills, P&L or
+    leaderboard membership.
+    """
+    if observations < 2:
+        raise ValueError("at least two return observations are required")
+    if independent_trials < 1:
+        raise ValueError("independent_trials must be positive")
+    if trial_sharpe_variance < 0:
+        raise ValueError("trial_sharpe_variance cannot be negative")
+    if return_kurtosis < 1:
+        raise ValueError("return_kurtosis must be at least 1")
+
+    expected_maximum = 0.0
+    if independent_trials > 1 and trial_sharpe_variance > 0:
+        normal = NormalDist()
+        euler_gamma = 0.5772156649015329
+        n = float(independent_trials)
+        expected_maximum = math.sqrt(trial_sharpe_variance) * (
+            (1.0 - euler_gamma) * normal.inv_cdf(1.0 - 1.0 / n)
+            + euler_gamma * normal.inv_cdf(1.0 - 1.0 / (n * math.e))
+        )
+    denominator_sq = (
+        1.0
+        - return_skewness * observed_sharpe
+        + ((return_kurtosis - 1.0) / 4.0) * observed_sharpe * observed_sharpe
+    )
+    if denominator_sq <= 0:
+        raise ValueError("return moments produce a non-positive DSR denominator")
+    statistic = (observed_sharpe - expected_maximum) * math.sqrt(observations - 1) / math.sqrt(denominator_sq)
+    return NormalDist().cdf(statistic)
 
 
 def stop_slippage_sensitivity(

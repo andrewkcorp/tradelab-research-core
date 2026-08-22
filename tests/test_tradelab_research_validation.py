@@ -7,6 +7,7 @@ from tradelab.accounting import AccountBacktestResult, AccountedTrade, Instrumen
 from tradelab.backtest import TradeExitReason
 from tradelab.research_validation import (
     benjamini_hochberg,
+    deflated_sharpe_probability,
     stationary_block_bootstrap_mean_p_value,
     stop_slippage_sensitivity,
     summarize_account_result,
@@ -47,6 +48,9 @@ class PerformanceValidationTests(unittest.TestCase):
         self.assertEqual(result.total_r, 12.5)
         self.assertIsNotNone(result.annualized_daily_sharpe)
         self.assertEqual(result.top_winner_share_of_positive_pnl, 1)
+        self.assertEqual(result.profitable_year_count, 1)
+        self.assertEqual(result.evaluated_year_count, 1)
+        self.assertEqual(result.yearly_net_pnl_usd, {"2026": 50.0})
 
     def test_stop_slippage_is_only_charged_on_stop_exits(self):
         value = account([trade("a", 5, 100), trade("b", 7, -50, TradeExitReason.SL_HIT)])
@@ -62,6 +66,25 @@ class PerformanceValidationTests(unittest.TestCase):
         second = stationary_block_bootstrap_mean_p_value(values, resamples=200, seed=7)
         self.assertEqual(first, second)
         self.assertLess(first, .02)
+
+    def test_deflated_sharpe_penalizes_more_strategy_trials(self):
+        few = deflated_sharpe_probability(
+            observed_sharpe=.20, observations=252, independent_trials=2,
+            trial_sharpe_variance=.01,
+        )
+        many = deflated_sharpe_probability(
+            observed_sharpe=.20, observations=252, independent_trials=10_000,
+            trial_sharpe_variance=.01,
+        )
+        self.assertGreater(few, many)
+        self.assertTrue(0 <= many <= 1)
+
+    def test_deflated_sharpe_rejects_annualization_agnostic_bad_inputs(self):
+        with self.assertRaises(ValueError):
+            deflated_sharpe_probability(
+                observed_sharpe=.2, observations=1, independent_trials=1,
+                trial_sharpe_variance=0,
+            )
 
 
 if __name__ == "__main__":
