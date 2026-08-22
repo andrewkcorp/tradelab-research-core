@@ -233,55 +233,30 @@ class FourHourAnchorTests(unittest.TestCase):
 
 class DstTransitionTests(unittest.TestCase):
     def test_spring_forward_4h_bucket_needs_only_180_minutes(self):
-        # 2026-03-08: US clocks jump 02:00 -> 03:00 NY, so the 02:00-06:00 4H
-        # bucket (UTC 07:00-10:00 that day) spans only 3 real hours (180 minutes).
-        # This window doesn't touch the 17:00-18:00 break, so it is unaffected
-        # by the session-calendar change.
+        # The transition is Sunday while Globex is closed. The old daily-only
+        # calendar incorrectly fabricated an open bucket here.
         start_utc = datetime(2026, 3, 8, 7, 0, tzinfo=timezone.utc)
         closer = [bar_at_utc(datetime(2026, 3, 8, 10, 5, tzinfo=timezone.utc))]
 
         complete = minute_series_utc(start_utc, 180)
-        [agg] = aggregate_bars(complete + closer, "4H")
-        self.assertEqual((agg.known_at - agg.timestamp).total_seconds() / 60, 180)
-        self.assertEqual(agg.known_at.astimezone(NY), datetime(2026, 3, 8, 6, 0, tzinfo=NY))
-
-        one_short = minute_series_utc(start_utc, 179)
-        self.assertEqual(aggregate_bars(one_short + closer, "4H"), [])
+        self.assertEqual(aggregate_bars(complete + closer, "4H"), [])
 
     def test_fall_back_4h_bucket_needs_300_minutes(self):
-        # 2026-11-01: US clocks fall back 02:00 -> 01:00 NY (repeated hour), so the
-        # 22:00-02:00 4H bucket (UTC 02:00-07:00 that day) spans 5 real hours (300
-        # minutes). Doesn't touch the 17:00-18:00 break either.
+        # Also Sunday/closed: the repeated civil hour cannot create a valid
+        # market-data bucket when the market itself is not open.
         start_utc = datetime(2026, 11, 1, 2, 0, tzinfo=timezone.utc)
         closer = [bar_at_utc(datetime(2026, 11, 1, 7, 5, tzinfo=timezone.utc))]
 
         complete = minute_series_utc(start_utc, 300)
-        [agg] = aggregate_bars(complete + closer, "4H")
-        self.assertEqual((agg.known_at - agg.timestamp).total_seconds() / 60, 300)
-
-        one_short = minute_series_utc(start_utc, 299)
-        self.assertEqual(aggregate_bars(one_short + closer, "4H"), [])
+        self.assertEqual(aggregate_bars(complete + closer, "4H"), [])
 
     def test_fall_back_trading_day_needs_1440_minutes(self):
-        # The CME trading day opening 18:00 NY on Oct 31 still ends 18:00 NY on
-        # Nov 1. Raw wall-clock span is 25 real hours (1500 min, extra fall-back
-        # hour), minus the 60-minute daily break = 1440 expected minutes.
+        # Saturday 18:00 through Sunday 18:00 is the weekly closure, not a
+        # trading day. The old calendar's 1440-minute expectation was false.
         day_start = datetime(2026, 10, 31, 18, 0, tzinfo=NY).astimezone(timezone.utc)
         day_end = datetime(2026, 11, 1, 18, 0, tzinfo=NY).astimezone(timezone.utc)
         expected = expected_open_minutes(day_start, day_end)
-        self.assertEqual(len(expected), 1440)
-
-        complete = [bar_at_utc(t) for t in expected]
-        closer = [bar_at_utc(datetime(2026, 11, 2, 0, 0, tzinfo=timezone.utc))]
-        [agg] = aggregate_bars(complete + closer, "1D")
-        # The last expected member closes at 17:00 NY; the scheduled final
-        # hour is not part of OHLC and cannot delay availability.
-        self.assertEqual((agg.known_at - agg.timestamp).total_seconds() / 60, 1440)
-        self.assertEqual(agg.known_at.astimezone(NY), datetime(2026, 11, 1, 17, 0, tzinfo=NY))
-        self.assertEqual(agg.volume, 1440)  # each fixture bar has volume=1: 1440 fed the bucket
-
-        one_short = [bar_at_utc(t) for t in expected[:-1]]
-        self.assertEqual(aggregate_bars(one_short + closer, "1D"), [])
+        self.assertEqual(expected, [])
 
 
 if __name__ == "__main__":

@@ -140,5 +140,14 @@ class DailyBreakIsNotAGapTests(unittest.TestCase):
         self.assertEqual(total_reported, 119)  # never the raw 179-minute span
 
 
+class WeekendIsNotAGapTests(unittest.TestCase):
+    def test_friday_close_to_sunday_open_is_not_missing_data(self):
+        bars = [
+            bar_at_ny(datetime(2026, 1, 2, 16, 59, tzinfo=NY)),
+            bar_at_ny(datetime(2026, 1, 4, 18, 0, tzinfo=NY)),
+        ]
+        self.assertEqual(validate_bars(bars).gaps, ())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,12 +17,9 @@ is actually a data problem:
   ``MissingMinutesGap`` entries -- one per contiguous run of missing,
   expected-open minutes -- rather than reported as one gap that includes the
   break.
-- **Unsupported special schedules.** CME holidays, early closes, and any
-  other one-off schedule are not modeled by ``tradelab.session_calendar``
-  (see its module docstring). A holiday or early-close day looks like an
-  ordinary large data gap here: this module has no way to distinguish "the
-  market was closed for a reason we don't model" from "the data is missing",
-  so it reports the former the same as the latter.
+- **Special schedules.** When supplied, a checksum-linked holiday/early-close
+  schedule removes official closed intervals from the expected-minute set.
+  Without it those exceptions remain visible as gaps rather than being guessed.
 """
 from __future__ import annotations
 
@@ -32,7 +29,7 @@ import math
 from collections.abc import Sequence
 
 from tradelab.bar import Bar1m
-from tradelab.session_calendar import expected_open_minutes
+from tradelab.session_calendar import SpecialSessionSchedule, expected_open_minutes
 
 ONE_MINUTE = timedelta(minutes=1)
 
@@ -52,7 +49,9 @@ class ValidationResult:
     gaps: tuple[MissingMinutesGap, ...]
 
 
-def validate_bars(bars: Sequence[Bar1m]) -> ValidationResult:
+def validate_bars(
+    bars: Sequence[Bar1m], *, special_schedule: SpecialSessionSchedule | None = None
+) -> ValidationResult:
     """Validate a 1-minute bar series and build its missing-minutes registry.
 
     Raises ``ValueError`` on: out-of-order or duplicate timestamps, an
@@ -77,7 +76,11 @@ def validate_bars(bars: Sequence[Bar1m]) -> ValidationResult:
                     f"Row {index}: timestamp {bar.timestamp} is not strictly after "
                     f"previous timestamp {previous.timestamp} (unordered or duplicate)"
                 )
-            missing_open = expected_open_minutes(previous.timestamp + ONE_MINUTE, bar.timestamp)
+            missing_open = expected_open_minutes(
+                previous.timestamp + ONE_MINUTE,
+                bar.timestamp,
+                special_schedule=special_schedule,
+            )
             gaps.extend(_group_contiguous_runs(missing_open))
         previous = bar
 

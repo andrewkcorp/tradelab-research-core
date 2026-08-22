@@ -96,6 +96,7 @@ from tradelab.continuous_futures import ContinuousSeriesResult, RollAdjustment, 
 from tradelab.databento_parent_csv import read_databento_parent_csv
 from tradelab.loaders import _parse_timestamp, read_csv_bars, read_parquet_bars
 from tradelab.validation import MissingMinutesGap, validate_bars, validate_price_grid
+from tradelab.session_calendar import load_special_session_schedule
 from tradelab.volume_roll_continuous import build_volume_front_month_continuous_series
 
 SCHEMA_VERSION = "1.0"
@@ -151,6 +152,8 @@ class MarketDataArtifact:
     normalization_method: str | None = None
     roll_audit_path: str | None = None
     roll_audit_sha256: str | None = None
+    session_schedule_path: str | None = None
+    session_schedule_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -188,6 +191,15 @@ class MarketDataArtifact:
                 raise ValueError(
                     "MarketDataArtifact.roll_audit_sha256 must be a 64-character lowercase hex digest when supplied"
                 )
+        if (self.session_schedule_path is None) != (self.session_schedule_sha256 is None):
+            raise ValueError("MarketDataArtifact.session_schedule_path and session_schedule_sha256 must be supplied together")
+        if self.session_schedule_path is not None:
+            if not self.session_schedule_path:
+                raise ValueError("MarketDataArtifact.session_schedule_path must be non-empty when supplied")
+            if not _looks_like_sha256(self.session_schedule_sha256):
+                raise ValueError(
+                    "MarketDataArtifact.session_schedule_sha256 must be a 64-character lowercase hex digest when supplied"
+                )
 
         if self.series_kind == SeriesKind.RAW_QUARTERLY:
             if not self.roll_manifest_path:
@@ -223,6 +235,8 @@ class MarketDataArtifact:
             "normalization_method": self.normalization_method,
             "roll_audit_path": self.roll_audit_path,
             "roll_audit_sha256": self.roll_audit_sha256,
+            "session_schedule_path": self.session_schedule_path,
+            "session_schedule_sha256": self.session_schedule_sha256,
         }
 
 
@@ -252,6 +266,8 @@ def load_market_data_artifact(path: Path | str) -> MarketDataArtifact:
             normalization_method=raw.get("normalization_method"),
             roll_audit_path=raw.get("roll_audit_path"),
             roll_audit_sha256=raw.get("roll_audit_sha256"),
+            session_schedule_path=raw.get("session_schedule_path"),
+            session_schedule_sha256=raw.get("session_schedule_sha256"),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"Invalid market data artifact manifest {path}: {error}") from error
@@ -419,8 +435,45 @@ def audit_market_data_artifact(
             )
         )
 
+    special_schedule = None
+    if artifact.session_schedule_path is not None:
+        schedule_path = _resolve_path(artifact.session_schedule_path, base_dir)
+        try:
+            schedule_actual = hashlib.sha256(schedule_path.read_bytes()).hexdigest()
+        except OSError as error:
+            findings.append(AuditFinding(
+                severity=AuditSeverity.CRITICAL,
+                category="session_schedule_missing",
+                message=f"cannot read declared session schedule {schedule_path}: {error}",
+            ))
+        else:
+            if schedule_actual != artifact.session_schedule_sha256:
+                findings.append(AuditFinding(
+                    severity=AuditSeverity.CRITICAL,
+                    category="session_schedule_checksum_mismatch",
+                    message=(
+                        f"sha256 of session schedule {schedule_path} is {schedule_actual!r}, manifest declares "
+                        f"{artifact.session_schedule_sha256!r}"
+                    ),
+                ))
+            else:
+                try:
+                    special_schedule = load_special_session_schedule(schedule_path)
+                except ValueError as error:
+                    findings.append(AuditFinding(
+                        severity=AuditSeverity.CRITICAL,
+                        category="session_schedule_invalid",
+                        message=str(error),
+                    ))
+    else:
+        findings.append(AuditFinding(
+            severity=AuditSeverity.WARNING,
+            category="special_session_schedule_missing",
+            message="artifact has no checksum-linked CME holiday/early-close schedule; weekly closures are modeled but exceptions remain unaudited",
+        ))
+
     try:
-        gaps = validate_bars(bars).gaps
+        gaps = validate_bars(bars, special_schedule=special_schedule).gaps
     except ValueError as error:
         findings.append(AuditFinding(severity=AuditSeverity.CRITICAL, category="bar_series_invalid", message=str(error)))
         gaps = ()
