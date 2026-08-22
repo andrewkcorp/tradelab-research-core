@@ -86,7 +86,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 
@@ -486,25 +486,29 @@ def audit_market_data_artifact(
     observed_start = bars[0].timestamp if bars else None
     observed_end = bars[-1].timestamp if bars else None
     if observed_start is not None and observed_end is not None:
-        if observed_start < artifact.coverage_start or observed_end > artifact.coverage_end:
+        # Manifest coverage is a half-open interval of 1m bar membership.
+        # The final bar stamped 20:59 covers [20:59, 21:00), so a declared
+        # coverage_end of 21:00 is exact rather than one minute "missing".
+        observed_end_exclusive = observed_end + timedelta(minutes=1)
+        if observed_start < artifact.coverage_start or observed_end_exclusive > artifact.coverage_end:
             findings.append(
                 AuditFinding(
                     severity=AuditSeverity.CRITICAL,
                     category="coverage_exceeds_declared_window",
                     message=(
-                        f"observed data [{observed_start.isoformat()}, {observed_end.isoformat()}] extends beyond "
-                        f"declared coverage [{artifact.coverage_start.isoformat()}, {artifact.coverage_end.isoformat()}]"
+                        f"observed bar coverage [{observed_start.isoformat()}, {observed_end_exclusive.isoformat()}) extends beyond "
+                        f"declared coverage [{artifact.coverage_start.isoformat()}, {artifact.coverage_end.isoformat()})"
                     ),
                 )
             )
-        elif observed_start > artifact.coverage_start or observed_end < artifact.coverage_end:
+        elif observed_start > artifact.coverage_start or observed_end_exclusive < artifact.coverage_end:
             findings.append(
                 AuditFinding(
                     severity=AuditSeverity.WARNING,
                     category="declared_coverage_not_fully_observed",
                     message=(
-                        f"declared coverage [{artifact.coverage_start.isoformat()}, {artifact.coverage_end.isoformat()}] is not "
-                        f"fully covered by observed data [{observed_start.isoformat()}, {observed_end.isoformat()}]"
+                        f"declared coverage [{artifact.coverage_start.isoformat()}, {artifact.coverage_end.isoformat()}) is not "
+                        f"fully covered by observed bar coverage [{observed_start.isoformat()}, {observed_end_exclusive.isoformat()})"
                     ),
                 )
             )

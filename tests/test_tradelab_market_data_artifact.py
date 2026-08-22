@@ -444,6 +444,16 @@ class ArtifactFieldValidationTests(unittest.TestCase):
 
 
 class AuditConsistencyChecksTests(unittest.TestCase):
+    def test_one_minute_bar_end_matches_half_open_declared_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            csv_path = write(tmp, "bars.csv", CONTINUOUS_CSV)
+            artifact = continuous_artifact(sha256_of(csv_path), coverage_end=T0 + timedelta(minutes=2))
+            from tradelab.loaders import read_csv_bars
+
+            report = audit_market_data_artifact(artifact, read_csv_bars(csv_path), base_dir=tmp)
+            self.assertNotIn("declared_coverage_not_fully_observed", [f.category for f in report.findings])
+
     def test_continuous_series_with_multiple_contracts_is_critical(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
