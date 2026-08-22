@@ -1365,6 +1365,33 @@ class ProductionRunnerResumeIntegrationTests(unittest.TestCase):
             self.assertIn("parameters_json", str(ctx.exception))
 
 
+class ProductionInputReadinessGateTests(unittest.TestCase):
+    def test_missing_checksum_linked_special_session_schedule_fails_before_run_creation(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest_path, news_csv_path = _write_smoke_market_artifact(tmp)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["session_schedule_path"] = None
+            manifest["session_schedule_sha256"] = None
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            runs_dir = tmp / "runs"
+
+            with patch("tradelab.backtest_v2._current_git_provenance", return_value=("test-commit", False)):
+                with self.assertRaisesRegex(ValueError, "official CME holiday/early-close schedule"):
+                    run_production_backtest_v2(
+                        market_artifact_path=manifest_path,
+                        news_csv_path=news_csv_path,
+                        runs_dir=runs_dir,
+                        pivot_strength=2,
+                        reclaim_window_bars=3,
+                        min_entries_per_year=1,
+                        run_id="must-not-exist",
+                        command="test",
+                    )
+
+            self.assertFalse((runs_dir / "must-not-exist").exists())
+
+
 class DirtyWorkingTreeRejectionTests(unittest.TestCase):
     """Task 043's final research-integrity guard: ``run_production_
     backtest_v2`` must refuse to start OR resume when the working tree
