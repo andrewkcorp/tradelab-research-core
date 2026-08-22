@@ -149,6 +149,8 @@ class MarketDataArtifact:
     sha256: str
     roll_manifest_path: str | None = None
     normalization_method: str | None = None
+    roll_audit_path: str | None = None
+    roll_audit_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -175,6 +177,17 @@ class MarketDataArtifact:
             raise ValueError(f"MarketDataArtifact.coverage_start ({self.coverage_start!r}) must be < coverage_end ({self.coverage_end!r})")
         if not _looks_like_sha256(self.sha256):
             raise ValueError(f"MarketDataArtifact.sha256 must be a 64-character lowercase hex digest, got {self.sha256!r}")
+        if (self.roll_audit_path is None) != (self.roll_audit_sha256 is None):
+            raise ValueError("MarketDataArtifact.roll_audit_path and roll_audit_sha256 must be supplied together")
+        if self.roll_audit_path is not None:
+            if self.series_kind != SeriesKind.CONTINUOUS:
+                raise ValueError("MarketDataArtifact roll-audit provenance is only valid for series_kind=continuous")
+            if not self.roll_audit_path:
+                raise ValueError("MarketDataArtifact.roll_audit_path must be non-empty when supplied")
+            if not _looks_like_sha256(self.roll_audit_sha256):
+                raise ValueError(
+                    "MarketDataArtifact.roll_audit_sha256 must be a 64-character lowercase hex digest when supplied"
+                )
 
         if self.series_kind == SeriesKind.RAW_QUARTERLY:
             if not self.roll_manifest_path:
@@ -208,6 +221,8 @@ class MarketDataArtifact:
             "sha256": self.sha256,
             "roll_manifest_path": self.roll_manifest_path,
             "normalization_method": self.normalization_method,
+            "roll_audit_path": self.roll_audit_path,
+            "roll_audit_sha256": self.roll_audit_sha256,
         }
 
 
@@ -235,6 +250,8 @@ def load_market_data_artifact(path: Path | str) -> MarketDataArtifact:
             sha256=raw["sha256"],
             roll_manifest_path=raw.get("roll_manifest_path"),
             normalization_method=raw.get("normalization_method"),
+            roll_audit_path=raw.get("roll_audit_path"),
+            roll_audit_sha256=raw.get("roll_audit_sha256"),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"Invalid market data artifact manifest {path}: {error}") from error
@@ -366,6 +383,39 @@ def audit_market_data_artifact(
                 severity=AuditSeverity.CRITICAL,
                 category="checksum_mismatch",
                 message=f"sha256 of {data_path} is {sha256_actual!r}, manifest declares {artifact.sha256!r}",
+            )
+        )
+
+    if artifact.roll_audit_path is not None:
+        roll_audit_path = _resolve_path(artifact.roll_audit_path, base_dir)
+        try:
+            roll_audit_actual = hashlib.sha256(roll_audit_path.read_bytes()).hexdigest()
+        except OSError as error:
+            findings.append(
+                AuditFinding(
+                    severity=AuditSeverity.CRITICAL,
+                    category="roll_audit_missing",
+                    message=f"cannot read declared roll audit {roll_audit_path}: {error}",
+                )
+            )
+        else:
+            if roll_audit_actual != artifact.roll_audit_sha256:
+                findings.append(
+                    AuditFinding(
+                        severity=AuditSeverity.CRITICAL,
+                        category="roll_audit_checksum_mismatch",
+                        message=(
+                            f"sha256 of roll audit {roll_audit_path} is {roll_audit_actual!r}, manifest declares "
+                            f"{artifact.roll_audit_sha256!r}"
+                        ),
+                    )
+                )
+    elif artifact.series_kind == SeriesKind.CONTINUOUS and artifact.normalization_method and "volume_front_month" in artifact.normalization_method:
+        findings.append(
+            AuditFinding(
+                severity=AuditSeverity.WARNING,
+                category="roll_audit_provenance_missing",
+                message="continuous volume-front-month artifact does not transitively link its roll audit and checksum",
             )
         )
 

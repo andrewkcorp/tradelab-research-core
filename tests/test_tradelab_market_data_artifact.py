@@ -351,6 +351,33 @@ class RollManifestLoaderTests(unittest.TestCase):
 
 
 class ArtifactFieldValidationTests(unittest.TestCase):
+    def test_roll_audit_path_and_checksum_must_be_supplied_together(self):
+        with self.assertRaises(ValueError):
+            MarketDataArtifact(
+                schema_version="1.0", source_name="x", instrument_root=Instrument.NQ, bar_interval="1m",
+                timestamp_timezone="UTC", series_kind=SeriesKind.CONTINUOUS, data_path="bars.csv",
+                coverage_start=T0, coverage_end=T0.replace(minute=31), sha256="0" * 64,
+                normalization_method="m", roll_audit_path="roll.json",
+            )
+
+    def test_declared_roll_audit_checksum_is_verified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            csv_path = write(tmp, "bars.csv", CONTINUOUS_CSV)
+            write(tmp, "roll.json", "{}\n")
+            artifact = MarketDataArtifact(
+                schema_version="1.0", source_name="x", instrument_root=Instrument.NQ, bar_interval="1m",
+                timestamp_timezone="UTC", series_kind=SeriesKind.CONTINUOUS, data_path="bars.csv",
+                coverage_start=T0, coverage_end=T0 + timedelta(minutes=2), sha256=sha256_of(csv_path),
+                normalization_method="volume_front_month_v1", roll_audit_path="roll.json",
+                roll_audit_sha256="0" * 64,
+            )
+            with self.assertRaises(ValueError):
+                load_market_data_series(artifact, base_dir=tmp)
+            from tradelab.loaders import read_csv_bars
+            report = audit_market_data_artifact(artifact, read_csv_bars(csv_path), base_dir=tmp)
+            self.assertIn("roll_audit_checksum_mismatch", [finding.category for finding in report.findings])
+
     def test_wrong_schema_version_rejected(self):
         with self.assertRaises(ValueError):
             MarketDataArtifact(
