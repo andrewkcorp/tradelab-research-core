@@ -2291,6 +2291,8 @@ def run_production_backtest_v2(
         artifact = load_market_data_artifact(artifact_path)
         reporter.progress(items_completed=1)
         series_result = load_market_data_series(artifact, base_dir=artifact_path.parent)
+        from tradelab.research_period import load_research_period_policy, require_discovery_only
+        require_discovery_only(series_result.bars, load_research_period_policy())
         reporter.progress(items_completed=2)
         news_events = read_news_events_csv(Path(news_csv_path))
         reporter.progress(items_completed=3)
