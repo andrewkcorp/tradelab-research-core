@@ -96,6 +96,7 @@ from tradelab.liquidity import (
     LOW,
     LiquidityDetectionResult,
     LiquidityLevel,
+    LiquidityLevelRevision,
     LiquidityStatus,
     LiquidityTakeEvent,
     LiquidityType,
@@ -205,6 +206,7 @@ def detect_session_liquidity(
 
     active_levels: dict[str, LiquidityLevel] = {}
     all_levels: dict[str, LiquidityLevel] = {}
+    level_revisions: list[LiquidityLevelRevision] = []
     takes: list[LiquidityTakeEvent] = []
     reclaims: list[ReclaimResult] = []
     reclaim_watches: list[_ReclaimWatch] = []
@@ -227,7 +229,8 @@ def detect_session_liquidity(
             open_anchor = open_anchors[key]
             if open_anchor is not None and anchor != open_anchor:
                 next_number = _finalize_session_window(
-                    key, open_anchor, timeframe, delta, candles_by_timestamp, active_levels, all_levels, next_number
+                    key, open_anchor, timeframe, delta, candles_by_timestamp, active_levels, all_levels,
+                    level_revisions, next_number
                 )
                 open_anchors[key] = None
 
@@ -278,6 +281,7 @@ def detect_session_liquidity(
                 takes.append(take_event)
                 taken_level = replace(level, status=LiquidityStatus.TAKEN, taken_at=candle.known_at)
                 all_levels[level_id] = taken_level
+                level_revisions.append(LiquidityLevelRevision(candle.known_at, taken_level))
                 del active_levels[level_id]
                 newly_taken_watches.append(_ReclaimWatch(level=taken_level, take_event=take_event))
         reclaim_watches.extend(newly_taken_watches)
@@ -311,7 +315,12 @@ def detect_session_liquidity(
         )
 
     ordered_levels = sorted(all_levels.values(), key=lambda lv: (lv.formed_at, lv.level_id))
-    return LiquidityDetectionResult(levels=ordered_levels, takes=takes, reclaims=reclaims)
+    return LiquidityDetectionResult(
+        levels=ordered_levels,
+        takes=takes,
+        reclaims=reclaims,
+        level_revisions=tuple(sorted(level_revisions, key=lambda revision: (revision.effective_at, revision.level.level_id))),
+    )
 
 
 def _finalize_session_window(
@@ -322,6 +331,7 @@ def _finalize_session_window(
     candles_by_timestamp: dict[datetime, Candle],
     active_levels: dict[str, LiquidityLevel],
     all_levels: dict[str, LiquidityLevel],
+    level_revisions: list[LiquidityLevelRevision],
     next_number: int,
 ) -> int:
     """Build this occurrence's high/low levels only if every expected slot
@@ -362,4 +372,5 @@ def _finalize_session_window(
         )
         active_levels[level_id] = level
         all_levels[level_id] = level
+        level_revisions.append(LiquidityLevelRevision(formed_at, level))
     return next_number

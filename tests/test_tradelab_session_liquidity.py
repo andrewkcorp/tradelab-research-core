@@ -120,6 +120,23 @@ class SessionCompletionTests(unittest.TestCase):
                 self.assertEqual(high.status, LiquidityStatus.ACTIVE)
                 self.assertEqual(high.formed_at, candles[-1].known_at)
 
+    def test_level_revisions_preserve_pre_take_state(self):
+        candles = complete_session_candles("ny_lunch", DAY, highs={0: 105.0})
+        confirming = Candle(
+            candles[-1].known_at, 100, 100.1, 99.9, 100,
+            candles[-1].known_at + timedelta(minutes=1),
+        )
+        taking = Candle(
+            confirming.known_at, 105.0, 105.25, 104.9, 105.1,
+            confirming.known_at + timedelta(minutes=1),
+        )
+        result = detect_session_liquidity(candles + [confirming, taking], "1m", reclaim_window_bars=3)
+        high_type, _ = _session_types("ny_lunch")
+        revisions = [r for r in result.level_revisions if r.level.liquidity_type == high_type]
+        self.assertEqual([r.level.status for r in revisions], [LiquidityStatus.ACTIVE, LiquidityStatus.TAKEN])
+        self.assertIsNone(revisions[0].level.taken_at)
+        self.assertEqual(revisions[1].effective_at, taking.known_at)
+
 
 def _session_types(key: str):
     return _SESSION_LIQUIDITY_TYPES[key]
