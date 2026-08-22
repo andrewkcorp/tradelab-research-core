@@ -49,6 +49,8 @@ UNIVERSE_PAGE_MAX = 250
 UNIVERSE_CACHE_SECONDS = 60.0
 UNIVERSE_CACHE_MAX_ORDERS = 2
 _LOSS_LIMITS_2000_SQL = "__loss_limits_2000__"
+_PROFITABLE_MONTHS_SQL = "__profitable_months__"
+_WORST_MONTH_PNL_SQL = "__worst_month_pnl__"
 _PERF_JSON = "performance_validation_json"
 def _perf_sql(field: str) -> str:
     return f"json_extract({_PERF_JSON}, '$.{field}')"
@@ -70,8 +72,8 @@ _UNIVERSE_SORT_COLUMNS = {
     "daily_sharpe": _perf_sql("annualized_daily_sharpe"),
     "expectancy": _perf_sql("expectancy_usd"),
     "top_winner_share": _perf_sql("top_winner_share_of_positive_pnl"),
-    "profitable_years": _perf_sql("profitable_year_count"),
-    "worst_year_pnl": _perf_sql("minimum_year_net_pnl_usd"),
+    "profitable_months": _PROFITABLE_MONTHS_SQL,
+    "worst_month_pnl": _WORST_MONTH_PNL_SQL,
 }
 _RANGE_FILTER_COLUMNS = {
     "pnl": "net_pnl_usd", "roi": "roi", "win_rate": "win_rate",
@@ -85,8 +87,8 @@ _RANGE_FILTER_COLUMNS = {
     "daily_sharpe": _perf_sql("annualized_daily_sharpe"),
     "expectancy": _perf_sql("expectancy_usd"),
     "top_winner_share": _perf_sql("top_winner_share_of_positive_pnl"),
-    "profitable_years": _perf_sql("profitable_year_count"),
-    "worst_year_pnl": _perf_sql("minimum_year_net_pnl_usd"),
+    "profitable_months": _PROFITABLE_MONTHS_SQL,
+    "worst_month_pnl": _WORST_MONTH_PNL_SQL,
 }
 _BOOLEAN_FILTER_COLUMNS = {"apex_has_breach": "apex_has_breach"}
 
@@ -153,6 +155,22 @@ def _monthly_equity_curve(monthly: dict[str, object], *, starting_equity: float 
     return points
 
 
+def _monthly_stability_metrics(monthly: dict[str, object]) -> dict[str, float | int | None]:
+    """Return calendar-month stability diagnostics from durable journal data.
+
+    These deliberately replace the much coarser year diagnostics in the UI.
+    They work for both historic rows and rows written by an active run, without
+    mutating the journal or changing any backtest result.
+    """
+    values = [float(value.get("net_pnl_usd", 0.0)) for value in monthly.values() if isinstance(value, dict)]
+    return {
+        "profitable_month_count": sum(value > 0 for value in values),
+        "evaluated_month_count": len(values),
+        "minimum_month_net_pnl_usd": min(values) if values else None,
+        "maximum_month_net_pnl_usd": max(values) if values else None,
+    }
+
+
 def _build_universe_order(run_dir: Path, *, sort_key: str, direction: str, min_trades: int, filters: dict[str, object]) -> list[int] | None:
     """Build a compact, read-only order snapshot (SQLite rowids only)."""
     sort_column = _UNIVERSE_SORT_COLUMNS.get(sort_key)
@@ -172,6 +190,10 @@ def _build_universe_order(run_dir: Path, *, sort_key: str, direction: str, min_t
         )
         if sort_column == _LOSS_LIMITS_2000_SQL:
             sort_column = f"CAST(({loss_drawdown_column}) / 2000.0 AS INTEGER)"
+        elif sort_column == _PROFITABLE_MONTHS_SQL:
+            sort_column = "(SELECT COUNT(*) FROM json_each(monthly_json) AS month WHERE CAST(json_extract(month.value, '$.net_pnl_usd') AS REAL) > 0)"
+        elif sort_column == _WORST_MONTH_PNL_SQL:
+            sort_column = "(SELECT MIN(CAST(json_extract(month.value, '$.net_pnl_usd') AS REAL)) FROM json_each(monthly_json) AS month)"
         elif _PERF_JSON in sort_column and _PERF_JSON not in columns:
             sort_column = "net_pnl_usd"
         order = "ASC" if direction == "asc" else "DESC"
@@ -185,6 +207,10 @@ def _build_universe_order(run_dir: Path, *, sort_key: str, direction: str, min_t
         for key, filter_column in _RANGE_FILTER_COLUMNS.items():
             if filter_column == _LOSS_LIMITS_2000_SQL:
                 filter_column = f"CAST(({loss_drawdown_column}) / 2000.0 AS INTEGER)"
+            elif filter_column == _PROFITABLE_MONTHS_SQL:
+                filter_column = "(SELECT COUNT(*) FROM json_each(monthly_json) AS month WHERE CAST(json_extract(month.value, '$.net_pnl_usd') AS REAL) > 0)"
+            elif filter_column == _WORST_MONTH_PNL_SQL:
+                filter_column = "(SELECT MIN(CAST(json_extract(month.value, '$.net_pnl_usd') AS REAL)) FROM json_each(monthly_json) AS month)"
             elif _PERF_JSON in filter_column and _PERF_JSON not in columns:
                 continue
             elif _PERF_JSON not in filter_column and filter_column not in columns:
@@ -305,6 +331,8 @@ def _read_universe_leaders(
          mtm_max_drawdown, mtm_worst_equity_at, ambiguous_same_bar_exit_count,
          performance_validation_json, stop_slippage_sensitivity_json) = by_rowid[rowid]
         performance_validation = json.loads(performance_validation_json or "{}")
+        monthly = json.loads(monthly_json or "{}")
+        performance_validation.update(_monthly_stability_metrics(monthly))
         slippage_sensitivity = json.loads(stop_slippage_sensitivity_json or "{}")
         detailed = detailed_by_id.get(strategy_id)
         if detailed is not None:
@@ -333,7 +361,6 @@ def _read_universe_leaders(
             detailed["rank"] = position
             entries.append(detailed)
             continue
-        monthly = json.loads(monthly_json)
         trades_by_month = {month: int(value.get("trade_count", 0)) for month, value in monthly.items() if isinstance(value, dict)}
         entries.append({
             "rank": position,
@@ -496,7 +523,7 @@ class _DashboardRequestHandler(BaseHTTPRequestHandler):
                         "profit_factor": "profit_factor", "average_r": "average_r",
                         "daily_sharpe": "annualized_daily_sharpe", "expectancy": "expectancy_usd",
                         "top_winner_share": "top_winner_share_of_positive_pnl",
-                        "profitable_years": "profitable_year_count", "worst_year_pnl": "minimum_year_net_pnl_usd",
+                        "profitable_months": "profitable_month_count", "worst_month_pnl": "minimum_month_net_pnl_usd",
                     }[sort_key]
                     for entry in payload.get("entries", []):
                         entry[sort_key] = (entry.get("performance_validation") or {}).get(field)
@@ -778,8 +805,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       <input id="f-daily-sharpe-min" type="number" step="0.01" placeholder="Min daily Sharpe"><input id="f-daily-sharpe-max" type="number" step="0.01" placeholder="Max daily Sharpe">
       <input id="f-expectancy-min" type="number" placeholder="Min expectancy ($)"><input id="f-expectancy-max" type="number" placeholder="Max expectancy ($)">
       <input id="f-top-winner-share-min" type="number" step="0.01" placeholder="Min top-winner share"><input id="f-top-winner-share-max" type="number" step="0.01" placeholder="Max top-winner share">
-      <input id="f-profitable-years-min" type="number" min="0" step="1" placeholder="Min profitable years"><input id="f-profitable-years-max" type="number" min="0" step="1" placeholder="Max profitable years">
-      <input id="f-worst-year-pnl-min" type="number" placeholder="Min worst-year P&amp;L ($)"><input id="f-worst-year-pnl-max" type="number" placeholder="Max worst-year P&amp;L ($)">
+      <input id="f-profitable-months-min" type="number" min="0" step="1" placeholder="Min profitable months"><input id="f-profitable-months-max" type="number" min="0" step="1" placeholder="Max profitable months">
+      <input id="f-worst-month-pnl-min" type="number" placeholder="Min worst-month P&amp;L ($)"><input id="f-worst-month-pnl-max" type="number" placeholder="Max worst-month P&amp;L ($)">
       <div class="check-group"><span class="group-label">Direction</span><label><input type="checkbox" data-filter="direction" value="long">Long</label><label><input type="checkbox" data-filter="direction" value="short">Short</label><label><input type="checkbox" data-filter="direction" value="both">Both</label></div>
       <div class="check-group"><span class="group-label">Instrument</span><label><input type="checkbox" data-filter="instrument" value="MNQ">MNQ</label></div>
       <div class="check-group"><span class="group-label">Apex EOD audit</span><label><input id="f-apex-pass" type="checkbox">No recorded breach</label><label><input id="f-apex-breach" type="checkbox">Recorded breach</label></div>
@@ -796,7 +823,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       <table id="leaders-table" style="display:none">
         <thead><tr>
           <th class="num">Position</th><th>Strategy</th><th class="num"><button class="sort-button" data-sort-key="pnl">P&amp;L <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="roi">ROI <span class="sort-indicator"></span></button></th>
-          <th class="num"><button class="sort-button" data-sort-key="win_rate">Win rate <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="trade_count">Trades <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="max_drawdown">Max DD <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="profit_factor">PF <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="average_r">Avg R <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="daily_sharpe">Sharpe <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="profitable_years">Positive years <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="worst_year_pnl">Worst year <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="drawdowns_over_2000_count">$2k limits <span class="sort-indicator"></span></button></th>
+          <th class="num"><button class="sort-button" data-sort-key="win_rate">Win rate <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="trade_count">Trades <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="max_drawdown">Max DD <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="profit_factor">PF <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="average_r">Avg R <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="daily_sharpe">Sharpe <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="profitable_months">Positive months <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="worst_month_pnl">Worst month <span class="sort-indicator"></span></button></th><th class="num"><button class="sort-button" data-sort-key="drawdowns_over_2000_count">$2k limits <span class="sort-indicator"></span></button></th>
         </tr></thead>
         <tbody id="leaders-tbody"></tbody>
       </table>
@@ -986,11 +1013,11 @@ function renderActiveWork(status) {
   }
 }
 
-const SORT_LABELS = {rank:"original rank", pnl:"realised P&L", roi:"ROI", win_rate:"win rate", trade_count:"trade count", max_drawdown:"max drawdown", profit_factor:"profit factor", average_r:"average R", daily_sharpe:"daily Sharpe", expectancy:"expectancy", top_winner_share:"top-winner concentration", profitable_years:"profitable years", worst_year_pnl:"worst-year P&L", drawdowns_over_2000_count:"$2k loss limits consumed"};
+const SORT_LABELS = {rank:"original rank", pnl:"realised P&L", roi:"ROI", win_rate:"win rate", trade_count:"trade count", max_drawdown:"max drawdown", profit_factor:"profit factor", average_r:"average R", daily_sharpe:"daily Sharpe", expectancy:"expectancy", top_winner_share:"top-winner concentration", profitable_months:"profitable months", worst_month_pnl:"worst-month P&L", drawdowns_over_2000_count:"$2k loss limits consumed"};
 function sortedEntries(leaderboard) {
   const sign = leaderboardSort.dir === "asc" ? 1 : -1;
   return ((leaderboard && leaderboard.entries) || []).slice().sort((a,b) => {
-    const metric = e => ({profit_factor:e.performance_validation?.profit_factor, average_r:e.performance_validation?.average_r, daily_sharpe:e.performance_validation?.annualized_daily_sharpe, expectancy:e.performance_validation?.expectancy_usd, top_winner_share:e.performance_validation?.top_winner_share_of_positive_pnl, profitable_years:e.performance_validation?.profitable_year_count, worst_year_pnl:e.performance_validation?.minimum_year_net_pnl_usd}[leaderboardSort.key] ?? e[leaderboardSort.key]);
+    const metric = e => ({profit_factor:e.performance_validation?.profit_factor, average_r:e.performance_validation?.average_r, daily_sharpe:e.performance_validation?.annualized_daily_sharpe, expectancy:e.performance_validation?.expectancy_usd, top_winner_share:e.performance_validation?.top_winner_share_of_positive_pnl, profitable_months:e.performance_validation?.profitable_month_count, worst_month_pnl:e.performance_validation?.minimum_month_net_pnl_usd}[leaderboardSort.key] ?? e[leaderboardSort.key]);
     const av = Number(metric(a)), bv = Number(metric(b));
     if (av === bv) return a.rank - b.rank;
     return (av - bv) * sign;
@@ -1053,8 +1080,8 @@ function renderStrategySummary(leaderboard) {
     <div class="card"><div class="label">P&amp;L with +3 stop ticks</div><div class="value ${slippage3 >= 0 ? "pnl-pos" : "pnl-neg"}">${fmtMoney(slippage3)}</div><div class="subtle">analytic sensitivity, signals unchanged</div></div>
     <div class="card"><div class="label">Top-winner concentration</div><div class="value">${fmtPct(validation.top_winner_share_of_positive_pnl)}</div><div class="subtle">largest win ÷ all positive P&amp;L</div></div>`;
   box.innerHTML += `
-    <div class="card"><div class="label">Profitable years</div><div class="value">${fmtNum(validation.profitable_year_count)} / ${fmtNum(validation.evaluated_year_count)}</div><div class="subtle">calendar-year net P&amp;L above zero</div></div>
-    <div class="card"><div class="label">Worst calendar year</div><div class="value ${(validation.minimum_year_net_pnl_usd ?? 0) >= 0 ? "pnl-pos" : "pnl-neg"}">${fmtMoney(validation.minimum_year_net_pnl_usd)}</div><div class="subtle">period-stability diagnostic</div></div>`;
+    <div class="card"><div class="label">Profitable months</div><div class="value">${fmtNum(validation.profitable_month_count)} / ${fmtNum(validation.evaluated_month_count)}</div><div class="subtle">calendar-month net P&amp;L above zero</div></div>
+    <div class="card"><div class="label">Worst calendar month</div><div class="value ${(validation.minimum_month_net_pnl_usd ?? 0) >= 0 ? "pnl-pos" : "pnl-neg"}">${fmtMoney(validation.minimum_month_net_pnl_usd)}</div><div class="subtle">period-stability diagnostic</div></div>`;
 }
 
 function renderLeaders(leaderboard) {
@@ -1076,8 +1103,8 @@ function renderLeaders(leaderboard) {
       <td class="num">${fmtNum(e.performance_validation?.profit_factor)}</td>
       <td class="num">${fmtNum(e.performance_validation?.average_r)}</td>
       <td class="num">${fmtNum(e.performance_validation?.annualized_daily_sharpe)}</td>
-      <td class="num">${fmtNum(e.performance_validation?.profitable_year_count)} / ${fmtNum(e.performance_validation?.evaluated_year_count)}</td>
-      <td class="num ${(e.performance_validation?.minimum_year_net_pnl_usd ?? 0) >= 0 ? "pnl-pos" : "pnl-neg"}">${fmtMoney(e.performance_validation?.minimum_year_net_pnl_usd)}</td>
+      <td class="num">${fmtNum(e.performance_validation?.profitable_month_count)} / ${fmtNum(e.performance_validation?.evaluated_month_count)}</td>
+      <td class="num ${(e.performance_validation?.minimum_month_net_pnl_usd ?? 0) >= 0 ? "pnl-pos" : "pnl-neg"}">${fmtMoney(e.performance_validation?.minimum_month_net_pnl_usd)}</td>
       <td class="num">${fmtNum(e.drawdowns_over_2000_count)}</td>
     </tr>`).join("");
   document.querySelectorAll("#leaders-tbody tr").forEach(row => row.addEventListener("click", () => {
@@ -1294,7 +1321,7 @@ async function loadLeaderboardPage(reset = false) {
   if (reset) { leaderboardOffset = 0; leaderboardTotal = 0; lastLeaderboard = null; }
   const offset = reset ? 0 : leaderboardOffset;
   const filters = new URLSearchParams();
-  const fieldMap = {"pnl-min":"pnl_min","pnl-max":"pnl_max","roi-min":"roi_min","roi-max":"roi_max","win-rate-min":"win_rate_min","win-rate-max":"win_rate_max","trade-count-min":"min_trades","trade-count-max":"trade_count_max","max-drawdown-min":"max_drawdown_min","max-drawdown-max":"max_drawdown_max","profit-factor-min":"profit_factor_min","profit-factor-max":"profit_factor_max","average-r-min":"average_r_min","average-r-max":"average_r_max","daily-sharpe-min":"daily_sharpe_min","daily-sharpe-max":"daily_sharpe_max","expectancy-min":"expectancy_min","expectancy-max":"expectancy_max","top-winner-share-min":"top_winner_share_min","top-winner-share-max":"top_winner_share_max","profitable-years-min":"profitable_years_min","profitable-years-max":"profitable_years_max","worst-year-pnl-min":"worst_year_pnl_min","worst-year-pnl-max":"worst_year_pnl_max","contains":"contains"};
+  const fieldMap = {"pnl-min":"pnl_min","pnl-max":"pnl_max","roi-min":"roi_min","roi-max":"roi_max","win-rate-min":"win_rate_min","win-rate-max":"win_rate_max","trade-count-min":"min_trades","trade-count-max":"trade_count_max","max-drawdown-min":"max_drawdown_min","max-drawdown-max":"max_drawdown_max","profit-factor-min":"profit_factor_min","profit-factor-max":"profit_factor_max","average-r-min":"average_r_min","average-r-max":"average_r_max","daily-sharpe-min":"daily_sharpe_min","daily-sharpe-max":"daily_sharpe_max","expectancy-min":"expectancy_min","expectancy-max":"expectancy_max","top-winner-share-min":"top_winner_share_min","top-winner-share-max":"top_winner_share_max","profitable-months-min":"profitable_months_min","profitable-months-max":"profitable_months_max","worst-month-pnl-min":"worst_month_pnl_min","worst-month-pnl-max":"worst_month_pnl_max","contains":"contains"};
   Object.entries(fieldMap).forEach(([id,key]) => { const value = document.getElementById("f-"+id).value.trim(); if (value) filters.set(key,value); });
   ["direction","instrument","tp_kind","sl_kind","confluence","session"].forEach(key => { const values = [...document.querySelectorAll(`[data-filter="${key}"]:checked`)].map(el => el.value); if (values.length) filters.set(key, values.join(",")); });
   const apexPass = document.getElementById("f-apex-pass").checked, apexBreach = document.getElementById("f-apex-breach").checked;

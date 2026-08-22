@@ -119,10 +119,10 @@ class IndexPageTests(_ServerTestCase):
         self.assertIn('data-sort-key="pnl"', DASHBOARD_HTML)
         self.assertIn('data-sort-key="max_drawdown"', DASHBOARD_HTML)
         self.assertIn('data-sort-key="win_rate"', DASHBOARD_HTML)
-        self.assertIn('data-sort-key="profitable_years"', DASHBOARD_HTML)
-        self.assertIn('data-sort-key="worst_year_pnl"', DASHBOARD_HTML)
-        self.assertIn('id="f-profitable-years-min"', DASHBOARD_HTML)
-        self.assertIn('id="f-worst-year-pnl-max"', DASHBOARD_HTML)
+        self.assertIn('data-sort-key="profitable_months"', DASHBOARD_HTML)
+        self.assertIn('data-sort-key="worst_month_pnl"', DASHBOARD_HTML)
+        self.assertIn('id="f-profitable-months-min"', DASHBOARD_HTML)
+        self.assertIn('id="f-worst-month-pnl-max"', DASHBOARD_HTML)
         self.assertIn("leaderboardSort", DASHBOARD_HTML)
         self.assertIn("Profit factor", DASHBOARD_HTML)
         self.assertIn("Largest win", DASHBOARD_HTML)
@@ -223,6 +223,21 @@ class ArtifactParsingTests(_ServerTestCase):
         status, body = self._get("/api/runs/run-universe/leaderboard?scope=all&sort=win_rate&dir=desc")
         self.assertEqual(status, 200)
         self.assertEqual([entry["strategy_id"] for entry in json.loads(body)["entries"]], ["profit-mid-dd", "profit-high-dd", "loss-low-dd"])
+
+    def test_month_stability_filters_and_sorts_use_monthly_journal_pnl(self):
+        create_run(runs_dir=self.runs_dir, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="run-month-stability")
+        self._write_variant_journal("run-month-stability", [
+            ("two-positive", 50.0, .001, .5, 140, 100.0, 0, '{"2024-01":{"net_pnl_usd":20,"trade_count":40},"2024-02":{"net_pnl_usd":35,"trade_count":50},"2024-03":{"net_pnl_usd":-5,"trade_count":50}}'),
+            ("one-positive", 20.0, .0004, .5, 140, 100.0, 0, '{"2024-01":{"net_pnl_usd":50,"trade_count":70},"2024-02":{"net_pnl_usd":-2,"trade_count":70}}'),
+        ])
+        status, body = self._get("/api/runs/run-month-stability/leaderboard?scope=all&sort=profitable_months&dir=desc")
+        self.assertEqual(status, 200)
+        entries = json.loads(body)["entries"]
+        self.assertEqual([entry["strategy_id"] for entry in entries], ["two-positive", "one-positive"])
+        self.assertEqual(entries[0]["performance_validation"]["profitable_month_count"], 2)
+        status, body = self._get("/api/runs/run-month-stability/leaderboard?scope=all&worst_month_pnl_min=-4")
+        self.assertEqual(status, 200)
+        self.assertEqual([entry["strategy_id"] for entry in json.loads(body)["entries"]], ["one-positive"])
 
     def test_2k_limit_sort_uses_mtm_drawdown_units_not_legacy_episode_edges(self):
         create_run(runs_dir=self.runs_dir, market_artifact_path=None, news_csv_path=None, parameters={}, run_id="run-loss-limits")
