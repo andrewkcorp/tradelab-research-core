@@ -2255,6 +2255,18 @@ def run_production_backtest_v2(
     ``run_manifest.json`` (``RunManifest.git_commit_dirty``).
     """
     _require_clean_working_tree()
+    # Production discovery is fail-closed on historical holiday/early-close
+    # provenance.  A missing schedule used to silently omit legitimate HTF
+    # candles on shortened sessions.  Preflight remains available to inspect
+    # incomplete artifacts, but an expensive result-producing run must not
+    # start until the market manifest transitively authenticates the schedule.
+    from tradelab.market_data_artifact import load_market_data_artifact as _load_artifact_gate
+    artifact_gate = _load_artifact_gate(Path(market_artifact_path))
+    if artifact_gate.session_schedule_path is None or artifact_gate.session_schedule_sha256 is None:
+        raise ValueError(
+            "production run requires a checksum-linked official CME holiday/early-close schedule; "
+            "run the pre-run quality audit to inspect the incomplete artifact"
+        )
     runs_dir = Path(runs_dir)
     resuming = run_id is not None and (runs_dir / run_id / "backtest_v2_journal.sqlite3").is_file()
 

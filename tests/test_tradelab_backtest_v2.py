@@ -276,11 +276,21 @@ def _write_smoke_market_artifact(tmp: Path) -> tuple[Path, Path]:
     bars_path.write_text("".join(lines), encoding="utf-8")
     sha256 = hashlib.sha256(bars_path.read_bytes()).hexdigest()
 
+    schedule_path = tmp / "special_sessions.json"
+    schedule_path.write_text(json.dumps({
+        "schema_version": "cme-special-session-schedule-v1",
+        "source_url": "https://www.cmegroup.com/trading-hours.html#synthetic-test-fixture",
+        "retrieved_at": "2026-08-22T00:00:00Z",
+        "closed_intervals": [],
+    }), encoding="utf-8")
+    schedule_sha256 = hashlib.sha256(schedule_path.read_bytes()).hexdigest()
+
     artifact = MarketDataArtifact(
         schema_version="1.0", source_name="test-fixture", instrument_root=Instrument.NQ, bar_interval="1m",
         timestamp_timezone="UTC", series_kind=SeriesKind.CONTINUOUS, data_path="bars.csv",
         coverage_start=start, coverage_end=start + timedelta(minutes=900), sha256=sha256,
         normalization_method="additive_back_adjustment",
+        session_schedule_path="special_sessions.json", session_schedule_sha256=schedule_sha256,
     )
     manifest_path = tmp / "manifest.json"
     manifest_path.write_text(json.dumps(artifact.to_dict()), encoding="utf-8")
