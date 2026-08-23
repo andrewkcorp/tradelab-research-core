@@ -1949,5 +1949,134 @@ class FVGZoneStateEquivalenceTests(unittest.TestCase):
         self.assertGreater(checked, 0)
 
 
+class SharedSnapshotPartsEquivalenceTests(unittest.TestCase):
+    """``iter_candidate_entry_snapshots`` reuses the identical immutable
+    objects for the unchanged parts of every ``MarketStateSnapshot``
+    (active selector sets, per-(timeframe, direction) sorted zone-id
+    tuples, their containing mappings, and the ``BiasSnapshot``) rather
+    than rebuilding a fresh copy per snapshot.
+
+    That is a pure allocation optimisation, so it must be *value*-identical
+    to the original copy-per-snapshot behaviour, which stays reachable as
+    ``_share_immutable_parts=False``. These tests prove three separate
+    things, because any one of them alone would be satisfiable by a broken
+    implementation: the two paths produce equal values; the sharing path
+    genuinely shares (otherwise the optimisation silently does nothing);
+    and a real change to the underlying active set is never served from a
+    stale cache."""
+
+    def _fixture(self, seed: int, count: int, base_hour: int):
+        rng = random.Random(seed)
+        candidates, mitigations = _random_fvg_zone_stories(rng, count, ny_dt(2026, 2, 9, base_hour, 0), f"shared{seed}")
+        fvg_res = fvg_result(*candidates, mitigations=mitigations)
+        liq_res = liquidity_result(*_random_liquidity_signals(rng, count // 3, ny_dt(2026, 2, 9, base_hour, 0), f"liq{seed}"))
+        bias_res = make_bias_result({
+            "1H": [bias_change("1H", BIAS_BULLISH, ny_dt(2026, 2, 9, base_hour, 30)),
+                   bias_change("1H", BIAS_BEARISH, ny_dt(2026, 2, 9, base_hour + 3, 0))],
+            "4H": [bias_change("4H", BIAS_BEARISH, ny_dt(2026, 2, 9, base_hour + 1, 0))],
+        })
+        return fvg_results_for(fvg_res), fvg_res, liq_res, bias_res
+
+    def _assert_streams_equal(self, args) -> int:
+        shared = list(iter_candidate_entry_snapshots(*args))
+        reference = list(iter_candidate_entry_snapshots(*args, _share_immutable_parts=False))
+        self.assertEqual(len(shared), len(reference))
+        self.assertGreater(len(shared), 0, "fixture produced no snapshots -- it would prove nothing")
+        for a, b in zip(shared, reference):
+            self.assertEqual(a.event, b.event)
+            self.assertEqual(a.market_state.as_of, b.market_state.as_of)
+            self.assertEqual(
+                a.market_state.active_fvg_selectors_by_direction,
+                b.market_state.active_fvg_selectors_by_direction,
+                f"selector sets differ at {a.event.event_id!r}",
+            )
+            self.assertEqual(
+                a.market_state.active_fvg_zone_ids_by_direction_selector,
+                b.market_state.active_fvg_zone_ids_by_direction_selector,
+                f"zone-id maps differ at {a.event.event_id!r}",
+            )
+            # Ordering is observable (tradelab.causality_audit records these
+            # mappings verbatim), so equality of the dicts is not enough --
+            # the tuples must be in the identical order too.
+            for direction, by_selector in a.market_state.active_fvg_zone_ids_by_direction_selector.items():
+                self.assertEqual(
+                    list(by_selector.items()),
+                    list(b.market_state.active_fvg_zone_ids_by_direction_selector[direction].items()),
+                    f"zone-id ordering differs at {a.event.event_id!r} direction={direction!r}",
+                )
+            self.assertEqual(a.market_state.bias, b.market_state.bias)
+        return len(shared)
+
+    def test_shared_and_reference_streams_are_value_identical(self):
+        self.assertGreater(self._assert_streams_equal(self._fixture(4242, 180, 9)), 0)
+
+    def test_shared_and_reference_streams_are_value_identical_on_a_second_seed(self):
+        self.assertGreater(self._assert_streams_equal(self._fixture(97531, 240, 9)), 0)
+
+    def test_sharing_path_actually_reuses_objects_across_batches(self):
+        args = self._fixture(31337, 200, 9)
+        shared = list(iter_candidate_entry_snapshots(*args))
+        reference = list(iter_candidate_entry_snapshots(*args, _share_immutable_parts=False))
+
+        def distinct_map_ids(snapshots):
+            return {id(s.market_state.active_fvg_zone_ids_by_direction_selector) for s in snapshots}
+
+        def distinct_tuple_ids(snapshots):
+            return {
+                id(tup)
+                for s in snapshots
+                for by_selector in s.market_state.active_fvg_zone_ids_by_direction_selector.values()
+                for tup in by_selector.values()
+            }
+
+        # Both paths already share one MarketStateSnapshot between the events
+        # of a single batch, so the reference count is per batch, not per
+        # snapshot -- the claim under test is that sharing strictly and
+        # substantially reduces it further, across batches.
+        self.assertLess(len(distinct_map_ids(shared)), len(distinct_map_ids(reference)))
+        self.assertLess(len(distinct_tuple_ids(shared)), len(distinct_tuple_ids(reference)))
+        self.assertLessEqual(len(distinct_tuple_ids(shared)) * 2, len(distinct_tuple_ids(reference)))
+
+    def test_a_changed_active_zone_set_is_never_served_from_a_stale_cache(self):
+        # Two zones form, then the first is mitigated. Every snapshot must
+        # report the active set as of its own instant, so the tuple served
+        # after the mitigation must not be the one cached before it.
+        t0 = ny_dt(2026, 4, 6, 9, 0)
+        first = fvg_candidate(zone_id="Z1", direction=LONG, known_at=t0)
+        second = fvg_candidate(zone_id="Z2", direction=LONG, known_at=t0 + timedelta(minutes=10))
+        third = fvg_candidate(zone_id="Z3", direction=LONG, known_at=t0 + timedelta(minutes=30))
+        res = fvg_result(
+            first, second, third,
+            mitigations=(
+                FVGMitigationEvent(
+                    zone_id="Z1", timeframe="1m", direction=LONG, lower=100.0, upper=102.0,
+                    timestamp=t0 + timedelta(minutes=20), known_at=t0 + timedelta(minutes=20),
+                ),
+            ),
+        )
+        by_id = {
+            s.event.event_id: s
+            for s in iter_candidate_entry_snapshots(fvg_results_for(res), res, EMPTY_LIQUIDITY, EMPTY_BIAS)
+        }
+        reference_by_id = {
+            s.event.event_id: s
+            for s in iter_candidate_entry_snapshots(
+                fvg_results_for(res), res, EMPTY_LIQUIDITY, EMPTY_BIAS, _share_immutable_parts=False
+            )
+        }
+        seen_sets = set()
+        for event_id, snapshot in by_id.items():
+            actual = snapshot.market_state.active_fvg_zone_ids_by_direction_selector
+            self.assertEqual(
+                actual,
+                reference_by_id[event_id].market_state.active_fvg_zone_ids_by_direction_selector,
+                f"stale or wrong active zone ids at {event_id!r}",
+            )
+            seen_sets.add(tuple(sorted((k, v) for k, v in actual.get(LONG, {}).items())))
+        # The fixture must genuinely change the active set, otherwise this
+        # test would pass even against a permanently frozen cache.
+        self.assertGreater(len(seen_sets), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

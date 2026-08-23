@@ -44,6 +44,7 @@ from tradelab.backtest_v2 import (
     _resolve_sl_candidate,
     _simulate_market_execution_reference,
     _TopNTracker,
+    _TARGET_CACHE_FAMILIES_PER_ENTRY,
     _target_cache_for_class,
     _yearly_monthly_breakdown,
     build_synthetic_smoke_context,
@@ -2478,14 +2479,36 @@ class EntryTargetCacheEquivalenceTests(unittest.TestCase):
     def test_production_class_cache_covers_all_revisited_target_families(self):
         """A dense class must not thrash a too-small cross-variant LRU.
 
-        Production resolves at most TP, liquidity-SL, 5m FVG-SL and 15m
-        FVG-SL for one observed entry.  Its scoped cache therefore has room
-        for every one of those exact keys before the next exit variant starts
-        again at entry one.
+        Production resolves at most six distinct keys for one observed entry:
+        TP, liquidity-SL, 5m FVG-SL, 15m FVG-SL, and the memoised linked-FVG
+        stop scan for each of those two timeframes.  Its scoped cache
+        therefore has room for every one of those exact keys before the next
+        exit variant starts again at entry one.
         """
         cache = _target_cache_for_class(31_327, include_data_wick_targets=False)
-        self.assertEqual(cache._max_entries, 31_327 * 4)
+        self.assertEqual(cache._max_entries, 31_327 * 6)
         self.assertFalse(cache._include_data_wick_targets)
+
+    def test_one_entry_never_exceeds_the_per_entry_cache_family_budget(self):
+        """The budget above is only correct if a single entry really cannot
+        produce more keys than it allows -- asserted against the real exit
+        variants rather than restated as a constant."""
+        context = build_synthetic_smoke_context()
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result,
+            context.htf_bias_result, min_entries_per_year=1,
+        )
+        equivalence_class = universe.equivalence_classes[0]
+        index = BarRangeIndex.build(context.bars_1m)
+        cache = EntryTargetCache()
+        one_entry = equivalence_class.observed_entries[:1]
+        for variant in ALL_EXIT_VARIANTS:
+            simulate_market_execution(
+                one_entry, equivalence_class.representative_spec.primary.direction, variant, context,
+                f"{equivalence_class.class_id}::{variant.variant_id}",
+                bar_range_index=index, entry_target_cache=cache,
+            )
+        self.assertLessEqual(len(cache), _TARGET_CACHE_FAMILIES_PER_ENTRY)
 
 
 class BatchedExitVariantExecutionTests(unittest.TestCase):

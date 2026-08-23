@@ -798,14 +798,35 @@ class _ActivePoolRefCounter:
     unique selectors)`` rather than growing with the number of
     snapshots taken."""
 
-    __slots__ = ("_selector_counts", "_instance_counts")
+    __slots__ = ("_selector_counts", "_instance_counts", "_selector_set_revision")
 
     def __init__(self) -> None:
         self._selector_counts: dict[str, dict[str, int]] = {}
         self._instance_counts: dict[str, int] = {}
+        # Bumped only when a direction's *selector key set* actually changes
+        # (a selector appears or disappears), never when a count merely moves
+        # up or down. ``active_selectors`` is therefore reusable between two
+        # snapshots taken across an unchanged key set -- see
+        # ``selector_set_revision``.
+        self._selector_set_revision: dict[str, int] = {}
+
+    def _bump(self, direction: str) -> None:
+        self._selector_set_revision[direction] = self._selector_set_revision.get(direction, 0) + 1
+
+    def selector_set_revision(self, direction: str) -> int:
+        """Monotonic revision of ``active_selectors(direction)``'s own value.
+
+        Equal revisions guarantee an equal selector set, so a caller may
+        safely reuse a previously built frozenset instead of allocating an
+        identical one. Used by ``iter_candidate_entry_snapshots``, which
+        would otherwise build ~1.2M identical frozensets on real MNQ data.
+        """
+        return self._selector_set_revision.get(direction, 0)
 
     def increment(self, direction: str, selector: str) -> None:
         sel_map = self._selector_counts.setdefault(direction, {})
+        if selector not in sel_map:
+            self._bump(direction)
         sel_map[selector] = sel_map.get(selector, 0) + 1
         self._instance_counts[direction] = self._instance_counts.get(direction, 0) + 1
 
@@ -814,6 +835,7 @@ class _ActivePoolRefCounter:
         remaining = sel_map[selector] - 1
         if remaining <= 0:
             del sel_map[selector]
+            self._bump(direction)
         else:
             sel_map[selector] = remaining
         self._instance_counts[direction] -= 1
@@ -855,11 +877,19 @@ class _RefCountingDict(dict):
     (liquidity is 2 levels deep, FVG is 3) without either caller
     needing to know about this class at all."""
 
-    __slots__ = ("_counter",)
+    __slots__ = ("_counter", "key_set_revision")
 
     def __init__(self, counter: "_ActivePoolRefCounter") -> None:
         super().__init__()
         self._counter = counter
+        # Monotonic revision of this dict's own *key set*, bumped on every
+        # insert of a new key and every removal -- never when an existing key
+        # is merely reassigned, which cannot change ``sorted(self)``. A
+        # snapshot consumer that only reads keys (see
+        # ``iter_candidate_entry_snapshots``) can therefore reuse a
+        # previously built ``tuple(sorted(...))`` whenever the revision is
+        # unchanged, instead of rebuilding an identical tuple per snapshot.
+        self.key_set_revision = 0
 
     def setdefault(self, key, default):
         if key in self:
@@ -867,17 +897,21 @@ class _RefCountingDict(dict):
         if isinstance(default, dict):
             default = _RefCountingDict(self._counter)
         dict.__setitem__(self, key, default)
+        self.key_set_revision += 1
         return default
 
     def __setitem__(self, key, value) -> None:
         is_new = key not in self
         dict.__setitem__(self, key, value)
-        if is_new and not isinstance(value, dict):
-            self._counter.increment(value.direction, value.selector)
+        if is_new:
+            self.key_set_revision += 1
+            if not isinstance(value, dict):
+                self._counter.increment(value.direction, value.selector)
 
     def __delitem__(self, key) -> None:
         value = self[key]
         dict.__delitem__(self, key)
+        self.key_set_revision += 1
         if not isinstance(value, dict):
             self._counter.decrement(value.direction, value.selector)
 
@@ -888,6 +922,7 @@ class _RefCountingDict(dict):
             raise KeyError(key)
         value = self[key]
         dict.__delitem__(self, key)
+        self.key_set_revision += 1
         if not isinstance(value, dict):
             self._counter.decrement(value.direction, value.selector)
         return value
@@ -1434,12 +1469,30 @@ def iter_candidate_entry_snapshots(
     fvg_result: FVGEntryCandidateResult,
     liquidity_result: LiquidityEntryCandidateResult,
     htf_bias_result: HTFBiasResult,
+    *,
+    _share_immutable_parts: bool = True,
 ) -> Iterator[CandidateEntrySnapshot]:
     """Yield one ``CandidateEntrySnapshot`` per real ``EntryEvent`` (see
     ``build_entry_events``), in chronological order -- the deterministic
     join of that event with the ``MarketStateSnapshot`` known at its own
     ``known_at``, and the primary, intended entry point for future
     strategy-discovery confluence semantics (spec, this task).
+
+    ``_share_immutable_parts`` (default ``True``) lets consecutive snapshots
+    reuse the *identical* immutable objects for the parts of
+    ``MarketStateSnapshot`` that did not change -- active selector sets,
+    per-(timeframe, direction) sorted zone-id tuples, their containing
+    mappings, and the ``BiasSnapshot``. This never changes a value, an
+    ordering, or a type: it only stops the generator from allocating ~1.2M
+    identical copies on real MNQ data, all of which
+    ``entry_strategy_universe.discover_entry_strategy_universe`` retains at
+    once (measured: ~30 GB of physical footprint before a single backtest
+    variant ran -- see ``docs/dense-class-memory-diagnostic.md``). Pass
+    ``False`` to get the original, copy-per-snapshot reference behavior; it
+    exists so ``tests/test_tradelab_entry_signal_timeline.py``'s
+    ``SharedSnapshotPartsEquivalenceTests`` can prove the two produce equal
+    values, and is never used in production. Consumers must treat every
+    ``MarketStateSnapshot`` field as read-only, which they already do.
 
     ``fvg_results`` (keyed by timeframe, exactly ``PreparedBacktestContext
     .fvg_results`` -- the raw detector output, **not** ``fvg_result``'s
@@ -1481,6 +1534,84 @@ def iter_candidate_entry_snapshots(
     bias_timeframe_states: dict[str, str] = {tf: NEUTRAL for tf in _BIAS_TIMEFRAMES}
     bias_global = NEUTRAL
 
+    # Structural-sharing caches for the immutable parts of MarketStateSnapshot.
+    #
+    # Every snapshot used to rebuild, from scratch, a frozenset of active
+    # selectors per direction, a sorted tuple of every active zone id per
+    # (timeframe, direction), the dicts containing them, and a BiasSnapshot.
+    # On real MNQ data that is ~1.2M snapshots x thousands of zone ids, all of
+    # them retained simultaneously by
+    # ``entry_strategy_universe.discover_entry_strategy_universe``'s own
+    # ``market_state_by_event_id`` -- measured at ~30 GB of physical footprint
+    # before a single backtest variant runs, which pushed the process into
+    # swap and collapsed throughput (see docs/dense-class-memory-diagnostic.md).
+    #
+    # The values below are *immutable and read-only* for every consumer, and
+    # consecutive snapshots overwhelmingly carry identical ones, so a snapshot
+    # reuses the previously built object whenever the underlying key set is
+    # provably unchanged (revision counters maintained by _RefCountingDict and
+    # _ActivePoolRefCounter). This changes no value, ordering, or type -- only
+    # how many identical copies of them exist at once.
+    zone_tuple_cache: dict[tuple[str, str], tuple[int, tuple[str, ...]]] = {}
+    zone_map_cache: dict[str, tuple[tuple, dict[str, tuple[str, ...]]]] = {}
+    selector_set_cache: dict[str, tuple[int, frozenset[str]]] = {}
+    outer_zone_map_cache: list = []  # [(long_map, short_map, outer_dict)]
+    outer_selector_cache: list = []  # [(long_set, short_set, outer_dict)]
+    bias_cache: list = []  # [(states_tuple, global_bias, BiasSnapshot)]
+
+    def _active_selectors_shared(direction: str) -> frozenset[str]:
+        if not _share_immutable_parts:
+            return counter.active_selectors(direction)
+        revision = counter.selector_set_revision(direction)
+        cached = selector_set_cache.get(direction)
+        if cached is not None and cached[0] == revision:
+            return cached[1]
+        built = counter.active_selectors(direction)
+        selector_set_cache[direction] = (revision, built)
+        return built
+
+    def _active_zone_ids_shared(direction: str) -> dict[str, tuple[str, ...]]:
+        # Signature is (timeframe, key_set_revision) for every non-empty pool,
+        # in zone_active's own insertion order -- so an unchanged signature
+        # guarantees both the same selectors and the same sorted zone ids, and
+        # the rebuilt dict below preserves the original comprehension's key
+        # order exactly.
+        signature = tuple(
+            (timeframe, getattr(zones, "key_set_revision", None))
+            for timeframe, by_direction in zone_active.items()
+            for zones in (by_direction.get(direction, ()),)
+            if zones
+        )
+        cached = zone_map_cache.get(direction)
+        if _share_immutable_parts and cached is not None and cached[0] == signature and all(rev is not None for _tf, rev in signature):
+            return cached[1]
+        built: dict[str, tuple[str, ...]] = {}
+        for timeframe, revision in signature:
+            zones = zone_active[timeframe][direction]
+            cache_key = (timeframe, direction)
+            entry = zone_tuple_cache.get(cache_key)
+            if not _share_immutable_parts or revision is None or entry is None or entry[0] != revision:
+                entry = (revision, tuple(sorted(zones)))
+                zone_tuple_cache[cache_key] = entry
+            built[_fvg_zone_selector(timeframe, FVGSourceType.FVG_TOUCH.value)] = entry[1]
+        zone_map_cache[direction] = (signature, built)
+        return built
+
+    def _pair_shared(cache: list, long_value, short_value) -> dict:
+        if _share_immutable_parts and cache and cache[0][0] is long_value and cache[0][1] is short_value:
+            return cache[0][2]
+        built = {LONG: long_value, SHORT: short_value}
+        cache[:] = [(long_value, short_value, built)]
+        return built
+
+    def _bias_shared() -> BiasSnapshot:
+        states = tuple(bias_timeframe_states.items())
+        if _share_immutable_parts and bias_cache and bias_cache[0][0] == states and bias_cache[0][1] == bias_global:
+            return bias_cache[0][2]
+        built = BiasSnapshot(timeframe_states=dict(bias_timeframe_states), global_bias=bias_global)
+        bias_cache[:] = [(states, bias_global, built)]
+        return built
+
     for formation_batch, fvg_batch, mitigation_batch, bias_batch, liquidity_batch in _merge_confluence_streams(
         all_zones, fvg_signals, fvg_result.zone_mitigations, bias_changes, liquidity_signals
     ):
@@ -1509,17 +1640,13 @@ def iter_candidate_entry_snapshots(
 
         market_state = MarketStateSnapshot(
             as_of=real_events[0].known_at,
-            active_fvg_selectors_by_direction={LONG: counter.active_selectors(LONG), SHORT: counter.active_selectors(SHORT)},
-            active_fvg_zone_ids_by_direction_selector={
-                direction: {
-                    _fvg_zone_selector(timeframe, FVGSourceType.FVG_TOUCH.value): tuple(sorted(zones))
-                    for timeframe, by_direction in zone_active.items()
-                    for zones in (by_direction.get(direction, {}),)
-                    if zones
-                }
-                for direction in (LONG, SHORT)
-            },
-            bias=BiasSnapshot(timeframe_states=dict(bias_timeframe_states), global_bias=bias_global),
+            active_fvg_selectors_by_direction=_pair_shared(
+                outer_selector_cache, _active_selectors_shared(LONG), _active_selectors_shared(SHORT)
+            ),
+            active_fvg_zone_ids_by_direction_selector=_pair_shared(
+                outer_zone_map_cache, _active_zone_ids_shared(LONG), _active_zone_ids_shared(SHORT)
+            ),
+            bias=_bias_shared(),
         )
         for signal in real_events:
             yield CandidateEntrySnapshot(event=_entry_event_from_signal(signal), market_state=market_state)

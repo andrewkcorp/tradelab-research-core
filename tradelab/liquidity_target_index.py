@@ -93,25 +93,30 @@ class LiquidityTargetIndex:
             if side == HIGH:
                 while index < len(prices) and prices[index] == price:
                     index += 1
-                group = levels[start:index]
+                group_start, group_stop = start, index
             else:
                 while index >= 0 and prices[index] == price:
                     index -= 1
-                group = levels[index + 1:start + 1]
-            # A single price tick can contain thousands of historical levels.
-            # The old ``extend`` materialised the entire eligible group even
-            # though callers can observe at most ``count`` (three) nearest
-            # levels. In a full sweep this transient allocation repeated for
-            # millions of entries, eventually pushing otherwise-freed memory
-            # into swap. Keep only the exact first ``remaining`` members of
-            # this equal-price group under the *same* final ordering key.
-            # ``nsmallest`` has O(group_size * log(count)) time and O(count)
-            # extra memory, rather than O(group_size) retained objects.
+                group_start, group_stop = index + 1, start + 1
+            # A single price tick can contain thousands of historical levels,
+            # while a caller can observe at most ``count`` (three) of them.
+            # Both the eligible-level list AND the equal-price group itself
+            # are therefore streamed: ``nsmallest`` over a generator that
+            # indexes ``levels`` directly costs O(group * log count) time and
+            # O(count) memory, whereas slicing ``levels[group_start:
+            # group_stop]`` first would allocate a fresh tuple of every
+            # pointer in the group -- measured at up to ~640 KB per call on
+            # real MNQ data, repeated for millions of entries (see
+            # docs/dense-class-memory-diagnostic.md).
             remaining = count - len(found)
             found.extend(
                 nsmallest(
                     remaining,
-                    (indexed.level for indexed in group if self._eligible(indexed, entry_known_at)),
+                    (
+                        levels[position].level
+                        for position in range(group_start, group_stop)
+                        if self._eligible(levels[position], entry_known_at)
+                    ),
                     key=lambda level: (level.formed_at, level.level_id),
                 )
             )

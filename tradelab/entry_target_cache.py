@@ -98,10 +98,20 @@ class EntryTargetCache:
         self._include_data_wick_targets = include_data_wick_targets
         self._tp: dict[str, TPTargetCandidateResult] = {}
         self._sl: dict[tuple[str, str | None, int | None], SLTargetCandidateResult] = {}
-        # One LRU order across both namespaces. Eviction is strictly a
+        # The linked-FVG stop *scan* (which zone an FVG-boundary SL resolves
+        # to) is memoised separately from the detector result it feeds: it
+        # depends only on the observed entry and the SL timeframe, never on
+        # which exit variant is asking, yet it used to run once per exit
+        # variant. On a dense 1m class that is a full pass over up to ~2,000
+        # active zones, repeated ~6x per entry for nothing -- see
+        # docs/dense-class-memory-diagnostic.md.
+        self._fvg_stop: dict[tuple[str, str], object] = {}
+        # One LRU order across all namespaces. Eviction is strictly a
         # performance/memory decision: a missing item is recomputed by the
         # same exact detector, never approximated.
         self._recency: OrderedDict[tuple[str, object], None] = OrderedDict()
+
+    _POOLS = {"tp": "_tp", "sl": "_sl", "fvg_stop": "_fvg_stop"}
 
     def _touch(self, key: tuple[str, object]) -> None:
         self._recency.pop(key, None)
@@ -109,10 +119,24 @@ class EntryTargetCache:
         if self._max_entries is not None:
             while len(self._recency) > self._max_entries:
                 namespace, evicted_key = self._recency.popitem(last=False)[0]
-                if namespace == "tp":
-                    self._tp.pop(evicted_key, None)
-                else:
-                    self._sl.pop(evicted_key, None)
+                getattr(self, self._POOLS[namespace]).pop(evicted_key, None)
+
+    def fvg_stop_candidate(self, entry_id: str, timeframe: str, compute):
+        """Memoise one entry's chosen FVG-boundary stop zone per timeframe.
+
+        ``compute`` is a zero-argument callable invoked only on a miss. A
+        legitimate ``None`` result (no eligible zone) is cached as such, and
+        is deliberately distinguishable from an absent key -- recomputing a
+        known-empty scan is exactly the waste this exists to remove.
+        """
+        key = (entry_id, timeframe)
+        if key in self._fvg_stop:
+            self._touch(("fvg_stop", key))
+            return self._fvg_stop[key]
+        value = compute()
+        self._fvg_stop[key] = value
+        self._touch(("fvg_stop", key))
+        return value
 
     def tp_candidates(
         self,
@@ -165,7 +189,7 @@ class EntryTargetCache:
         return result
 
     def __len__(self) -> int:
-        """Total number of memoized entries (TP + SL) -- purely
-        informational, e.g. for a diagnostic's own memory-estimate
+        """Total number of memoized entries (TP + SL + FVG stop scans) --
+        purely informational, e.g. for a diagnostic's own memory-estimate
         reporting."""
-        return len(self._tp) + len(self._sl)
+        return len(self._tp) + len(self._sl) + len(self._fvg_stop)

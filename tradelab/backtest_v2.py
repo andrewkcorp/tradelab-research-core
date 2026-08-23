@@ -250,15 +250,18 @@ DEFAULT_INSTRUMENTS: tuple[Instrument, ...] = (Instrument.MNQ,)
 # This cache is an exact speed optimisation only: eviction recomputes a
 # candidate and never changes a fill.  Keep it bounded tightly enough that a
 # pathological dense 1m class cannot dominate the process footprint.
-# An entry can contribute at most four distinct candidate lists during one
-# class's exit sweep: one TP list, one liquidity-SL list, and one FVG-boundary
-# list for each of the two allowed FVG SL timeframes.  This is deliberately a
-# *per-equivalence-class* bound (see `_target_cache_for_class`), not a
-# run-wide one.  A smaller run-wide LRU looked safe on paper, but a dense class
-# has more entries than the LRU: scanning the next exit variant from the
-# beginning then evicts every cached tail entry before it is revisited.  That
-# produced no useful cache hits and enormous allocation/swap churn.
-_TARGET_CACHE_FAMILIES_PER_ENTRY = 4
+# An entry can contribute at most six distinct cache keys during one class's
+# exit sweep: one TP list, one liquidity-SL list, one FVG-boundary list for
+# each of the two allowed FVG SL timeframes, and one memoised linked-FVG stop
+# scan per those same two timeframes.  The bound must cover all of them, or
+# the LRU evicts entries the next exit variant is about to re-request.  This
+# is deliberately a *per-equivalence-class* bound (see
+# `_target_cache_for_class`), not a run-wide one.  A smaller run-wide LRU
+# looked safe on paper, but a dense class has more entries than the LRU:
+# scanning the next exit variant from the beginning then evicts every cached
+# tail entry before it is revisited.  That produced no useful cache hits and
+# enormous allocation/swap churn.
+_TARGET_CACHE_FAMILIES_PER_ENTRY = 6
 
 
 def _target_cache_for_class(entry_count: int, *, include_data_wick_targets: bool) -> EntryTargetCache:
@@ -546,11 +549,15 @@ def _nearest_linked_fvg_candidate_for_stop(
             return
         if market_entry.direction == SHORT and price <= market_entry.entry_price:
             return
-        key = (
-            abs(price - market_entry.entry_price),
-            known_at,
-            f"sl-fvg_boundary-{market_entry.entry_id}-{candidate.zone_id}",
-        )
+        # ``sl_targets._fvg_sl_candidates`` breaks ties on the full
+        # ``sl_target_id``, i.e. f"sl-fvg_boundary-{entry_id}-{zone_id}".
+        # Within this one call that string has a constant prefix, and
+        # concatenating an identical prefix preserves lexicographic order
+        # exactly -- so comparing ``zone_id`` alone selects the identical
+        # candidate while allocating nothing. Formatting the full id per
+        # considered zone measured ~33% of this function's runtime on a
+        # 5,000-zone entry (see docs/dense-class-memory-diagnostic.md).
+        key = (abs(price - market_entry.entry_price), known_at, candidate.zone_id)
         if best_key is None or key < best_key:
             best, best_key = candidate, key
 
@@ -632,7 +639,17 @@ def _resolve_sl_candidate(
             if candidate.rank == variant.sl_rank:
                 return candidate
         return None
-    linked = _nearest_linked_fvg_candidate_for_stop(entry, variant.sl_fvg_timeframe, market_entry)
+    # The scan below depends only on this observed entry and the SL
+    # timeframe -- never on which exit variant is asking -- so it is
+    # memoised per (entry, timeframe) rather than repeated for each of the
+    # ~6 FVG-boundary variants that share them.
+    if entry_target_cache is not None:
+        linked = entry_target_cache.fvg_stop_candidate(
+            market_entry.entry_id, variant.sl_fvg_timeframe,
+            lambda: _nearest_linked_fvg_candidate_for_stop(entry, variant.sl_fvg_timeframe, market_entry),
+        )
+    else:
+        linked = _nearest_linked_fvg_candidate_for_stop(entry, variant.sl_fvg_timeframe, market_entry)
     if linked is None:
         return None
     confluence = SelectedFVGConfluence(entry_id=market_entry.entry_id, fvg_candidates=(linked,))
