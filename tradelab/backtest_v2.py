@@ -1868,6 +1868,20 @@ class _TopNTracker:
             heapq.heappushpop(self._heap, (*key, entry))
         # else: not in the current top N -- discarded, never retained.
 
+    def offer_entry(self, entry: LeaderboardEntry) -> None:
+        """Merge an already-projected entry, e.g. one a worker computed.
+
+        Uses the identical ranking key as :meth:`offer` -- ``LeaderboardEntry``
+        carries ``pnl``, ``max_drawdown`` and ``strategy_id``, which is exactly
+        what ``_leaderboard_sort_key`` reads -- so a top-N merged from several
+        workers ranks the same as one built in a single process.
+        """
+        key = (entry.pnl, -entry.max_drawdown, entry.strategy_id)
+        if len(self._heap) < self._n:
+            heapq.heappush(self._heap, (*key, entry))
+        elif key > self._heap[0][:3]:
+            heapq.heappushpop(self._heap, (*key, entry))
+
     def top_entries(self) -> list[LeaderboardEntry]:
         """Best-first (rank 1 first) -- an O(n log n) sort over at most
         ``n`` entries, never over the full population ever offered."""

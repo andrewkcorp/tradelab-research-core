@@ -614,6 +614,7 @@ class LiveStatus:
     warnings: tuple[str, ...]
     errors: tuple[str, ...]
     active_work: Mapping[str, Any] | None = None  # task 044 -- see ActiveWork; None on older run folders, always backward compatible
+    multiprocess: Mapping[str, Any] | None = None  # worker pool state; None for single-process runs and every older run folder
 
     def __post_init__(self) -> None:
         RunPhase(self.phase)  # raises ValueError if not a legal phase
@@ -638,6 +639,7 @@ class LiveStatus:
             "top_strategies": [dict(s) for s in self.top_strategies],
             "warnings": list(self.warnings), "errors": list(self.errors),
             "active_work": (dict(self.active_work) if self.active_work is not None else None),
+            "multiprocess": (dict(self.multiprocess) if self.multiprocess is not None else None),
         }
 
     @staticmethod
@@ -653,6 +655,7 @@ class LiveStatus:
             exit_variants_generated=d.get("exit_variants_generated"), backtests_completed=d.get("backtests_completed"),
             top_strategies=tuple(d.get("top_strategies", ())), warnings=tuple(d.get("warnings", ())),
             errors=tuple(d.get("errors", ())), active_work=d.get("active_work"),  # absent on older run folders -- None, never a KeyError
+            multiprocess=d.get("multiprocess"),
         )
 
 
@@ -692,6 +695,7 @@ class RunReporter:
         self._warnings: list[str] = []
         self._errors: list[str] = []
         self._active_work: ActiveWork | None = None
+        self._multiprocess: dict | None = None
         self._last_heartbeat_monotonic: float | None = None
         # task 046: an RLock (not a plain Lock) -- _flush_status() itself
         # acquires this too (see its own docstring), and heartbeat()/
@@ -772,6 +776,29 @@ class RunReporter:
         if warning:
             self._warnings.append(warning)
         self._flush_status()
+
+    def record_multiprocess_state(self, state: Mapping[str, Any] | None) -> None:
+        """Publish worker-pool state to ``live_status.json``.
+
+        Single-process runs never call this, so the field stays ``None`` and
+        every existing reader and run directory is unaffected. Purely
+        observational: nothing here influences which variants run or what they
+        produce.
+        """
+        self._multiprocess = dict(state) if state is not None else None
+        self._flush_status()
+
+    def warn(self, message: str) -> None:
+        """Record a non-fatal warning on the run (dashboard + live status).
+
+        Used for things an operator must see but that do not invalidate
+        results -- a worker dying mid-shard, or the pool stepping down to one
+        worker under memory pressure.
+        """
+        if message:
+            self._warnings.append(message)
+            self._append_event("warning", {"message": message})
+            self._flush_status()
 
     def record_resource_usage(self, *, rss_bytes: int | None = None, cpu_seconds: float | None = None) -> None:
         """Sample and durably record this process's memory and CPU.
@@ -1061,6 +1088,7 @@ class RunReporter:
                 backtests_completed=self._backtests_completed, top_strategies=self._top_strategies,
                 warnings=tuple(self._warnings), errors=tuple(self._errors),
                 active_work=(self._active_work.to_dict() if self._active_work is not None else None),
+                multiprocess=self._multiprocess,
             )
             atomic_write_json(self._run_dir / "live_status.json", status.to_dict())
 

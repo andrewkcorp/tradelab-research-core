@@ -662,6 +662,11 @@ DASHBOARD_HTML = r"""<!doctype html>
   section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-dim); margin: 0 0 12px 0; }
   .progress-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
   .progress-bar-track { flex: 1; min-width: 200px; height: 10px; background: var(--bg-card); border-radius: 999px; overflow: hidden; border: 1px solid var(--border); }
+.mp-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+.mp-table th, .mp-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid rgba(128,128,128,0.2); }
+.mp-table th { font-weight: 600; opacity: 0.75; }
+.warn-banner { margin-top: 8px; padding: 6px 10px; border-radius: 4px; background: rgba(220,150,0,0.15); border: 1px solid rgba(220,150,0,0.4); font-size: 13px; }
+
   .progress-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), #7db2ff); transition: width 0.3s ease; }
   .stat { font-family: var(--mono); font-size: 13px; color: var(--text-dim); }
   .stat b { color: var(--text); font-weight: 600; }
@@ -752,6 +757,20 @@ DASHBOARD_HTML = r"""<!doctype html>
       </div>
       <div class="progress-row">
         <div class="progress-bar-track"><div id="progress-bar-fill" class="progress-bar-fill" style="width:0%"></div></div>
+      </div>
+      <div id="mp-panel" style="display:none">
+        <div class="progress-row">
+          <span class="stat">Workers: <b id="mp-workers">-</b></span>
+          <span class="stat" title="Variants per second across all workers.">Aggregate: <b id="mp-throughput">-</b></span>
+          <span class="stat">Shards: <b id="mp-shards">-</b></span>
+          <span class="stat" title="Coordinator process footprint. Workers are listed separately below.">Parent memory: <b id="mp-parent-mem">-</b></span>
+          <span class="stat" title="Parent plus all workers.">Aggregate memory: <b id="mp-total-mem">-</b></span>
+        </div>
+        <div id="mp-degraded" class="warn-banner" style="display:none"></div>
+        <table class="mp-table"><thead><tr>
+          <th>Worker</th><th>PID</th><th>State</th><th>Shard</th><th>Shards done</th>
+          <th>Variants</th><th>Throughput</th><th>Process memory</th>
+        </tr></thead><tbody id="mp-rows"></tbody></table>
       </div>
       <div class="timeline" id="phase-timeline"></div>
     </div>
@@ -885,6 +904,47 @@ function fmtSeconds(s) { if (s === null || s === undefined) return "-"; s = Math
 function fmtMoney(n) { if (n === null || n === undefined) return "-"; const sign = n < 0 ? "-" : ""; return sign + "$" + Math.abs(n).toLocaleString(undefined, {maximumFractionDigits: 2}); }
 function fmtPct(n) { if (n === null || n === undefined) return "-"; return (n*100).toFixed(1) + "%"; }
 function fmtBytes(n) { if (n === null || n === undefined) return "-"; const units = ["B","KB","MB","GB","TB"]; let i = 0; let v = n; while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; } return v.toFixed(v >= 10 || i === 0 ? 0 : 1) + " " + units[i]; }
+function renderMultiprocess(mp) {
+  // Absent for every single-process run and every run directory written
+  // before the pool existed -- the panel simply stays hidden.
+  const panel = document.getElementById("mp-panel");
+  if (!mp) { panel.style.display = "none"; return; }
+  panel.style.display = "block";
+  const live = mp.worker_count === null || mp.worker_count === undefined ? "?" : mp.worker_count;
+  const target = mp.target_worker_count === null || mp.target_worker_count === undefined ? "?" : mp.target_worker_count;
+  document.getElementById("mp-workers").textContent = live + (String(live) === String(target) ? "" : " (target " + target + ")");
+  document.getElementById("mp-throughput").textContent =
+    mp.aggregate_throughput_per_second === null || mp.aggregate_throughput_per_second === undefined
+      ? "-" : fmtNum(mp.aggregate_throughput_per_second) + "/s";
+  document.getElementById("mp-shards").textContent =
+    fmtNum(mp.shards_completed || 0) + " / " + fmtNum(mp.shards_total || 0)
+    + ((mp.shards_failed && mp.shards_failed.length) ? "  (" + mp.shards_failed.length + " failed)" : "");
+  document.getElementById("mp-parent-mem").textContent = fmtBytes(mp.parent_phys_footprint_bytes);
+  document.getElementById("mp-total-mem").textContent =
+    fmtBytes(mp.aggregate_phys_footprint_bytes)
+    + (mp.budget_bytes ? " / " + fmtBytes(mp.budget_bytes) + " budget" : "");
+
+  const degraded = document.getElementById("mp-degraded");
+  if (mp.degraded_reason) {
+    degraded.style.display = "block";
+    degraded.textContent = "Reduced to 1 worker: " + mp.degraded_reason
+      + (mp.system_swap_growth_bytes ? " (system swap grew " + fmtBytes(mp.system_swap_growth_bytes) + ")" : "");
+  } else {
+    degraded.style.display = "none";
+  }
+
+  const rows = (mp.workers || []).map(w =>
+    "<tr><td>" + w.worker_id + "</td><td>" + (w.pid === null || w.pid === undefined ? "-" : w.pid) + "</td>"
+    + "<td>" + (w.status || "-") + "</td>"
+    + "<td>" + (w.current_shard === null || w.current_shard === undefined ? "-" : w.current_shard) + "</td>"
+    + "<td>" + fmtNum(w.shards_completed || 0) + "</td>"
+    + "<td>" + fmtNum(w.variants_completed || 0) + "</td>"
+    + "<td>" + (w.throughput_per_second === null || w.throughput_per_second === undefined ? "-" : fmtNum(w.throughput_per_second) + "/s") + "</td>"
+    + "<td>" + fmtBytes(w.phys_footprint_bytes) + "</td></tr>"
+  ).join("");
+  document.getElementById("mp-rows").innerHTML = rows || "<tr><td colspan=\"8\">no workers reported yet</td></tr>";
+}
+
 function fmtAgo(iso) { if (!iso) return "-"; const s = (Date.now() - new Date(iso).getTime()) / 1000; if (s < 0) return "just now"; if (s < 2) return "just now"; return fmtSeconds(s) + " ago"; }
 
 async function fetchJson(url) {
@@ -1401,6 +1461,8 @@ async function refresh() {
       + " (system-wide)";
   }
   document.getElementById("stat-cpu").textContent = usage.cpu_seconds === null || usage.cpu_seconds === undefined ? "-" : fmtSeconds(usage.cpu_seconds);
+
+  renderMultiprocess(status.multiprocess);
 
   const pct = (status.items_total && status.items_total > 0 && status.items_completed !== null) ? Math.min(100, (status.items_completed / status.items_total) * 100) : (status.phase === "completed" ? 100 : 0);
   document.getElementById("progress-bar-fill").style.width = pct + "%";

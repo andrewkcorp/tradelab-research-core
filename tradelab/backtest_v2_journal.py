@@ -54,7 +54,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 JOURNAL_SCHEMA_VERSION = "1.2"
 
@@ -342,6 +342,27 @@ class BacktestV2Journal:
         """A single ``COUNT(*)`` -- used to initialize a resumed run's
         progress counter without reading any row's own data into Python."""
         return self._conn.execute("SELECT COUNT(*) FROM variant_summaries").fetchone()[0]
+
+    def completed_ids_for(self, candidate_ids: Sequence[str]) -> set[str]:
+        """Which of ``candidate_ids`` are already durably completed.
+
+        Asked per shard rather than for the whole run, so a coordinator never
+        materialises every completed id of a million-variant run at once. The
+        query is chunked because SQLite caps host parameters per statement.
+        """
+        found: set[str] = set()
+        chunk = 500
+        for start in range(0, len(candidate_ids), chunk):
+            window = list(candidate_ids[start : start + chunk])
+            if not window:
+                continue
+            placeholders = ",".join("?" * len(window))
+            rows = self._conn.execute(
+                f"SELECT strategy_variant_id FROM variant_summaries WHERE strategy_variant_id IN ({placeholders})",
+                window,
+            ).fetchall()
+            found.update(row[0] for row in rows)
+        return found
 
     def commit_summary(self, row: Mapping[str, Any]) -> None:
         """Durably commit one completed variant's summary -- a single,
