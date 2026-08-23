@@ -39,6 +39,7 @@ from tradelab.backtest_v2 import (
     _leaderboard_sort_key,
     _linked_fvg_candidate,
     _linked_fvg_candidates,
+    _nearest_linked_fvg_candidate_for_stop,
     _open_journal,
     _resolve_sl_candidate,
     _simulate_market_execution_reference,
@@ -72,6 +73,7 @@ from tradelab.equity import build_equity_curve
 from tradelab.fvg_entry import FVGContactType, FVGEntryCandidate, SourceType
 from tradelab.fvg import FVGStatus, FVGZone
 from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityLevel, LiquidityStatus, LiquidityType
+from tradelab.tp_targets import MarketEntryContext
 from tradelab.market_data_artifact import MarketDataArtifact, SeriesKind
 from tradelab.news import NewsBlackoutIndex, NewsEvent
 from tradelab.research_run import ProgressThrottle, RunReporter, create_run, read_leaderboard, read_live_status, read_progress_events, read_run_manifest
@@ -463,6 +465,24 @@ class LinkedFVGExtractionTests(unittest.TestCase):
             strategy_fvg_link_selectors=("fvg-5m-fvg_touch",),
         )
         self.assertEqual(_linked_fvg_candidates(entry, "5m"), (zone,))
+
+    def test_stop_shortcut_selects_the_same_nearest_linked_zone_without_materializing_all(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        farther = FVGZone(
+            zone_id="farther", timeframe="5m", direction="bullish", lower=90.0, upper=92.0,
+            candle_1_timestamp=t0 - timedelta(minutes=15), candle_2_timestamp=t0 - timedelta(minutes=10),
+            candle_3_timestamp=t0 - timedelta(minutes=5), formed_at=t0, status=FVGStatus.ACTIVE,
+            resolved_at=None, produced_ifvg=False,
+        )
+        nearest = dataclasses.replace(farther, zone_id="nearest", lower=97.0, upper=99.0)
+        entry = ObservedEntry(
+            entry_id="lazy-fvg-stop", known_at=t0 + timedelta(minutes=5), direction=LONG, source=object(),
+            active_fvg_zone_ids_by_selector={"fvg-5m-fvg_touch": (farther.zone_id, nearest.zone_id)},
+            fvg_zone_by_id={farther.zone_id: farther, nearest.zone_id: nearest},
+            strategy_fvg_link_selectors=("fvg-5m-fvg_touch",),
+        )
+        market_entry = MarketEntryContext(entry_id=entry.entry_id, direction=LONG, entry_price=100.0, entry_known_at=entry.known_at)
+        self.assertEqual(_nearest_linked_fvg_candidate_for_stop(entry, "5m", market_entry), nearest)
 
 
 class NextBarOpenEntryTests(unittest.TestCase):

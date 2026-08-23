@@ -502,6 +502,83 @@ def _linked_fvg_candidates(entry: ObservedEntry, timeframe: str) -> tuple[Any, .
     return tuple(by_zone_id[zone_id] for zone_id in sorted(by_zone_id))
 
 
+def _nearest_linked_fvg_candidate_for_stop(
+    entry: ObservedEntry,
+    timeframe: str,
+    market_entry: MarketEntryContext,
+) -> FVGEntryCandidate | FVGZone | None:
+    """Return the exact FVG candidate that the historical FVG-SL path
+    would ultimately choose, without materialising every active FVG zone.
+
+    Dense 1m entries can have thousands of active FVGs under a linked
+    selector.  The production FVG-boundary rule always calls
+    ``detect_sl_target_candidates(..., max_fvg_targets=1)`` and then uses
+    index zero, so constructing a tuple of every zone first is pure
+    allocation churn.  This scans the same candidates, performs the same
+    eligibility checks and uses the identical deterministic comparison key
+    from ``sl_targets._fvg_sl_candidates``.  It is therefore an exact
+    selection shortcut, not a changed SL rule.
+    """
+    allowed = set(entry.strategy_fvg_link_selectors)
+    seen_zone_ids: set[str] = set()
+    best: FVGEntryCandidate | FVGZone | None = None
+    best_key: tuple[float, datetime, str] | None = None
+
+    def consider(candidate: FVGEntryCandidate | FVGZone) -> None:
+        nonlocal best, best_key
+        if candidate.zone_id in seen_zone_ids:
+            return
+        seen_zone_ids.add(candidate.zone_id)
+        if candidate.timeframe != timeframe:
+            return
+        if candidate.lower >= candidate.upper:
+            raise ValueError(
+                f"FVG confluence {candidate.zone_id!r} has non-increasing bounds "
+                f"(lower={candidate.lower!r}, upper={candidate.upper!r})"
+            )
+        known_at = candidate.known_at if isinstance(candidate, FVGEntryCandidate) else candidate.formed_at
+        if known_at > market_entry.entry_known_at:
+            return
+        price = candidate.lower if market_entry.direction == LONG else candidate.upper
+        if price <= 0:
+            raise ValueError(f"FVG confluence {candidate.zone_id!r} has non-positive price {price!r}")
+        if market_entry.direction == LONG and price >= market_entry.entry_price:
+            return
+        if market_entry.direction == SHORT and price <= market_entry.entry_price:
+            return
+        key = (
+            abs(price - market_entry.entry_price),
+            known_at,
+            f"sl-fvg_boundary-{market_entry.entry_id}-{candidate.zone_id}",
+        )
+        if best_key is None or key < best_key:
+            best, best_key = candidate, key
+
+    own = _linked_fvg_candidate(entry)
+    if own is not None and own.timeframe == timeframe:
+        own_selector = f"fvg-{own.timeframe}-{own.source_type.value}"
+        if not allowed or own_selector in allowed:
+            consider(own)
+
+    if not allowed:
+        return best
+    for selector in sorted(allowed):
+        if not selector.startswith(f"fvg-{timeframe}-"):
+            continue
+        if entry.active_fvg_zones_by_selector is not None:
+            for candidate in entry.active_fvg_zones_by_selector.get(selector, ()):
+                consider(candidate)
+        elif entry.active_fvg_zone_ids_by_selector is not None and entry.fvg_zone_by_id is not None:
+            for zone_id in entry.active_fvg_zone_ids_by_selector.get(selector, ()):
+                try:
+                    consider(entry.fvg_zone_by_id[zone_id])
+                except KeyError as exc:
+                    raise ValueError(
+                        f"Observed entry {entry.entry_id} references unknown FVG zone {zone_id!r}"
+                    ) from exc
+    return best
+
+
 def _resolve_tp_candidate(
     variant: ExitVariantSpec,
     market_entry: MarketEntryContext,
@@ -555,10 +632,10 @@ def _resolve_sl_candidate(
             if candidate.rank == variant.sl_rank:
                 return candidate
         return None
-    linked = _linked_fvg_candidates(entry, variant.sl_fvg_timeframe)
-    if not linked:
+    linked = _nearest_linked_fvg_candidate_for_stop(entry, variant.sl_fvg_timeframe, market_entry)
+    if linked is None:
         return None
-    confluence = SelectedFVGConfluence(entry_id=market_entry.entry_id, fvg_candidates=linked)
+    confluence = SelectedFVGConfluence(entry_id=market_entry.entry_id, fvg_candidates=(linked,))
     # ``entry_id`` already uniquely fixes its linked FVG set.  Keeping every
     # active zone id in the cache key made dense 1m entries allocate huge
     # strings solely for memoisation; timeframe is the only remaining cache
