@@ -509,6 +509,7 @@ def _nearest_linked_fvg_candidate_for_stop(
     entry: ObservedEntry,
     timeframe: str,
     market_entry: MarketEntryContext,
+    fvg_link_selectors: tuple[str, ...] | None = None,
 ) -> FVGEntryCandidate | FVGZone | None:
     """Return the exact FVG candidate that the historical FVG-SL path
     would ultimately choose, without materialising every active FVG zone.
@@ -521,8 +522,17 @@ def _nearest_linked_fvg_candidate_for_stop(
     eligibility checks and uses the identical deterministic comparison key
     from ``sl_targets._fvg_sl_candidates``.  It is therefore an exact
     selection shortcut, not a changed SL rule.
+
+    ``fvg_link_selectors`` is the recipe's own allowed selector set. It is a
+    property of the strategy, not of an observed entry, so production passes
+    it down from the equivalence class rather than stamping a copy onto every
+    entry -- doing the latter cost ~78 million redundant ``ObservedEntry``
+    objects during ``both``-direction pairing (see
+    docs/dense-class-memory-diagnostic.md). ``None`` falls back to the
+    entry's own annotation, which is what directional classes, small
+    fixtures and external callers use.
     """
-    allowed = set(entry.strategy_fvg_link_selectors)
+    allowed = set(entry.strategy_fvg_link_selectors if fvg_link_selectors is None else fvg_link_selectors)
     seen_zone_ids: set[str] = set()
     best: FVGEntryCandidate | FVGZone | None = None
     best_key: tuple[float, datetime, str] | None = None
@@ -623,6 +633,7 @@ def _resolve_sl_candidate(
     *,
     entry_target_cache: "EntryTargetCache | None" = None,
     liquidity_target_index: LiquidityTargetIndex | None = None,
+    fvg_link_selectors: tuple[str, ...] | None = None,
 ) -> SLTargetCandidate | None:
     """``entry_target_cache`` (task 047) -- see ``_resolve_tp_candidate``.
     The SL cache key additionally carries a ``confluence_key`` (``None``
@@ -645,11 +656,11 @@ def _resolve_sl_candidate(
     # ~6 FVG-boundary variants that share them.
     if entry_target_cache is not None:
         linked = entry_target_cache.fvg_stop_candidate(
-            market_entry.entry_id, variant.sl_fvg_timeframe,
-            lambda: _nearest_linked_fvg_candidate_for_stop(entry, variant.sl_fvg_timeframe, market_entry),
+            market_entry.entry_id, variant.sl_fvg_timeframe, fvg_link_selectors,
+            lambda: _nearest_linked_fvg_candidate_for_stop(entry, variant.sl_fvg_timeframe, market_entry, fvg_link_selectors),
         )
     else:
-        linked = _nearest_linked_fvg_candidate_for_stop(entry, variant.sl_fvg_timeframe, market_entry)
+        linked = _nearest_linked_fvg_candidate_for_stop(entry, variant.sl_fvg_timeframe, market_entry, fvg_link_selectors)
     if linked is None:
         return None
     confluence = SelectedFVGConfluence(entry_id=market_entry.entry_id, fvg_candidates=(linked,))
@@ -866,6 +877,7 @@ def simulate_market_execution(
     liquidity_target_index: LiquidityTargetIndex | None = None,
     news_blackout_index: NewsBlackoutIndex | None = None,
     stage_timings: StageTimings | None = None,
+    fvg_link_selectors: tuple[str, ...] | None = None,
 ) -> tuple[list[ExecutedTrade], list[SkippedEntryV2]]:
     """**The real, accelerated execution loop (task 045).** Identical
     rules to ``_simulate_market_execution_reference`` -- same observed
@@ -1010,6 +1022,7 @@ def simulate_market_execution(
             variant, entry, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results,
             entry_target_cache=entry_target_cache,
             liquidity_target_index=liquidity_target_index,
+            fvg_link_selectors=fvg_link_selectors,
         )
         if stage_timings is not None:
             stage_timings.record("entry_target_resolution", time.perf_counter() - _t0)
@@ -1115,6 +1128,7 @@ def simulate_market_execution_batched(
     liquidity_target_index: LiquidityTargetIndex | None = None,
     news_blackout_index: NewsBlackoutIndex | None = None,
     compact_skip_counts: bool = False,
+    fvg_link_selectors: tuple[str, ...] | None = None,
 ) -> dict[str, tuple[list[ExecutedTrade], list[SkippedEntryV2] | dict[str, int]]]:
     """Execute every supplied exit variant in one chronological entry pass.
 
@@ -1210,6 +1224,7 @@ def simulate_market_execution_batched(
                 state.variant, entry, market_entry, context.swing_equal_liquidity_results,
                 context.session_liquidity_results, entry_target_cache=cache,
                 liquidity_target_index=liquidity_target_index,
+                fvg_link_selectors=fvg_link_selectors,
             )
             if sl_candidate is None:
                 _record_execution_skip(state.skipped, entry, ExecutionSkipReason.MISSING_SL_TARGET)
@@ -2189,6 +2204,9 @@ def _expand_and_simulate(
                     bar_range_index=bar_range_index, entry_target_cache=both_target_cache,
                     liquidity_target_index=liquidity_target_index, news_blackout_index=news_blackout_index,
                     compact_skip_counts=True,
+                    # The recipe's own selectors, carried by the class rather
+                    # than stamped onto every ObservedEntry.
+                    fvg_link_selectors=equivalence_class.fvg_link_selectors,
                 )
 
                 for variant, pending_instruments in variant_batch:
@@ -2736,6 +2754,7 @@ def _measure_sample_throughput(
             on_bar_progress=on_bar_progress, on_entry_progress=on_entry_progress, bar_range_index=bar_range_index,
             entry_target_cache=entry_target_cache, liquidity_target_index=liquidity_target_index,
             news_blackout_index=news_blackout_index, compact_skip_counts=is_both,
+            fvg_link_selectors=(getattr(equivalence_class, "fvg_link_selectors", None) if is_both else None),
         )
         for variant, group_instruments in pending_by_variant:
             trades, variant_skipped = executions_by_variant[variant.variant_id]

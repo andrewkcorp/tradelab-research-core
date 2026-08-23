@@ -12,7 +12,7 @@ are deliberately removed from that stream by its conservative conflict rule.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from tradelab.entry_signal_timeline import LONG, SHORT
 from tradelab.entry_strategy_universe import (
@@ -82,39 +82,31 @@ def discover_both_direction_universe(universe: EntryStrategyUniverseResult) -> B
     entries_by_key: dict[tuple, tuple[ObservedEntry, ...]] = {}
     streams_by_key: dict[tuple, tuple[tuple[ObservedEntry, ...], tuple[ObservedEntry, ...]]] = {}
 
-    # Many pairs resolve to the *same* source equivalence class and the same
-    # link selectors, and pairs sharing both produce byte-identical streams and
-    # sequence keys. Rebuilding them per pair meant one fresh ObservedEntry per
-    # entry per pair, plus a fresh (entry_id, known_at, direction) tuple per
-    # entry per pair, all retained through `grouped`. On real MNQ that was the
-    # second-largest allocation source in the whole pipeline, after
-    # `iter_candidate_entry_snapshots` -- see
+    # The entry streams below are the source classes' own tuples, used as-is.
+    #
+    # They used to be rebuilt per pair with `dataclasses.replace(entry,
+    # strategy_fvg_link_selectors=...)`, purely to stamp one strategy-level
+    # constant onto every entry. On real MNQ that is ~78 million fresh
+    # ObservedEntry objects (27,519 pairs x two classes x ~1,400 entries) and
+    # was the single largest allocation in the deduplicating_entries phase --
+    # ~12 GB, enough on its own to push the process into swap before any
+    # simulation began. The selectors are a property of the *recipe*, not of
+    # an observed entry, so they now travel on
+    # BothDirectionEquivalenceClass.fvg_link_selectors and are passed into
+    # execution, leaving the entries themselves shared and uncopied. See
     # docs/dense-class-memory-diagnostic.md.
     #
-    # Both caches key on the identity of the source tuple, which is safe here
-    # because `universe` (and, for the merged streams, `relabelled_cache`
-    # itself) keeps every one of those tuples alive for this whole function --
-    # so an id can never be recycled while it is in use. The cached value
-    # holds its own reference too, making that explicit.
-    relabelled_cache: dict[tuple[int, tuple], tuple[tuple[ObservedEntry, ...], tuple[ObservedEntry, ...]]] = {}
-    merged_cache: dict[tuple[int, int], tuple[tuple[ObservedEntry, ...], tuple]] = {}
-
-    def _relabelled(source: tuple[ObservedEntry, ...], fvg_link_selectors: tuple) -> tuple[ObservedEntry, ...]:
-        cache_key = (id(source), fvg_link_selectors)
-        cached = relabelled_cache.get(cache_key)
-        if cached is None:
-            cached = (source, tuple(
-                replace(entry, strategy_fvg_link_selectors=fvg_link_selectors) for entry in source
-            ))
-            relabelled_cache[cache_key] = cached
-        return cached[1]
+    # `merged_cache` keys on the identity of those source tuples, which is
+    # safe because `universe` keeps every one of them alive for this whole
+    # function, so an id cannot be recycled while in use.
+    merged_cache: dict[tuple[int, int, tuple], tuple[tuple[ObservedEntry, ...], tuple]] = {}
 
     for pair in pairs:
         fvg_link_selectors = _fvg_link_selectors(pair.long_spec)
-        long_entries = _relabelled(class_by_spec_id[pair.long_spec.spec_id].observed_entries, fvg_link_selectors)
-        short_entries = _relabelled(class_by_spec_id[pair.short_spec.spec_id].observed_entries, fvg_link_selectors)
+        long_entries = class_by_spec_id[pair.long_spec.spec_id].observed_entries
+        short_entries = class_by_spec_id[pair.short_spec.spec_id].observed_entries
 
-        merge_key = (id(long_entries), id(short_entries))
+        merge_key = (id(long_entries), id(short_entries), fvg_link_selectors)
         merged = merged_cache.get(merge_key)
         if merged is None:
             entries = _merge_for_key(long_entries, short_entries)

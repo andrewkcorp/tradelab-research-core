@@ -105,7 +105,7 @@ class EntryTargetCache:
         # variant. On a dense 1m class that is a full pass over up to ~2,000
         # active zones, repeated ~6x per entry for nothing -- see
         # docs/dense-class-memory-diagnostic.md.
-        self._fvg_stop: dict[tuple[str, str], object] = {}
+        self._fvg_stop: dict[tuple[str, str, tuple | None], object] = {}
         # One LRU order across all namespaces. Eviction is strictly a
         # performance/memory decision: a missing item is recomputed by the
         # same exact detector, never approximated.
@@ -121,15 +121,21 @@ class EntryTargetCache:
                 namespace, evicted_key = self._recency.popitem(last=False)[0]
                 getattr(self, self._POOLS[namespace]).pop(evicted_key, None)
 
-    def fvg_stop_candidate(self, entry_id: str, timeframe: str, compute):
+    def fvg_stop_candidate(self, entry_id: str, timeframe: str, fvg_link_selectors, compute):
         """Memoise one entry's chosen FVG-boundary stop zone per timeframe.
 
         ``compute`` is a zero-argument callable invoked only on a miss. A
         legitimate ``None`` result (no eligible zone) is cached as such, and
         is deliberately distinguishable from an absent key -- recomputing a
         known-empty scan is exactly the waste this exists to remove.
+
+        ``fvg_link_selectors`` is part of the key even though production
+        scopes one cache per equivalence class (where it is constant): the
+        selectors now arrive from the caller rather than from the entry
+        itself, so keying on them keeps this cache correct on its own terms
+        instead of relying on that scoping.
         """
-        key = (entry_id, timeframe)
+        key = (entry_id, timeframe, fvg_link_selectors)
         if key in self._fvg_stop:
             self._touch(("fvg_stop", key))
             return self._fvg_stop[key]

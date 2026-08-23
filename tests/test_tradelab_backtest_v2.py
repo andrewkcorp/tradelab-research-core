@@ -485,6 +485,38 @@ class LinkedFVGExtractionTests(unittest.TestCase):
         market_entry = MarketEntryContext(entry_id=entry.entry_id, direction=LONG, entry_price=100.0, entry_known_at=entry.known_at)
         self.assertEqual(_nearest_linked_fvg_candidate_for_stop(entry, "5m", market_entry), nearest)
 
+    def test_passed_selectors_match_the_same_selectors_stamped_on_the_entry(self):
+        """``both`` pairing stopped copying an ObservedEntry per pair just to
+        stamp ``strategy_fvg_link_selectors``; the selectors are passed in
+        instead. Passing them must resolve exactly what stamping them did."""
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        base = FVGZone(
+            zone_id="far", timeframe="5m", direction="bullish", lower=90.0, upper=92.0,
+            candle_1_timestamp=t0 - timedelta(minutes=15), candle_2_timestamp=t0 - timedelta(minutes=10),
+            candle_3_timestamp=t0 - timedelta(minutes=5), formed_at=t0, status=FVGStatus.ACTIVE,
+            resolved_at=None, produced_ifvg=False,
+        )
+        near = dataclasses.replace(base, zone_id="near", lower=97.0, upper=99.0)
+        other = dataclasses.replace(base, zone_id="other", lower=95.0, upper=96.0)
+        bare = ObservedEntry(
+            entry_id="pair-entry", known_at=t0 + timedelta(minutes=5), direction=LONG, source=object(),
+            active_fvg_zone_ids_by_selector={
+                "fvg-5m-fvg_touch": (base.zone_id, near.zone_id),
+                "fvg-5m-ifvg": (other.zone_id,),
+            },
+            fvg_zone_by_id={z.zone_id: z for z in (base, near, other)},
+        )
+        market_entry = MarketEntryContext(
+            entry_id=bare.entry_id, direction=LONG, entry_price=100.0, entry_known_at=bare.known_at
+        )
+        for selectors in (("fvg-5m-fvg_touch",), ("fvg-5m-ifvg",), ("fvg-5m-fvg_touch", "fvg-5m-ifvg"), ()):
+            stamped = dataclasses.replace(bare, strategy_fvg_link_selectors=selectors)
+            self.assertEqual(
+                _nearest_linked_fvg_candidate_for_stop(bare, "5m", market_entry, selectors),
+                _nearest_linked_fvg_candidate_for_stop(stamped, "5m", market_entry),
+                f"passed vs stamped selectors diverged for {selectors!r}",
+            )
+
 
 class NextBarOpenEntryTests(unittest.TestCase):
     """Market entry must fill at the OPEN of the first bar whose own

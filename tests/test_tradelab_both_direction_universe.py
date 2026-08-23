@@ -86,14 +86,15 @@ class BothDirectionUniverseTests(unittest.TestCase):
         self.assertEqual(both.equivalence_classes[0].observed_entries, ())
 
 
-class SharedRelabelledStreamTests(unittest.TestCase):
-    """Pairing reuses one relabelled entry stream per (source class, link
-    selectors) instead of rebuilding it per pair.
+class SharedEntryStreamTests(unittest.TestCase):
+    """Pairing no longer copies an ObservedEntry per pair just to stamp the
+    recipe's FVG link selectors onto it.
 
-    The cache is keyed on the *identity* of the source tuple, so the risk it
-    introduces is cross-contamination: two recipes that share a source class
-    but require different FVG link selectors must still get their own,
-    correctly-labelled entries."""
+    The selectors are a property of the recipe, so they live on
+    ``BothDirectionEquivalenceClass.fvg_link_selectors`` and are passed into
+    execution. These tests pin the two things that change: the entries really
+    are the shared, uncopied source objects, and each class still reports the
+    selectors its entries would previously have carried."""
 
     @staticmethod
     def _universe_with_two_context_variants():
@@ -125,20 +126,32 @@ class SharedRelabelledStreamTests(unittest.TestCase):
             spec_counts_by_execution_timeframe={}, spec_counts_by_bias_requirement_pattern={},
         )
 
-    def test_recipes_with_different_link_selectors_keep_their_own_labels(self):
-        both = discover_both_direction_universe(self._universe_with_two_context_variants())
+    def test_recipes_with_different_link_selectors_are_kept_distinct_on_the_class(self):
+        universe = self._universe_with_two_context_variants()
+        both = discover_both_direction_universe(universe)
         self.assertEqual(both.paired_spec_count, 2)
-        by_selectors = {}
-        for equivalence_class in both.equivalence_classes:
-            for entry in equivalence_class.long_entries + equivalence_class.short_entries:
-                by_selectors.setdefault(equivalence_class.fvg_link_selectors, set()).add(
-                    entry.strategy_fvg_link_selectors
-                )
-        # Every entry carries exactly its own class's selectors -- never a
-        # neighbouring class's, which is what a mis-keyed cache would produce.
-        self.assertGreaterEqual(len(by_selectors), 2)
-        for class_selectors, entry_selectors in by_selectors.items():
-            self.assertEqual(entry_selectors, {class_selectors})
+        # Two recipes, two different selector sets -- the distinction the old
+        # per-entry stamping carried is preserved, just at class level.
+        self.assertEqual(len({c.fvg_link_selectors for c in both.equivalence_classes}), 2)
+
+    def test_entries_are_the_shared_source_objects_not_per_pair_copies(self):
+        universe = self._universe_with_two_context_variants()
+        source_ids = {
+            id(entry)
+            for equivalence_class in universe.equivalence_classes
+            for entry in equivalence_class.observed_entries
+        }
+        both = discover_both_direction_universe(universe)
+        paired_entries = [
+            entry
+            for equivalence_class in both.equivalence_classes
+            for entry in equivalence_class.long_entries + equivalence_class.short_entries
+        ]
+        self.assertGreater(len(paired_entries), 0)
+        # Identity, not equality: a copy per pair is exactly what this change
+        # removed, and it is invisible to an equality check.
+        for entry in paired_entries:
+            self.assertIn(id(entry), source_ids)
 
     def test_repeated_discovery_is_deterministic(self):
         universe = self._universe_with_two_context_variants()
