@@ -49,3 +49,9 @@ research_journal.sqlite3
 .diag/*.log
 .diag/*.pkl
 .diag/*.txt
+.diag/*.json
+
+# Shard payloads and any other on-disk worker data are generated artifacts.
+/shards/
+**/shards/
+*.shard

@@ -222,6 +222,12 @@ from tradelab.entry_strategy_universe import (
     discover_entry_strategy_universe,
 )
 from tradelab.entry_target_cache import EntryTargetCache
+from tradelab.shard_plan import (
+    BacktestShardPlan,
+    ShardFingerprint,
+    build_shard_plan,
+    verify_partitions,
+)
 from tradelab.trade_path_audit import AccountMarkToMarketAudit, audit_account_mark_to_market
 from tradelab.research_validation import PerformanceValidation, stop_slippage_sensitivity, summarize_account_result
 from tradelab.liquidity_target_index import LiquidityTargetIndex
@@ -1947,14 +1953,26 @@ def _merged_leaderboard(durable_top_n: list[LeaderboardEntry], tracker: _TopNTra
     (``durable_top_n`` -- itself already the correct top-N of that
     population, from a single bounded SQL query, never a full-table
     scan) and variants completed *in this process* (``tracker``, the
-    existing in-memory bounded structure, unchanged). The two
-    populations can never overlap (a variant is completed exactly once,
-    ever -- either before this process attached, or by it, never both),
-    so concatenating both already-correct top-N lists, re-sorting by
-    the identical ranking key, and truncating to ``n`` is exact, not an
-    approximation."""
+    existing in-memory bounded structure, unchanged). Concatenating two
+    already-correct top-N lists, re-sorting by the identical ranking key
+    and truncating to ``n`` is exact, not an approximation.
+
+    The two populations overlap in exactly one situation: several shards
+    run sequentially in one process against a shared tracker, where a
+    variant this process computed earlier is by now *also* a durable
+    journal row. The journal's rendering is deliberately lean (no equity
+    curve, no per-trade P&L -- those are never persisted), so a duplicate
+    is resolved in favour of the in-process entry, which carries the
+    charts. Ranking-relevant values are identical either way; this only
+    decides how much detail survives. Without shards the populations are
+    still disjoint and nothing here changes."""
     fresh = tracker.top_entries()
-    combined = list(durable_top_n) + fresh
+    by_strategy: dict[str, LeaderboardEntry] = {}
+    for entry in list(durable_top_n) + fresh:
+        existing = by_strategy.get(entry.strategy_id)
+        if existing is None or (not existing.equity_curve and entry.equity_curve):
+            by_strategy[entry.strategy_id] = entry
+    combined = list(by_strategy.values())
     combined.sort(key=lambda e: (e.pnl, -e.max_drawdown, e.strategy_id), reverse=True)
     return [dataclasses.replace(e, rank=i) for i, e in enumerate(combined[:n], start=1)]
 
@@ -1973,6 +1991,7 @@ def _expand_and_simulate(
     equity_config: EquityConfig,
     top_n_leaderboard: int,
     checkpoint_every: int,
+    top_n_tracker: "_TopNTracker | None" = None,
     min_completed_trades_per_year: int = 0,
 ) -> tuple[int, list[LeaderboardEntry]]:
     """Shared by :func:`run_production_backtest_v2` and the CLI smoke
@@ -2072,7 +2091,11 @@ def _expand_and_simulate(
     completed = journal.completed_count()
     durable_top_n = [_leaderboard_entry_from_journal_summary(s) for s in journal.top_n_summaries(top_n_leaderboard)]
 
-    top_n = _TopNTracker(top_n_leaderboard)
+    # A caller running several shards in one process passes one tracker, so
+    # the final leaderboard carries every shard's charts exactly as an
+    # unsharded run does. Omitted, a fresh tracker is created -- the original
+    # single-process behaviour, unchanged.
+    top_n = top_n_tracker if top_n_tracker is not None else _TopNTracker(top_n_leaderboard)
     last_leaderboard_publish_at = time.monotonic()
     if completed:
         reporter.progress(items_completed=completed, backtests_completed=completed)
@@ -2396,6 +2419,118 @@ def _require_clean_working_tree() -> None:
             "discovery, or simulation work begins. Commit, stash, or revert your changes, or start again from "
             "a clean checkout, then re-run."
         )
+
+
+# ---------------------------------------------------------------------------
+# Sharded execution (single shard, single process -- no pool, no fork)
+# ---------------------------------------------------------------------------
+
+
+def build_shard_plan_for_universe(
+    both_universe: BothDirectionUniverseResult,
+    exit_variants: tuple[ExitVariantSpec, ...],
+    instruments: tuple[Instrument, ...],
+    *,
+    shard_count: int,
+    market_artifact_sha256: str | None,
+    news_csv_sha256: str | None,
+    parameters: Mapping[str, Any],
+    risk_config: RiskConfig = DEFAULT_RISK_CONFIG,
+    equity_config: EquityConfig = DEFAULT_EQUITY_CONFIG,
+    git_commit: str | None = None,
+) -> BacktestShardPlan:
+    """Partition an already-discovered ``both`` universe into shards.
+
+    Entry counts come from the merged stream a class actually simulates, so
+    the plan balances the work that will really be done rather than a proxy
+    for it. See ``tradelab.shard_plan`` for the determinism guarantees.
+    """
+    class_ids = [equivalence_class.class_id for equivalence_class in both_universe.equivalence_classes]
+    entry_counts = [
+        len(equivalence_class.long_entries) + len(equivalence_class.short_entries)
+        for equivalence_class in both_universe.equivalence_classes
+    ]
+    fingerprint = ShardFingerprint.build(
+        market_artifact_sha256=market_artifact_sha256, news_csv_sha256=news_csv_sha256,
+        parameters=parameters, risk_config=dataclasses.asdict(risk_config),
+        equity_config=dataclasses.asdict(equity_config),
+        instruments=[instrument.value for instrument in instruments], git_commit=git_commit,
+        class_ids=class_ids, class_entry_counts=entry_counts,
+        exit_variant_ids=[variant.variant_id for variant in exit_variants],
+    )
+    plan = build_shard_plan(
+        shard_count=shard_count, class_ids=class_ids, class_entry_counts=entry_counts,
+        exit_variant_ids=[variant.variant_id for variant in exit_variants],
+        instruments=[instrument.value for instrument in instruments], fingerprint=fingerprint,
+    )
+    verify_partitions(plan, class_ids)
+    return plan
+
+
+def shard_universe(
+    both_universe: BothDirectionUniverseResult, plan: BacktestShardPlan, shard_index: int
+) -> BothDirectionUniverseResult:
+    """The sub-universe one shard owns, in the original global order.
+
+    Order matters: keeping the shard's classes in the same relative order the
+    unsharded run would visit them is what makes a sharded run's per-class
+    results, journal rows and leaderboard identical rather than merely
+    equivalent.
+    """
+    wanted = set(plan.shard(shard_index).class_ids)
+    selected = tuple(
+        equivalence_class for equivalence_class in both_universe.equivalence_classes
+        if equivalence_class.class_id in wanted
+    )
+    if len(selected) != len(wanted):
+        found = {equivalence_class.class_id for equivalence_class in selected}
+        raise ValueError(f"shard {shard_index} names {len(wanted - found)} class(es) absent from this universe")
+    return BothDirectionUniverseResult(
+        equivalence_classes=selected, paired_spec_count=both_universe.paired_spec_count,
+        equivalence_class_count=len(selected),
+    )
+
+
+def run_shard(
+    reporter: RunReporter,
+    journal: BacktestV2Journal,
+    both_universe: BothDirectionUniverseResult,
+    context: PreparedBacktestContext,
+    *,
+    instruments: tuple[Instrument, ...] = DEFAULT_INSTRUMENTS,
+    exit_variants: tuple[ExitVariantSpec, ...] = ALL_EXIT_VARIANTS,
+    risk_config: RiskConfig = DEFAULT_RISK_CONFIG,
+    equity_config: EquityConfig = DEFAULT_EQUITY_CONFIG,
+    top_n_leaderboard: int = 25,
+    checkpoint_every: int = 25,
+    min_completed_trades_per_year: int = 100,
+    top_n_tracker: "_TopNTracker | None" = None,
+) -> tuple[int, list[LeaderboardEntry]]:
+    """Simulate one shard's sub-universe into an existing journal.
+
+    Deliberately a thin call into the unmodified ``_expand_and_simulate``: the
+    execution loop, per-class caching, batching, accounting, journal writes and
+    checkpoint cursor are all exactly what a single-process run does. A shard
+    differs only in which classes it is handed.
+
+    **Resume is unchanged.** ``_expand_and_simulate`` skips any variant the
+    journal already records as completed, so re-running a shard, or running
+    shards in any order, or switching between sharded and unsharded execution,
+    never recomputes or duplicates work. The journal remains the single
+    authority on what is done.
+
+    This runs one shard in this process. Pools, forking and multiple concurrent
+    workers are deliberately out of scope here -- see
+    ``docs/sharding-readiness.md``.
+    """
+    return _expand_and_simulate(
+        reporter, journal, None, exit_variants, instruments, context,
+        both_universe=both_universe, include_directional_variants=False,
+        risk_config=risk_config, equity_config=equity_config,
+        top_n_leaderboard=top_n_leaderboard, checkpoint_every=checkpoint_every,
+        min_completed_trades_per_year=min_completed_trades_per_year,
+        top_n_tracker=top_n_tracker,
+    )
 
 
 def run_production_backtest_v2(
