@@ -12,6 +12,7 @@ from __future__ import annotations
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import datetime
+from heapq import nsmallest
 from typing import Mapping
 
 from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityLevel, LiquidityStatus
@@ -97,7 +98,23 @@ class LiquidityTargetIndex:
                 while index >= 0 and prices[index] == price:
                     index -= 1
                 group = levels[index + 1:start + 1]
-            found.extend(indexed.level for indexed in group if self._eligible(indexed, entry_known_at))
+            # A single price tick can contain thousands of historical levels.
+            # The old ``extend`` materialised the entire eligible group even
+            # though callers can observe at most ``count`` (three) nearest
+            # levels. In a full sweep this transient allocation repeated for
+            # millions of entries, eventually pushing otherwise-freed memory
+            # into swap. Keep only the exact first ``remaining`` members of
+            # this equal-price group under the *same* final ordering key.
+            # ``nsmallest`` has O(group_size * log(count)) time and O(count)
+            # extra memory, rather than O(group_size) retained objects.
+            remaining = count - len(found)
+            found.extend(
+                nsmallest(
+                    remaining,
+                    (indexed.level for indexed in group if self._eligible(indexed, entry_known_at)),
+                    key=lambda level: (level.formed_at, level.level_id),
+                )
+            )
             if len(found) >= count:
                 break  # all later groups have strictly larger distance
         return tuple(sorted(found, key=lambda level: (abs((level.upper if side == HIGH else level.lower) - entry_price), level.formed_at, level.level_id))[:count])
