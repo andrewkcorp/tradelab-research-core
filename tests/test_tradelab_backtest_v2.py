@@ -45,6 +45,8 @@ from tradelab.backtest_v2 import (
     _simulate_market_execution_reference,
     _TopNTracker,
     _TARGET_CACHE_FAMILIES_PER_ENTRY,
+    _build_both_variant_result_for_instrument,
+    _merge_skip_audits,
     _target_cache_for_class,
     _yearly_monthly_breakdown,
     build_synthetic_smoke_context,
@@ -66,6 +68,7 @@ from tradelab.backtest_v2 import (
 )
 from tradelab.bar import Bar1m
 from tradelab.bar_range_index import BarRangeIndex
+from tradelab.backtest import SIMULATION_UNUSED_CONTEXT_FIELDS, release_discovery_inputs
 from tradelab.both_direction_universe import discover_both_direction_universe
 from tradelab.liquidity_target_index import LiquidityTargetIndex
 from tradelab.entry_signal_timeline import LONG, SHORT, EntryEvent, EntryEventKind
@@ -2920,6 +2923,117 @@ class StageDiagnosticTests(unittest.TestCase):
     def test_stage_diagnostic_cli_runs_and_prints_a_report(self):
         exit_code = backtest_v2_main(["stage-diagnostic", "--sample-size", "3"])
         self.assertEqual(exit_code, 0)
+
+
+class ReleasedContextSimulationEquivalenceTests(unittest.TestCase):
+    """Production releases the context's discovery-only fields once the
+    universe exists (``tradelab.backtest.release_discovery_inputs``). That is
+    a memory change, so simulation against a released context must be
+    byte-identical to simulation against the full one.
+
+    The comparison runs the real production path -- both-direction pairing,
+    batched execution, the per-class target cache, accounting and equity for
+    MNQ -- over randomized zigzag contexts, and asserts the trials actually
+    exercised what the change could plausibly break: FVG and iFVG and
+    liquidity primaries, long and short and merged ``both`` streams, both TP
+    families and both SL families, same-bar TP+SL ambiguity, news blocks and
+    unresolved positions, and real contract sizing."""
+
+    def _universe(self, context):
+        universe = discover_entry_strategy_universe(
+            context.fvg_results, context.fvg_entry_result, context.liquidity_entry_result,
+            context.htf_bias_result, min_entries_per_year=1, pair_yearly_eligibility_for_both=True,
+        )
+        return discover_both_direction_universe(universe)
+
+    def _simulate(self, context, equivalence_class, variant, indexes):
+        bar_range_index, liquidity_index, news_index = indexes
+        merged, conflicts = merge_both_direction_entries(
+            equivalence_class.long_entries, equivalence_class.short_entries, compact_skip_counts=True,
+        )
+        cache = _target_cache_for_class(len(merged), include_data_wick_targets=True)
+        executions = simulate_market_execution_batched(
+            merged, "both", (variant,), context, equivalence_class.class_id,
+            bar_range_index=bar_range_index, entry_target_cache=cache,
+            liquidity_target_index=liquidity_index, news_blackout_index=news_index,
+            compact_skip_counts=True, fvg_link_selectors=equivalence_class.fvg_link_selectors,
+        )
+        trades, variant_skipped = executions[variant.variant_id]
+        skipped = _merge_skip_audits(conflicts, variant_skipped)
+        result = _build_both_variant_result_for_instrument(
+            equivalence_class, variant, Instrument.MNQ, trades, skipped, context,
+            risk_config=DEFAULT_RISK_CONFIG, equity_config=DEFAULT_EQUITY_CONFIG,
+            audit_bar_range_index=bar_range_index,
+        )
+        return trades, skipped, result
+
+    def test_released_context_simulates_identically(self):
+        rng = random.Random(90210)
+        compared = 0
+        exit_reasons = set()
+        skip_reasons = set()
+        tp_kinds = set()
+        sl_kinds = set()
+        primary_kinds = set()
+        directions = set()
+        sized_trade_seen = False
+
+        for trial in range(8):
+            full = _random_zigzag_context(rng, n_bars=rng.choice([500, 900]))
+            both_universe = self._universe(full)
+            if both_universe.equivalence_class_count == 0:
+                continue
+            released = release_discovery_inputs(full)
+            # The released context must be genuinely stripped, or this test
+            # would be comparing a context with itself.
+            for name in SIMULATION_UNUSED_CONTEXT_FIELDS:
+                self.assertIsNone(getattr(released, name))
+
+            indexes = (
+                BarRangeIndex.build(full.bars_1m),
+                LiquidityTargetIndex.build(full.swing_equal_liquidity_results, full.session_liquidity_results),
+                NewsBlackoutIndex.build(full.news_events),
+            )
+            for equivalence_class in both_universe.equivalence_classes:
+                primary_kinds.add(equivalence_class.representative_spec.long_spec.primary.kind)
+                for entry in equivalence_class.long_entries + equivalence_class.short_entries:
+                    directions.add(entry.direction)
+                for variant in ALL_EXIT_VARIANTS:
+                    tp_kinds.add(variant.tp_kind)
+                    sl_kinds.add(variant.sl_kind)
+                    a_trades, a_skipped, a_result = self._simulate(full, equivalence_class, variant, indexes)
+                    b_trades, b_skipped, b_result = self._simulate(released, equivalence_class, variant, indexes)
+                    msg = f"trial={trial} class={equivalence_class.class_id} variant={variant.variant_id}"
+                    self.assertEqual(a_trades, b_trades, msg=msg)
+                    self.assertEqual(a_skipped, b_skipped, msg=msg)
+                    self.assertEqual(a_result.account_result.accounted_trades, b_result.account_result.accounted_trades, msg=msg)
+                    self.assertEqual(a_result.equity_result.equity_points, b_result.equity_result.equity_points, msg=msg)
+                    self.assertEqual(a_result.net_pnl_usd, b_result.net_pnl_usd, msg=msg)
+                    self.assertEqual(a_result.max_drawdown_usd, b_result.max_drawdown_usd, msg=msg)
+                    self.assertEqual(a_result.win_rate, b_result.win_rate, msg=msg)
+                    self.assertEqual(a_result.skipped_entries_by_reason, b_result.skipped_entries_by_reason, msg=msg)
+                    self.assertEqual(a_result.yearly, b_result.yearly, msg=msg)
+                    self.assertEqual(a_result.monthly, b_result.monthly, msg=msg)
+                    compared += 1
+                    exit_reasons.update(t.exit_reason for t in a_trades)
+                    skip_reasons.update(a_result.skipped_entries_by_reason)
+                    sized_trade_seen = sized_trade_seen or any(
+                        t.quantity > 0 and t.entry_cost_usd > 0 for t in a_result.account_result.accounted_trades
+                    )
+
+        self.assertGreater(compared, 200, "too few real comparisons to be meaningful")
+        self.assertEqual(directions, {LONG, SHORT}, "both directions must appear in the merged streams")
+        self.assertGreaterEqual(len(primary_kinds), 2, f"needs several primary families, saw {primary_kinds}")
+        self.assertGreaterEqual(len(tp_kinds), 2, "both TP families must be exercised")
+        self.assertGreaterEqual(len(sl_kinds), 2, "both SL families must be exercised")
+        self.assertIn(TradeExitReason.TP_HIT, exit_reasons)
+        self.assertIn(TradeExitReason.SL_HIT, exit_reasons)
+        self.assertIn(TradeExitReason.OPEN_UNRESOLVED, exit_reasons)
+        self.assertTrue(sized_trade_seen, "no trade was ever sized -- MNQ accounting was not exercised")
+        self.assertTrue(
+            {"news_block", "position_already_open"} & set(skip_reasons),
+            f"expected news/one-position skips to occur, saw {sorted(skip_reasons)}",
+        )
 
 
 if __name__ == "__main__":

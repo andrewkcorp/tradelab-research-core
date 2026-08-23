@@ -179,6 +179,7 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
+import gc
 import hashlib
 import heapq
 import itertools
@@ -202,6 +203,7 @@ from tradelab.backtest import (
     _finalize_trade,
     _OpenPosition,
     _peak_rss_bytes,
+    release_discovery_inputs,
 )
 from tradelab.backtest_v2_journal import BacktestV2Journal, JournalVariantSummary
 from tradelab.bar import Bar1m
@@ -2578,6 +2580,18 @@ def run_production_backtest_v2(
         # directional discovery container through every simulation only
         # wastes RAM.  Releasing it here cannot affect results.
         del universe
+
+        # Discovery is finished, so the context fields that exist only to feed
+        # it can go too.  Whatever the universe actually needs -- each entry's
+        # own source event and linked FVG zones -- is referenced by
+        # ObservedEntry and stays alive; this drops only detector-result
+        # wrappers and candidates that never became an entry.  Simulation
+        # never reads these fields (asserted by ReleaseDiscoveryInputsTests),
+        # so results are unchanged.  See
+        # docs/pre-multiprocessing-memory-readiness.md for the measurement.
+        context = release_discovery_inputs(context)
+        gc.collect()
+        reporter.record_resource_usage()
 
         completed, final_leaderboard = _expand_and_simulate(
             reporter, journal, None, exit_variants, instruments, context,

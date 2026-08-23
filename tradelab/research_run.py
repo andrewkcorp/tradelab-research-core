@@ -131,24 +131,42 @@ def _git_provenance(repo_root: Path) -> tuple[str | None, bool | None]:
         return None, None
 
 
-def _sample_resource_usage() -> tuple[int | None, float | None]:
-    """Best-effort ``(rss_bytes, cpu_seconds)`` for this process --
-    ``(None, None)`` if unavailable (``resource`` is POSIX-only, never
-    fabricated elsewhere). RSS is normalized to bytes on every platform
-    (``ru_maxrss`` is KiB on Linux, already bytes on macOS) -- the same
-    normalization ``tradelab.backtest._peak_rss_bytes`` already applies,
-    reused here via that exact helper rather than re-derived."""
+def _sample_resource_usage() -> "ResourceUsage":
+    """One full memory+CPU sample for this process.
+
+    Memory comes from ``tradelab.process_memory``, which reads the kernel's
+    own ``phys_footprint`` rather than ``ru_maxrss`` -- see that module and
+    ``ResourceUsage`` for why the latter cannot be used to judge memory
+    safety. System-wide swap is sampled alongside but kept in its own,
+    clearly-named fields. Everything degrades to ``None`` rather than to a
+    guess."""
     try:
-        from tradelab.backtest import _peak_rss_bytes
+        from tradelab.process_memory import sample_process_memory, sample_system_memory_pressure
 
-        rss_bytes = _peak_rss_bytes()
-        import resource
+        memory = sample_process_memory()
+        swap = sample_system_memory_pressure()
+        cpu_seconds = None
+        try:
+            import resource
 
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        cpu_seconds = usage.ru_utime + usage.ru_stime
-        return rss_bytes, cpu_seconds
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            cpu_seconds = usage.ru_utime + usage.ru_stime
+        except Exception:
+            cpu_seconds = None
+        return ResourceUsage(
+            # Prefer a genuine *current* RSS; fall back to the legacy peak so
+            # this field is never emptier than it used to be.
+            rss_bytes=memory.rss_bytes if memory.rss_bytes is not None else memory.peak_rss_bytes,
+            cpu_seconds=cpu_seconds,
+            phys_footprint_bytes=memory.phys_footprint_bytes,
+            phys_footprint_peak_bytes=memory.phys_footprint_peak_bytes,
+            compressed_bytes=memory.compressed_bytes,
+            peak_rss_bytes=memory.peak_rss_bytes,
+            system_swap_used_bytes=swap.swap_used_bytes,
+            system_swap_total_bytes=swap.swap_total_bytes,
+        )
     except Exception:
-        return None, None
+        return ResourceUsage(rss_bytes=None, cpu_seconds=None)
 
 
 class ProgressThrottle:
@@ -264,21 +282,74 @@ def _require(condition: bool, message: str) -> None:
 
 @dataclass(frozen=True)
 class ResourceUsage:
+    """What one run process is costing, in bytes and CPU seconds.
+
+    ``rss_bytes`` was historically ``ru_maxrss`` -- a *peak resident* figure
+    that silently stops tracking reality once the kernel compresses or swaps
+    the process out. It reported a flat 7.81 GB for a run whose real footprint
+    was 34.8 GB, and the same 7.81 GB for a later, healthy 9.9 GB run, so it
+    could not distinguish the two (see
+    ``docs/pre-multiprocessing-memory-readiness.md``). It is kept for
+    backward compatibility and now carries a genuine *current* RSS where the
+    platform can supply one.
+
+    ``phys_footprint_bytes`` is the field to judge memory safety by: the
+    kernel's own charge for this process, compressed pages included, exactly
+    what Activity Monitor's "Memory" column and ``vmmap``'s "Physical
+    footprint" report.
+
+    ``system_swap_used_bytes``/``system_swap_total_bytes`` are deliberately
+    *system-wide*, not this process's share, and are labelled as such
+    everywhere they are displayed. A healthy run can sit on a machine whose
+    swap is full for unrelated reasons; conflating the two is what made the
+    earlier diagnosis ambiguous.
+
+    Every field is optional and is simply absent when the platform cannot
+    supply it -- never estimated from a different measurement.
+    """
+
     rss_bytes: int | None
     cpu_seconds: float | None
+    phys_footprint_bytes: int | None = None
+    phys_footprint_peak_bytes: int | None = None
+    compressed_bytes: int | None = None
+    peak_rss_bytes: int | None = None
+    system_swap_used_bytes: int | None = None
+    system_swap_total_bytes: int | None = None
+
+    _NON_NEGATIVE = (
+        "rss_bytes", "cpu_seconds", "phys_footprint_bytes", "phys_footprint_peak_bytes",
+        "compressed_bytes", "peak_rss_bytes", "system_swap_used_bytes", "system_swap_total_bytes",
+    )
 
     def __post_init__(self) -> None:
-        if self.rss_bytes is not None:
-            _require(self.rss_bytes >= 0, "ResourceUsage.rss_bytes must be >= 0")
-        if self.cpu_seconds is not None:
-            _require(self.cpu_seconds >= 0, "ResourceUsage.cpu_seconds must be >= 0")
+        for name in self._NON_NEGATIVE:
+            value = getattr(self, name)
+            if value is not None:
+                _require(value >= 0, f"ResourceUsage.{name} must be >= 0")
 
     def to_dict(self) -> dict:
-        return {"rss_bytes": self.rss_bytes, "cpu_seconds": self.cpu_seconds}
+        # rss_bytes/cpu_seconds stay unconditionally present so every existing
+        # reader (dashboard, tests, older run directories) keeps its shape.
+        out = {"rss_bytes": self.rss_bytes, "cpu_seconds": self.cpu_seconds}
+        for name in self._NON_NEGATIVE[2:]:
+            value = getattr(self, name)
+            if value is not None:
+                out[name] = value
+        return out
 
     @staticmethod
     def from_dict(d: Mapping[str, Any]) -> "ResourceUsage":
-        return ResourceUsage(rss_bytes=d.get("rss_bytes"), cpu_seconds=d.get("cpu_seconds"))
+        return ResourceUsage(
+            rss_bytes=d.get("rss_bytes"),
+            cpu_seconds=d.get("cpu_seconds"),
+            phys_footprint_bytes=d.get("phys_footprint_bytes"),
+            phys_footprint_peak_bytes=d.get("phys_footprint_peak_bytes"),
+            compressed_bytes=d.get("compressed_bytes"),
+            peak_rss_bytes=d.get("peak_rss_bytes"),
+            system_swap_used_bytes=d.get("system_swap_used_bytes"),
+            system_swap_total_bytes=d.get("system_swap_total_bytes"),
+        )
 
 
 @dataclass(frozen=True)
@@ -703,9 +774,15 @@ class RunReporter:
         self._flush_status()
 
     def record_resource_usage(self, *, rss_bytes: int | None = None, cpu_seconds: float | None = None) -> None:
+        """Sample and durably record this process's memory and CPU.
+
+        Explicit ``rss_bytes``/``cpu_seconds`` are honoured (tests inject
+        them); otherwise a full sample is taken, including phys_footprint and
+        system swap -- see ``ResourceUsage``."""
         if rss_bytes is None and cpu_seconds is None:
-            rss_bytes, cpu_seconds = _sample_resource_usage()
-        self._resource_usage = ResourceUsage(rss_bytes=rss_bytes, cpu_seconds=cpu_seconds)
+            self._resource_usage = _sample_resource_usage()
+        else:
+            self._resource_usage = ResourceUsage(rss_bytes=rss_bytes, cpu_seconds=cpu_seconds)
         self._append_event("resource_usage", self._resource_usage.to_dict())
         self._flush_status()
 
@@ -796,9 +873,9 @@ class RunReporter:
         if self._last_heartbeat_monotonic is not None and (now - self._last_heartbeat_monotonic) < _HEARTBEAT_MIN_INTERVAL_SECONDS:
             return False
         self._last_heartbeat_monotonic = now
-        rss_bytes, cpu_seconds = _sample_resource_usage()
-        if rss_bytes is not None or cpu_seconds is not None:
-            self._resource_usage = ResourceUsage(rss_bytes=rss_bytes, cpu_seconds=cpu_seconds)
+        sample = _sample_resource_usage()
+        if sample.rss_bytes is not None or sample.cpu_seconds is not None or sample.phys_footprint_bytes is not None:
+            self._resource_usage = sample
         self._flush_status()
         return True
 

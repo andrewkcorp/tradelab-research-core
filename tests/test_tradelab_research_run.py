@@ -23,6 +23,7 @@ from tradelab.research_run import (
     LiveStatus,
     ProgressThrottle,
     RunManifest,
+    ResourceUsage,
     RunPhase,
     atomic_write_json,
     create_run,
@@ -752,6 +753,58 @@ class LiveStatusBackwardCompatibilityTests(unittest.TestCase):
     def test_active_work_rejects_negative_counters(self):
         with self.assertRaises(ValueError):
             ActiveWork(operation="x", variant_id=None, unit_index=-1, unit_total=None, bars_scanned=None, bars_total=None, updated_at="2026-01-01T00:00:00+00:00")
+
+
+class MemoryTelemetryTests(unittest.TestCase):
+    """The run's memory telemetry must be usable to decide whether a run is
+    memory-safe. That means reporting phys_footprint, not just ru_maxrss --
+    which reported an identical 7.81 GB for a 34.8 GB run and a healthy 9.9 GB
+    one -- and keeping system-wide swap in separate, clearly-named fields so
+    it is never read as this process's own usage."""
+
+    def test_recorded_usage_carries_footprint_and_system_swap_separately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=1)
+            reporter.record_resource_usage()
+            usage = ResourceUsage.from_dict(read_live_status(reporter.run_dir).resource_usage)
+            self.assertIsNotNone(usage.cpu_seconds)
+            if usage.phys_footprint_bytes is not None:
+                self.assertGreater(usage.phys_footprint_bytes, 1024 * 1024)
+                # Swap is a machine-wide fact and must never be folded into
+                # the process's own figures.
+                self.assertNotEqual(usage.phys_footprint_bytes, usage.system_swap_used_bytes)
+            if usage.rss_bytes is not None:
+                # RSS and footprint are genuinely different measurements and
+                # neither bounds the other: RSS counts shared clean pages
+                # (the mapped interpreter and libraries) that the process is
+                # not charged for, while footprint counts compressed private
+                # pages that are no longer resident. Both must simply be real.
+                self.assertGreater(usage.rss_bytes, 0)
+
+    def test_explicit_values_are_still_honoured_for_injection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reporter = create_run(runs_dir=tmp, market_artifact_path=None, news_csv_path=None, parameters={})
+            reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=1)
+            reporter.record_resource_usage(rss_bytes=123, cpu_seconds=4.5)
+            usage = ResourceUsage.from_dict(read_live_status(reporter.run_dir).resource_usage)
+            self.assertEqual((usage.rss_bytes, usage.cpu_seconds), (123, 4.5))
+
+    def test_round_trips_through_dict_including_the_new_fields(self):
+        usage = ResourceUsage(
+            rss_bytes=1, cpu_seconds=2.0, phys_footprint_bytes=3, phys_footprint_peak_bytes=4,
+            compressed_bytes=5, peak_rss_bytes=6, system_swap_used_bytes=7, system_swap_total_bytes=8,
+        )
+        self.assertEqual(ResourceUsage.from_dict(usage.to_dict()), usage)
+
+    def test_old_run_directories_without_the_new_fields_still_load(self):
+        legacy = ResourceUsage.from_dict({"rss_bytes": 10, "cpu_seconds": 1.0})
+        self.assertEqual((legacy.rss_bytes, legacy.cpu_seconds), (10, 1.0))
+        self.assertIsNone(legacy.phys_footprint_bytes)
+        self.assertIsNone(legacy.system_swap_used_bytes)
+        # And the legacy shape is preserved on the way out, so a reader that
+        # only knows the old two keys is unaffected.
+        self.assertEqual(legacy.to_dict(), {"rss_bytes": 10, "cpu_seconds": 1.0})
 
 
 if __name__ == "__main__":

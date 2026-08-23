@@ -156,7 +156,7 @@ from __future__ import annotations
 
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dataclass_replace
 from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
@@ -307,6 +307,16 @@ class PreparedBacktestContext:
     freeze the plain lists nested *inside* them (e.g. ``FVGDetectionResult
     .zones``); it simply never mutates any of it, which is the only
     guarantee ``backtest_prepared_strategy`` actually relies on.
+
+    **Releasing discovery-only inputs (see ``SIMULATION_UNUSED_CONTEXT_
+    FIELDS``).** Six of these fields exist purely so
+    ``tradelab.entry_strategy_universe.discover_entry_strategy_universe``
+    can be called; nothing in the simulation path reads them. They may be
+    set to ``None`` once discovery has produced its universe, which is what
+    ``release_discovery_inputs`` does. Their annotations therefore admit
+    ``None``: it means "already released", and any code that tries to read
+    one then fails loudly rather than silently simulating against an empty
+    detector result.
     """
 
     bars_1m: tuple[Bar1m, ...]
@@ -314,16 +324,59 @@ class PreparedBacktestContext:
     tick_size: float
     pivot_strength: int
     reclaim_window_bars: int
-    fvg_results: Mapping[str, FVGDetectionResult]
-    fvg_touch_results: Mapping[str, FVGTouchDetectionResult]
-    fvg_entry_result: FVGEntryCandidateResult
+    fvg_results: Mapping[str, FVGDetectionResult] | None
+    fvg_touch_results: Mapping[str, FVGTouchDetectionResult] | None
+    fvg_entry_result: FVGEntryCandidateResult | None
     swing_equal_liquidity_results: Mapping[str, LiquidityDetectionResult]
     session_liquidity_results: Mapping[str, LiquidityDetectionResult]
-    liquidity_entry_result: LiquidityEntryCandidateResult
+    liquidity_entry_result: LiquidityEntryCandidateResult | None
     data_wick_result: DataWickDetectionResult
-    htf_bias_result: HTFBiasResult
-    timeline: EntrySignalTimeline
+    htf_bias_result: HTFBiasResult | None
+    timeline: EntrySignalTimeline | None
     special_session_schedule: SpecialSessionSchedule | None = None
+
+
+SIMULATION_UNUSED_CONTEXT_FIELDS: tuple[str, ...] = (
+    "fvg_results",
+    "fvg_touch_results",
+    "fvg_entry_result",
+    "liquidity_entry_result",
+    "htf_bias_result",
+    "timeline",
+)
+"""``PreparedBacktestContext`` fields that exist only to feed entry discovery.
+
+Every read of these in ``tradelab.backtest_v2`` is an argument to
+``discover_entry_strategy_universe``; the simulation path never touches them
+(``tests/test_tradelab_backtest.py::ReleaseDiscoveryInputsTests`` asserts this
+against the module source, so the list cannot quietly go stale).
+
+They are *not* the same thing as the objects inside them. Whatever discovery
+put into the universe -- an entry's own source event, the FVG zones an entry
+links to -- is referenced by ``ObservedEntry`` and stays alive regardless.
+Releasing these fields drops only the detector-result wrappers and the
+candidates that never became an entry.
+
+Deliberately excludes ``swing_equal_liquidity_results``/
+``session_liquidity_results``: they are unread only while a
+``LiquidityTargetIndex`` is supplied, and ``simulate_market_execution``
+still accepts calls without one.
+"""
+
+
+def release_discovery_inputs(context: PreparedBacktestContext) -> PreparedBacktestContext:
+    """Return ``context`` with its discovery-only inputs set to ``None``.
+
+    Call once entry discovery has produced its universe. The returned context
+    simulates byte-for-byte identically (proven by
+    ``ReleaseDiscoveryInputsTests``); the point is that dropping the original
+    lets the parts of it nothing else references be collected, which is a
+    large share of a worker's steady-state footprint on real data -- see
+    ``docs/pre-multiprocessing-memory-readiness.md``.
+
+    Idempotent, and safe to call on an already-released context.
+    """
+    return _dataclass_replace(context, **{name: None for name in SIMULATION_UNUSED_CONTEXT_FIELDS})
 
 
 @dataclass(frozen=True)

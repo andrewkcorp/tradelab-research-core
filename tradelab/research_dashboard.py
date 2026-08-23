@@ -745,7 +745,9 @@ DASHBOARD_HTML = r"""<!doctype html>
         <span class="stat">Items: <b id="stat-items">-</b></span>
         <span class="stat">Throughput: <b id="stat-throughput">-</b></span>
         <span class="stat">ETA: <b id="stat-eta">-</b></span>
-        <span class="stat">RAM: <b id="stat-ram">-</b></span>
+        <span class="stat" title="Process memory footprint (phys_footprint): what the kernel charges this process, compressed pages included. This is the figure Activity Monitor shows.">Process memory: <b id="stat-footprint">-</b></span>
+        <span class="stat" title="Resident set size: the part of the process currently in physical RAM. Not a total: it excludes compressed/swapped pages, and separately includes shared library pages the process is not charged for. Use Process memory for how much this run costs.">RSS: <b id="stat-ram">-</b></span>
+        <span class="stat" title="System-wide swap in use across ALL processes, not this run's share.">System swap: <b id="stat-swap">-</b></span>
         <span class="stat">CPU: <b id="stat-cpu">-</b></span>
       </div>
       <div class="progress-row">
@@ -1374,7 +1376,30 @@ async function refresh() {
   document.getElementById("stat-throughput").textContent = status.throughput_per_second === null || status.throughput_per_second === undefined ? "-" : fmtNum(status.throughput_per_second) + "/s";
   document.getElementById("stat-eta").textContent = status.eta_seconds === null || status.eta_seconds === undefined ? "n/a" : fmtSeconds(status.eta_seconds);
   const usage = status.resource_usage || {};
+  // phys_footprint is the honest "how much memory is this run using" number.
+  // RSS alone under-reports badly once the kernel compresses or swaps pages
+  // out, so both are shown, labelled, and never conflated -- and the peak is
+  // appended when it differs meaningfully from the current value.
+  const footprintEl = document.getElementById("stat-footprint");
+  if (usage.phys_footprint_bytes === null || usage.phys_footprint_bytes === undefined) {
+    footprintEl.textContent = "n/a";
+    footprintEl.title = "phys_footprint is not available on this platform; RSS alone cannot be read as total memory use.";
+  } else {
+    let text = fmtBytes(usage.phys_footprint_bytes);
+    if (usage.phys_footprint_peak_bytes && usage.phys_footprint_peak_bytes > usage.phys_footprint_bytes * 1.05) {
+      text += " (peak " + fmtBytes(usage.phys_footprint_peak_bytes) + ")";
+    }
+    footprintEl.textContent = text;
+  }
   document.getElementById("stat-ram").textContent = fmtBytes(usage.rss_bytes);
+  const swapEl = document.getElementById("stat-swap");
+  if (usage.system_swap_used_bytes === null || usage.system_swap_used_bytes === undefined) {
+    swapEl.textContent = "n/a";
+  } else {
+    swapEl.textContent = fmtBytes(usage.system_swap_used_bytes)
+      + (usage.system_swap_total_bytes ? " / " + fmtBytes(usage.system_swap_total_bytes) : "")
+      + " (system-wide)";
+  }
   document.getElementById("stat-cpu").textContent = usage.cpu_seconds === null || usage.cpu_seconds === undefined ? "-" : fmtSeconds(usage.cpu_seconds);
 
   const pct = (status.items_total && status.items_total > 0 && status.items_completed !== null) ? Math.min(100, (status.items_completed / status.items_total) * 100) : (status.phase === "completed" ? 100 : 0);

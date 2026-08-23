@@ -26,6 +26,7 @@ notes.
 """
 from __future__ import annotations
 
+import dataclasses
 import unittest
 import unittest.mock
 from datetime import datetime, timedelta, timezone
@@ -38,12 +39,14 @@ from tradelab.strategy_spec import LONG, SHORT, BiasPolicy, SLChoice, StrategySp
 from tradelab.tp_targets import TPSourceType
 from tradelab import backtest as backtest_module
 from tradelab.backtest import (
+    SIMULATION_UNUSED_CONTEXT_FIELDS,
     PreparedBacktestContext,
     SkipReason,
     TradeExitReason,
     backtest_prepared_strategy,
     backtest_strategy,
     prepare_backtest_context,
+    release_discovery_inputs,
 )
 
 UTC = timezone.utc
@@ -1010,6 +1013,87 @@ class PhaseCallbackTests(unittest.TestCase):
         self.assertEqual(with_callback.data_wick_result, without_callback.data_wick_result)
         self.assertEqual(with_callback.htf_bias_result, without_callback.htf_bias_result)
         self.assertEqual(with_callback.timeline, without_callback.timeline)
+
+
+class ReleaseDiscoveryInputsTests(unittest.TestCase):
+    """``release_discovery_inputs`` drops exactly the context fields that
+    only entry discovery reads, and nothing else.
+
+    The dangerous failure mode is the list going stale: someone starts
+    reading one of these fields from the simulation path, the list is not
+    updated, and every run silently simulates against ``None``. So the first
+    test does not restate the list -- it parses ``tradelab/backtest_v2.py``
+    and proves that every single ``context.<field>`` access there is an
+    argument to ``discover_entry_strategy_universe``."""
+
+    @staticmethod
+    def _context() -> PreparedBacktestContext:
+        bars = [
+            Bar1m(timestamp=T0 + timedelta(minutes=i), open=100.0, high=101.0, low=99.0, close=100.0,
+                  volume=10.0, contract="TEST")
+            for i in range(30)
+        ]
+        return prepare_backtest_context(bars, [], tick_size=0.25, pivot_strength=2, reclaim_window_bars=3)
+
+    def _simulation_module_source(self) -> str:
+        from pathlib import Path
+
+        import tradelab.backtest_v2 as module
+
+        return Path(module.__file__).read_text(encoding="utf-8")
+
+    def test_released_fields_are_only_ever_read_by_entry_discovery(self):
+        import ast
+
+        tree = ast.parse(self._simulation_module_source())
+        discovery_arg_nodes: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+                if name == "discover_entry_strategy_universe":
+                    for argument in list(node.args) + [kw.value for kw in node.keywords]:
+                        for inner in ast.walk(argument):
+                            discovery_arg_nodes.add(id(inner))
+
+        offenders = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr in SIMULATION_UNUSED_CONTEXT_FIELDS
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "context"
+                and id(node) not in discovery_arg_nodes
+            ):
+                offenders.append(f"context.{node.attr} at line {node.lineno}")
+        self.assertEqual(
+            offenders, [],
+            "these context fields are released after discovery but are read elsewhere in the "
+            "simulation module; either stop reading them or remove them from "
+            "SIMULATION_UNUSED_CONTEXT_FIELDS:\n  " + "\n  ".join(offenders),
+        )
+
+    def test_releases_exactly_the_named_fields_and_preserves_the_rest(self):
+        context = self._context()
+        released = release_discovery_inputs(context)
+
+        for name in SIMULATION_UNUSED_CONTEXT_FIELDS:
+            self.assertIsNotNone(getattr(context, name), f"fixture must actually populate {name}")
+            self.assertIsNone(getattr(released, name), f"{name} should have been released")
+
+        preserved = [f.name for f in dataclasses.fields(context) if f.name not in SIMULATION_UNUSED_CONTEXT_FIELDS]
+        self.assertIn("bars_1m", preserved)
+        for name in preserved:
+            self.assertIs(
+                getattr(released, name), getattr(context, name),
+                f"{name} must be carried through untouched, not rebuilt",
+            )
+
+    def test_is_idempotent(self):
+        context = self._context()
+        once = release_discovery_inputs(context)
+        twice = release_discovery_inputs(once)
+        self.assertEqual(once, twice)
 
 
 if __name__ == "__main__":
