@@ -250,7 +250,32 @@ DEFAULT_INSTRUMENTS: tuple[Instrument, ...] = (Instrument.MNQ,)
 # This cache is an exact speed optimisation only: eviction recomputes a
 # candidate and never changes a fill.  Keep it bounded tightly enough that a
 # pathological dense 1m class cannot dominate the process footprint.
-_PRODUCTION_TARGET_CACHE_MAX_ENTRIES = 10_000
+# An entry can contribute at most four distinct candidate lists during one
+# class's exit sweep: one TP list, one liquidity-SL list, and one FVG-boundary
+# list for each of the two allowed FVG SL timeframes.  This is deliberately a
+# *per-equivalence-class* bound (see `_target_cache_for_class`), not a
+# run-wide one.  A smaller run-wide LRU looked safe on paper, but a dense class
+# has more entries than the LRU: scanning the next exit variant from the
+# beginning then evicts every cached tail entry before it is revisited.  That
+# produced no useful cache hits and enormous allocation/swap churn.
+_TARGET_CACHE_FAMILIES_PER_ENTRY = 4
+
+
+def _target_cache_for_class(entry_count: int, *, include_data_wick_targets: bool) -> EntryTargetCache:
+    """Return the exact, bounded target cache for one equivalence class.
+
+    The target cache must survive every exit variant *of this class* so a
+    target calculation is reused.  It must not survive into later classes:
+    their entries are not revisited soon enough to justify retained memory.
+    The bound covers every possible key for this class, so LRU eviction cannot
+    turn a sequential exit-variant sweep back into a cache-thrashing loop.
+    """
+    if entry_count < 0:
+        raise ValueError("entry_count must be non-negative")
+    return EntryTargetCache(
+        max_entries=max(1, entry_count * _TARGET_CACHE_FAMILIES_PER_ENTRY),
+        include_data_wick_targets=include_data_wick_targets,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1927,16 +1952,17 @@ def _expand_and_simulate(
         reporter.update_leaderboard(_merged_leaderboard(durable_top_n, top_n, top_n_leaderboard))
 
     include_data_wick_targets = any(variant.tp_kind == TPVariantKind.DATA_WICK for variant in exit_variants)
-    entry_target_cache = EntryTargetCache(
-        max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES,
-        include_data_wick_targets=include_data_wick_targets,
-    )
     directional_classes = universe.equivalence_classes if include_directional_variants and universe is not None else ()
     for equivalence_class in directional_classes:
-        # One bounded cache survives the whole prepared run. Multiple
-        # equivalence classes often share the exact same observed event, so
-        # this avoids resolving its TP/SL candidates again. LRU eviction only
-        # causes an exact recomputation and never affects trade results.
+        # Keep every target list which this class can revisit across its exit
+        # variants.  A run-wide 10k LRU thrashed on dense 1m classes (>10k
+        # entries): each next variant scanned from entry 1 and evicted the
+        # cached tail before reaching it.  Scope the bounded cache to the
+        # class instead, then let it be released before the next class.
+        entry_target_cache = _target_cache_for_class(
+            len(equivalence_class.observed_entries),
+            include_data_wick_targets=include_data_wick_targets,
+        )
         pending_by_variant: list[tuple[ExitVariantSpec, tuple[Instrument, ...]]] = []
         for variant in exit_variants:
             pending_instruments = tuple(
@@ -2010,10 +2036,6 @@ def _expand_and_simulate(
     # directional universe, so ranking/filtering sees one coherent research
     # population.
     if both_universe is not None:
-        both_target_cache = EntryTargetCache(
-            max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES,
-            include_data_wick_targets=include_data_wick_targets,
-        )
         for equivalence_class in both_universe.equivalence_classes:
             pending_by_variant: list[tuple[ExitVariantSpec, tuple[Instrument, ...]]] = []
             for variant in exit_variants:
@@ -2044,6 +2066,9 @@ def _expand_and_simulate(
             )
             merged_entries, conflicts = merge_both_direction_entries(
                 equivalence_class.long_entries, equivalence_class.short_entries, compact_skip_counts=True,
+            )
+            both_target_cache = _target_cache_for_class(
+                len(merged_entries), include_data_wick_targets=include_data_wick_targets,
             )
             for variant_batch in _iter_execution_batches(pending_by_variant):
                 executions_by_variant = simulate_market_execution_batched(
@@ -2554,12 +2579,14 @@ def _measure_sample_throughput(
     bar_range_index = _build_bar_range_index_with_heartbeat(reporter, context.bars_1m) if reporter is not None else BarRangeIndex.build(context.bars_1m)
     completed = 0
     start = time.perf_counter()
-    entry_target_cache = EntryTargetCache(max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES)
     liquidity_target_index = LiquidityTargetIndex.build(context.swing_equal_liquidity_results, context.session_liquidity_results)
     news_blackout_index = NewsBlackoutIndex.build(context.news_events)
     for _class_id, class_group_iter in itertools.groupby(combos, key=lambda c: c[0].class_id):
         class_group = list(class_group_iter)
         equivalence_class = class_group[0][0]
+        entry_target_cache = _target_cache_for_class(
+            len(equivalence_class.observed_entries), include_data_wick_targets=False,
+        )
         pending_by_variant: list[tuple[ExitVariantSpec, tuple[Instrument, ...]]] = []
         for _variant_id, variant_group_iter in itertools.groupby(class_group, key=lambda c: c[1].variant_id):
             variant_group = list(variant_group_iter)
@@ -2978,12 +3005,15 @@ def run_batched_exit_benchmark(
         )
     batched_elapsed_seconds = time.perf_counter() - batched_start
 
-    # The production path: a bounded cache survives across classes. This
-    # measures the incremental effect beyond task 048's batched traversal.
+    # The production path: every class has a cache large enough for every
+    # target family it can revisit.  This measures the incremental effect of
+    # that exact cache scope beyond task 048's batched traversal.
     run_wide_start = time.perf_counter()
     run_wide_results: dict[str, dict[str, tuple[list[ExecutedTrade], list[SkippedEntryV2]]]] = {}
-    run_wide_cache = EntryTargetCache(max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES)
     for equivalence_class in classes:
+        run_wide_cache = _target_cache_for_class(
+            len(equivalence_class.observed_entries), include_data_wick_targets=True,
+        )
         run_wide_results[equivalence_class.class_id] = simulate_market_execution_batched(
             equivalence_class.observed_entries,
             equivalence_class.representative_spec.primary.direction,
@@ -2998,8 +3028,10 @@ def run_batched_exit_benchmark(
     indexed_start = time.perf_counter()
     indexed_results: dict[str, dict[str, tuple[list[ExecutedTrade], list[SkippedEntryV2]]]] = {}
     target_index = LiquidityTargetIndex.build(context.swing_equal_liquidity_results, context.session_liquidity_results)
-    indexed_cache = EntryTargetCache(max_entries=_PRODUCTION_TARGET_CACHE_MAX_ENTRIES)
     for equivalence_class in classes:
+        indexed_cache = _target_cache_for_class(
+            len(equivalence_class.observed_entries), include_data_wick_targets=True,
+        )
         indexed_results[equivalence_class.class_id] = simulate_market_execution_batched(
             equivalence_class.observed_entries,
             equivalence_class.representative_spec.primary.direction,

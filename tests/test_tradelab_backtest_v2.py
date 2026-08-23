@@ -43,6 +43,7 @@ from tradelab.backtest_v2 import (
     _resolve_sl_candidate,
     _simulate_market_execution_reference,
     _TopNTracker,
+    _target_cache_for_class,
     _yearly_monthly_breakdown,
     build_synthetic_smoke_context,
     enumerate_exit_variants,
@@ -2437,6 +2438,18 @@ class EntryTargetCacheEquivalenceTests(unittest.TestCase):
             for instrument in DEFAULT_INSTRUMENTS:
                 self.assertEqual(with_shared[instrument].trades, with_fresh[instrument].trades)
                 self.assertEqual(with_shared[instrument].net_pnl_usd, with_fresh[instrument].net_pnl_usd)
+
+    def test_production_class_cache_covers_all_revisited_target_families(self):
+        """A dense class must not thrash a too-small cross-variant LRU.
+
+        Production resolves at most TP, liquidity-SL, 5m FVG-SL and 15m
+        FVG-SL for one observed entry.  Its scoped cache therefore has room
+        for every one of those exact keys before the next exit variant starts
+        again at entry one.
+        """
+        cache = _target_cache_for_class(31_327, include_data_wick_targets=False)
+        self.assertEqual(cache._max_entries, 31_327 * 4)
+        self.assertFalse(cache._include_data_wick_targets)
 
 
 class BatchedExitVariantExecutionTests(unittest.TestCase):

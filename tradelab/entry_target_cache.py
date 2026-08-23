@@ -49,13 +49,13 @@ by, the reference (uncached) simulation at the exact same point in its
 own execution -- see ``tests/test_tradelab_backtest_v2.py``'s randomized
 cached-vs-uncached equivalence test for the proof.
 
-**Scope and memory.** Production builds one cache for one prepared run,
-not one cache per equivalence class. Equivalence classes regularly reuse
-the same observed event id, and a result is wholly determined by that id's
-fill context plus the immutable prepared detectors, so cross-class reuse is
-exact. The production cache has a 100,000-entry LRU bound; eviction merely
-causes the ordinary detector call to be repeated and never changes a target.
-Direct callers retain the unbounded default for simple unit use.
+**Scope and memory.** Production builds one bounded cache per equivalence
+class, not one cache for the full run. This is intentional: a dense class is
+scanned from its first entry for every exit variant, so a run-wide LRU smaller
+than that class would evict all useful entries before the next pass revisits
+them. The production bound covers every target family an entry can request in
+that class; the whole cache is then released before the next class. Direct
+callers retain the unbounded default for simple unit use.
 
 Only ever used by ``tradelab.backtest_v2``'s own ``_resolve_tp_
 candidate``/``_resolve_sl_candidate`` -- this module has no dependency
