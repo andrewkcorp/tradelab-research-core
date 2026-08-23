@@ -44,3 +44,8 @@ research_journal.sqlite3
 # default landing inside the repo by accident (e.g. for local testing).
 /runs/
 **/runs/
+
+# Ad-hoc diagnostic probe outputs (the probe scripts themselves stay tracked).
+.diag/*.log
+.diag/*.pkl
+.diag/*.txt
