@@ -289,7 +289,13 @@ class ObservedEntry:
     known_at: datetime
     direction: str
     source: EntryEvent | SweepFVGSetupEvent
+    # Legacy/eager representation kept for small fixtures and backwards
+    # compatibility.  Real discovery must prefer the two shared references
+    # below: copying every active FVGZone object into every observed event
+    # makes a dense 1m dataset consume tens of GB before simulation begins.
     active_fvg_zones_by_selector: Mapping[str, tuple[FVGZone, ...]] | None = None
+    active_fvg_zone_ids_by_selector: Mapping[str, tuple[str, ...]] | None = None
+    fvg_zone_by_id: Mapping[str, FVGZone] | None = None
     strategy_fvg_link_selectors: tuple[str, ...] = ()
 
 
@@ -469,13 +475,6 @@ def discover_entry_strategy_universe(
         for zone in result.zones
     }
 
-    def _active_zones(direction: str, market_state: MarketStateSnapshot) -> Mapping[str, tuple[FVGZone, ...]]:
-        return {
-            selector: tuple(fvg_zone_by_id[zone_id] for zone_id in zone_ids)
-            for selector, zone_ids in market_state.active_fvg_zone_ids_by_direction_selector[direction].items()
-            if selector.startswith(("fvg-5m-", "fvg-15m-"))
-        }
-
     # (ObservedEntry, S, B) tuples, grouped by their own PrimaryTriggerSpec
     # -- S is the observed active-FVG-context set (already intersected
     # with the execution-timeframe-only universe, see module docstring),
@@ -499,7 +498,11 @@ def discover_entry_strategy_universe(
         s, b = _signature(event.direction, market_state)
         observed = ObservedEntry(
             entry_id=event.event_id, known_at=event.known_at, direction=event.direction, source=event,
-            active_fvg_zones_by_selector=_active_zones(event.direction, market_state),
+            # Reuse the immutable timeline snapshot and the one global zone
+            # index.  Resolving ids to FVGZone objects is deferred until a
+            # selected FVG-boundary SL is actually requested.
+            active_fvg_zone_ids_by_selector=market_state.active_fvg_zone_ids_by_direction_selector[event.direction],
+            fvg_zone_by_id=fvg_zone_by_id,
         )
         items_by_primary.setdefault(key, []).append((observed, s, b))
 
@@ -510,7 +513,8 @@ def discover_entry_strategy_universe(
         s, b = _signature(setup.direction, market_state)
         observed = ObservedEntry(
             entry_id=setup.setup_id, known_at=setup.known_at, direction=setup.direction, source=setup,
-            active_fvg_zones_by_selector=_active_zones(setup.direction, market_state),
+            active_fvg_zone_ids_by_selector=market_state.active_fvg_zone_ids_by_direction_selector[setup.direction],
+            fvg_zone_by_id=fvg_zone_by_id,
         )
         items_by_primary.setdefault(key, []).append((observed, s, b))
 

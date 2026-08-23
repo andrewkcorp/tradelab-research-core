@@ -448,6 +448,22 @@ class LinkedFVGExtractionTests(unittest.TestCase):
         self.assertEqual(_linked_fvg_candidates(entry, "5m"), (zone,))
         self.assertEqual(_linked_fvg_candidates(entry, "15m"), ())
 
+    def test_required_context_lazy_zone_ids_resolve_the_same_exact_zone(self):
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        zone = FVGZone(
+            zone_id="required-z1", timeframe="5m", direction="bullish", lower=98.0, upper=100.0,
+            candle_1_timestamp=t0 - timedelta(minutes=15), candle_2_timestamp=t0 - timedelta(minutes=10),
+            candle_3_timestamp=t0 - timedelta(minutes=5), formed_at=t0, status=FVGStatus.ACTIVE,
+            resolved_at=None, produced_ifvg=False,
+        )
+        entry = ObservedEntry(
+            entry_id="lazy-liquidity-entry", known_at=t0 + timedelta(minutes=5), direction=LONG, source=object(),
+            active_fvg_zone_ids_by_selector={"fvg-5m-fvg_touch": (zone.zone_id,)},
+            fvg_zone_by_id={zone.zone_id: zone},
+            strategy_fvg_link_selectors=("fvg-5m-fvg_touch",),
+        )
+        self.assertEqual(_linked_fvg_candidates(entry, "5m"), (zone,))
+
 
 class NextBarOpenEntryTests(unittest.TestCase):
     """Market entry must fill at the OPEN of the first bar whose own

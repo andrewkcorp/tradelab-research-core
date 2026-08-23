@@ -477,11 +477,27 @@ def _linked_fvg_candidates(entry: ObservedEntry, timeframe: str) -> tuple[Any, .
         # preserve their historical exact-own-primary behavior.
         if not allowed or own_selector in allowed:
             selected.append(own)
-    if allowed and entry.active_fvg_zones_by_selector:
+    if allowed:
         for selector in sorted(allowed):
             if not selector.startswith(f"fvg-{timeframe}-"):
                 continue
-            selected.extend(entry.active_fvg_zones_by_selector.get(selector, ()))
+            # Small tests and external callers can still provide the old,
+            # eager representation.  Real discovery stores only immutable
+            # zone-id tuples shared by a market-state snapshot, then resolves
+            # the exact zones here on the uncommon FVG-boundary SL path.
+            if entry.active_fvg_zones_by_selector is not None:
+                selected.extend(entry.active_fvg_zones_by_selector.get(selector, ()))
+            elif (
+                entry.active_fvg_zone_ids_by_selector is not None
+                and entry.fvg_zone_by_id is not None
+            ):
+                for zone_id in entry.active_fvg_zone_ids_by_selector.get(selector, ()):
+                    try:
+                        selected.append(entry.fvg_zone_by_id[zone_id])
+                    except KeyError as exc:
+                        raise ValueError(
+                            f"Observed entry {entry.entry_id} references unknown FVG zone {zone_id!r}"
+                        ) from exc
     by_zone_id = {candidate.zone_id: candidate for candidate in selected}
     return tuple(by_zone_id[zone_id] for zone_id in sorted(by_zone_id))
 
