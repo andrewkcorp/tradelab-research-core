@@ -81,21 +81,51 @@ def discover_both_direction_universe(universe: EntryStrategyUniverseResult) -> B
     grouped: dict[tuple, list[BothDirectionSpec]] = {}
     entries_by_key: dict[tuple, tuple[ObservedEntry, ...]] = {}
     streams_by_key: dict[tuple, tuple[tuple[ObservedEntry, ...], tuple[ObservedEntry, ...]]] = {}
+
+    # Many pairs resolve to the *same* source equivalence class and the same
+    # link selectors, and pairs sharing both produce byte-identical streams and
+    # sequence keys. Rebuilding them per pair meant one fresh ObservedEntry per
+    # entry per pair, plus a fresh (entry_id, known_at, direction) tuple per
+    # entry per pair, all retained through `grouped`. On real MNQ that was the
+    # second-largest allocation source in the whole pipeline, after
+    # `iter_candidate_entry_snapshots` -- see
+    # docs/dense-class-memory-diagnostic.md.
+    #
+    # Both caches key on the identity of the source tuple, which is safe here
+    # because `universe` (and, for the merged streams, `relabelled_cache`
+    # itself) keeps every one of those tuples alive for this whole function --
+    # so an id can never be recycled while it is in use. The cached value
+    # holds its own reference too, making that explicit.
+    relabelled_cache: dict[tuple[int, tuple], tuple[tuple[ObservedEntry, ...], tuple[ObservedEntry, ...]]] = {}
+    merged_cache: dict[tuple[int, int], tuple[tuple[ObservedEntry, ...], tuple]] = {}
+
+    def _relabelled(source: tuple[ObservedEntry, ...], fvg_link_selectors: tuple) -> tuple[ObservedEntry, ...]:
+        cache_key = (id(source), fvg_link_selectors)
+        cached = relabelled_cache.get(cache_key)
+        if cached is None:
+            cached = (source, tuple(
+                replace(entry, strategy_fvg_link_selectors=fvg_link_selectors) for entry in source
+            ))
+            relabelled_cache[cache_key] = cached
+        return cached[1]
+
     for pair in pairs:
         fvg_link_selectors = _fvg_link_selectors(pair.long_spec)
-        long_entries = tuple(
-            replace(entry, strategy_fvg_link_selectors=fvg_link_selectors)
-            for entry in class_by_spec_id[pair.long_spec.spec_id].observed_entries
-        )
-        short_entries = tuple(
-            replace(entry, strategy_fvg_link_selectors=fvg_link_selectors)
-            for entry in class_by_spec_id[pair.short_spec.spec_id].observed_entries
-        )
-        entries = _merge_for_key(long_entries, short_entries)
-        sequence_key = (
-            tuple((entry.entry_id, entry.known_at, entry.direction) for entry in entries),
-            fvg_link_selectors,
-        )
+        long_entries = _relabelled(class_by_spec_id[pair.long_spec.spec_id].observed_entries, fvg_link_selectors)
+        short_entries = _relabelled(class_by_spec_id[pair.short_spec.spec_id].observed_entries, fvg_link_selectors)
+
+        merge_key = (id(long_entries), id(short_entries))
+        merged = merged_cache.get(merge_key)
+        if merged is None:
+            entries = _merge_for_key(long_entries, short_entries)
+            sequence_key = (
+                tuple((entry.entry_id, entry.known_at, entry.direction) for entry in entries),
+                fvg_link_selectors,
+            )
+            merged = (entries, sequence_key)
+            merged_cache[merge_key] = merged
+        entries, sequence_key = merged
+
         grouped.setdefault(sequence_key, []).append(pair)
         entries_by_key[sequence_key] = entries
         streams_by_key[sequence_key] = (long_entries, short_entries)
