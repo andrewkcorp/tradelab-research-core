@@ -1991,6 +1991,27 @@ def _merged_leaderboard(durable_top_n: list[LeaderboardEntry], tracker: _TopNTra
     return [dataclasses.replace(e, rank=i) for i, e in enumerate(combined[:n], start=1)]
 
 
+
+def _liquidity_index_for(context):
+    """The liquidity index, from mapped columns when the context has them.
+
+    A bundle-backed context carries a ``LiquidityStoreReader`` and leaves the
+    raw detector mappings ``None``: the simulation never dereferences those once
+    an index exists (``tp_targets.py:251``, ``sl_targets.py:239``), and holding
+    them measured ~2.6 GB per worker. The mapped index answers identically --
+    same eligibility rule, same rank 1/2/3, same equal-price tie groups -- while
+    materialising at most three levels per call instead of 785,102 up front.
+    """
+    store = getattr(context, "liquidity_store", None)
+    if store is not None:
+        from tradelab.liquidity_target_index import MappedLiquidityTargetIndex
+
+        return MappedLiquidityTargetIndex(store)
+    return LiquidityTargetIndex.build(
+        context.swing_equal_liquidity_results, context.session_liquidity_results
+    )
+
+
 def _expand_and_simulate(
     reporter: RunReporter,
     journal: BacktestV2Journal,
@@ -2099,7 +2120,7 @@ def _expand_and_simulate(
     reporter.phase_started(RunPhase.SIMULATING_BACKTESTS, items_total=max(total_variant_runs, 1))
     summary_path = reporter.run_dir / "variant_summaries.jsonl"
     bar_range_index = _build_bar_range_index_with_heartbeat(reporter, context.bars_1m)
-    liquidity_target_index = LiquidityTargetIndex.build(context.swing_equal_liquidity_results, context.session_liquidity_results)
+    liquidity_target_index = _liquidity_index_for(context)
     news_blackout_index = NewsBlackoutIndex.build(context.news_events)
 
     completed = journal.completed_count()
@@ -2870,7 +2891,7 @@ def _measure_sample_throughput(
     bar_range_index = _build_bar_range_index_with_heartbeat(reporter, context.bars_1m) if reporter is not None else BarRangeIndex.build(context.bars_1m)
     completed = 0
     start = time.perf_counter()
-    liquidity_target_index = LiquidityTargetIndex.build(context.swing_equal_liquidity_results, context.session_liquidity_results)
+    liquidity_target_index = _liquidity_index_for(context)
     news_blackout_index = NewsBlackoutIndex.build(context.news_events)
     for _class_id, class_group_iter in itertools.groupby(combos, key=lambda c: c[0].class_id):
         class_group = list(class_group_iter)

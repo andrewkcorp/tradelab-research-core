@@ -17,6 +17,8 @@ for legacy/reference tests and marks its result ``uses_mark_to_market=False``.
 """
 from __future__ import annotations
 
+from tradelab.trade_path_audit import _as_sequence
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -125,7 +127,7 @@ def audit_apex_eod(
     """
     if bars is not None:
         return _audit_apex_eod_mark_to_market(
-            account_result, config, tuple(bars), bar_range_index=bar_range_index,
+            account_result, config, _as_sequence(bars), bar_range_index=bar_range_index,
         )
     return _audit_apex_eod_realized(account_result, config)
 

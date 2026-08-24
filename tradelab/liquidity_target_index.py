@@ -16,6 +16,7 @@ from heapq import nsmallest
 from typing import Mapping
 
 from tradelab.liquidity import HIGH, LOW, LiquidityDetectionResult, LiquidityLevel, LiquidityStatus
+from tradelab.liquidity_store import _NULL_TIME, _to_micros
 
 
 @dataclass(frozen=True)
@@ -123,3 +124,104 @@ class LiquidityTargetIndex:
             if len(found) >= count:
                 break  # all later groups have strictly larger distance
         return tuple(sorted(found, key=lambda level: (abs((level.upper if side == HIGH else level.lower) - entry_price), level.formed_at, level.level_id))[:count])
+
+
+class MappedLiquidityTargetIndex:
+    """``LiquidityTargetIndex`` over a memory-mapped store instead of objects.
+
+    Same public surface (``nearest``), same rules, same tie-breaks. The
+    difference is where the data lives: this holds no ``LiquidityLevel`` and no
+    ``_IndexedLevel``, only the reader and two mapped arrays it does not own.
+    On the real artifact that is 785,102 level versions the worker never
+    materialises.
+
+    **Eligibility and ranking run on primitives.** ``_eligible`` in the object
+    index reads only ``effective_from``, ``effective_until``, ``status``,
+    ``formed_at`` and ``taken_at``; all five are numeric columns here, so a
+    candidate is accepted or rejected without building anything. Only the
+    survivors -- at most ``count`` (three) per call -- become real levels.
+
+    **The tie-break is preserved, not approximated.** The object index orders
+    equal candidates by ``level_id``, a string. This orders them by the store's
+    numeric level ordinal, which is assigned in sorted ``level_id`` order, so
+    the two comparisons induce the same order. See
+    ``tradelab/liquidity_store.py``.
+    """
+
+    __slots__ = ("_reader", "_absorbed_status", "_taken_status")
+
+    def __init__(self, reader) -> None:
+        self._reader = reader
+        self._absorbed_status = reader.absorbed_status_id
+        self._taken_status = reader.taken_status_id
+
+    def _eligible(self, version: int, known_at_us: int) -> bool:
+        formed_at, taken_at, effective_from, effective_until = self._reader.times(version)
+        if effective_from > known_at_us:
+            return False
+        if effective_until != _NULL_TIME and known_at_us >= effective_until:
+            return False
+        status = self._reader.status_id(version)
+        if status == self._absorbed_status:
+            return False
+        if formed_at > known_at_us:
+            return False
+        if status == self._taken_status and taken_at <= known_at_us:
+            return False
+        return True
+
+    def nearest(self, *, side: str, entry_price: float, entry_known_at, count: int = 3):
+        if side not in {HIGH, LOW}:
+            raise ValueError(f"Unsupported liquidity side {side!r}")
+        if count <= 0:
+            return ()
+        reader = self._reader
+        if side == HIGH:
+            prices, order = reader.high_prices, reader.high_order
+        else:
+            prices, order = reader.low_prices, reader.low_order
+        total = len(prices)
+        if total == 0:
+            return ()
+        known_at_us = _to_micros(entry_known_at)
+        index = bisect_right(prices, entry_price) if side == HIGH else bisect_left(prices, entry_price) - 1
+
+        found: list[int] = []
+        while 0 <= index < total:
+            price = prices[index]
+            start = index
+            if side == HIGH:
+                while index < total and prices[index] == price:
+                    index += 1
+                group_start, group_stop = start, index
+            else:
+                while index >= 0 and prices[index] == price:
+                    index -= 1
+                group_start, group_stop = index + 1, start + 1
+            # Streamed exactly as the object index streams it: at most ``count``
+            # of a group that can hold thousands of historical levels is ever
+            # observable, so neither the group nor the eligible subset is
+            # materialised.
+            remaining = count - len(found)
+            found.extend(
+                nsmallest(
+                    remaining,
+                    (
+                        order[position]
+                        for position in range(group_start, group_stop)
+                        if self._eligible(order[position], known_at_us)
+                    ),
+                    key=lambda version: (reader.times(version)[0], reader.level_ord(version)),
+                )
+            )
+            if len(found) >= count:
+                break  # all later groups have strictly larger distance
+            if group_start == group_stop:
+                break  # defensive: an empty group would not advance the cursor
+
+        def final_key(version: int):
+            lower, upper = reader.prices(version)
+            price_at = upper if side == HIGH else lower
+            return (abs(price_at - entry_price), reader.times(version)[0], reader.level_ord(version))
+
+        return tuple(reader.level_at(version) for version in sorted(found, key=final_key)[:count])

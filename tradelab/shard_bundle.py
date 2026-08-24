@@ -172,7 +172,35 @@ def write_bundle(
     # alive, but this local materialisation must not double it.
     del entries
 
-    context_blob = pickle.dumps(_unwrap_proxies(context), protocol=pickle.HIGHEST_PROTOCOL)
+    # Bars go to memory-mapped columns, not into the pickle. Every worker maps
+    # the same file read-only instead of unpickling its own ~3 GB of Bar1m
+    # objects -- see tradelab/shared_context.py for why copy-on-write does not
+    # solve this and mapping does.
+    from dataclasses import replace as _replace
+
+    from tradelab.shared_context import SIMCTX_DIRNAME, write_shared_context
+
+    from tradelab.liquidity_store import LIQUIDITY_DIRNAME, write_liquidity_store
+
+    simctx_manifest = write_shared_context(
+        bundle / SIMCTX_DIRNAME, context.bars_1m, fingerprint=plan.fingerprint.combined,
+    )
+    # Liquidity levels go the same way as the bars, and for the same reason:
+    # 785,102 causally-distinct level versions were being rebuilt in every
+    # worker. The simulation never dereferences the raw mappings once an index
+    # exists, so they are dropped from the pickle rather than shipped unused.
+    liquidity_manifest = write_liquidity_store(
+        bundle / LIQUIDITY_DIRNAME,
+        context.swing_equal_liquidity_results, context.session_liquidity_results,
+        fingerprint=plan.fingerprint.combined,
+    )
+    context_blob = pickle.dumps(
+        _replace(
+            _unwrap_proxies(context), bars_1m=None,
+            swing_equal_liquidity_results=None, session_liquidity_results=None,
+        ),
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )
     _atomic_write_bytes(bundle / CONTEXT_FILENAME, context_blob)
     _atomic_write_bytes(
         bundle / PLAN_FILENAME,
@@ -272,8 +300,75 @@ def read_plan(bundle_dir: Path | str) -> BacktestShardPlan:
 
 
 def load_context(bundle_dir: Path | str):
-    with open(Path(bundle_dir) / CONTEXT_FILENAME, "rb") as handle:
-        return _rewrap_proxies(pickle.load(handle))
+    """The prepared context, with bars mapped rather than unpickled.
+
+    Returns ``(context, reader)``. The reader owns the mappings and must be
+    closed when the context is done with; the context's ``bars_1m`` is a view
+    onto it and is invalid afterwards.
+
+    A bundle written before bars were externalised has them inside the pickle
+    and no ``simctx`` directory; it still loads, and the reader is ``None``.
+    That fallback exists so an existing bundle stays readable, not as a
+    supported way to write new ones.
+    """
+    from dataclasses import replace as _replace
+
+    from tradelab.shared_context import SIMCTX_DIRNAME, open_shared_context
+
+    bundle = Path(bundle_dir)
+    with open(bundle / CONTEXT_FILENAME, "rb") as handle:
+        context = _rewrap_proxies(pickle.load(handle))
+
+    from tradelab.liquidity_store import LIQUIDITY_DIRNAME, open_liquidity_store
+
+    simctx = bundle / SIMCTX_DIRNAME
+    if not simctx.is_dir():
+        if getattr(context, "bars_1m", None) is None:
+            raise EntryStoreError(
+                f"bundle at {bundle} has no bars: the pickled context carries none and there is "
+                f"no {SIMCTX_DIRNAME}/ directory. The bundle is incomplete; rebuild it."
+            )
+        return context, None
+
+    bars_reader = open_shared_context(simctx)
+    liquidity_reader = None
+    liquidity_dir = bundle / LIQUIDITY_DIRNAME
+    if liquidity_dir.is_dir():
+        try:
+            liquidity_reader = open_liquidity_store(liquidity_dir)
+        except BaseException:
+            bars_reader.close()
+            raise
+    elif context.swing_equal_liquidity_results is None:
+        bars_reader.close()
+        raise EntryStoreError(
+            f"bundle at {bundle} has no liquidity levels: the pickled context carries none and "
+            f"there is no {LIQUIDITY_DIRNAME}/ directory. The bundle is incomplete; rebuild it."
+        )
+    return (
+        _replace(context, bars_1m=bars_reader.bars, liquidity_store=liquidity_reader),
+        _BundleHandles(bars_reader, liquidity_reader),
+    )
+
+
+class _BundleHandles:
+    """Owns every mapping a bundle-backed context views into.
+
+    The context holds views, not copies, so these must outlive every use of it
+    and be closed exactly once. Kept as one object so a caller has a single
+    thing to close rather than a list that can be partly forgotten.
+    """
+
+    __slots__ = ("bars", "liquidity")
+
+    def __init__(self, bars, liquidity) -> None:
+        self.bars = bars
+        self.liquidity = liquidity
+
+    def close(self) -> None:
+        for handle in (self.bars, self.liquidity):
+            if handle is not None:
+                handle.close()
 
 
 def open_store(bundle_dir: Path | str, *, expected_fingerprint: str | None = None) -> EntryStoreReader:

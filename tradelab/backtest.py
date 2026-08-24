@@ -160,7 +160,7 @@ from dataclasses import dataclass, replace as _dataclass_replace
 from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 from tradelab.aggregate import SUPPORTED_TIMEFRAMES as _AGGREGATE_TIMEFRAMES
 from tradelab.aggregate import aggregate_bars
@@ -334,6 +334,17 @@ class PreparedBacktestContext:
     htf_bias_result: HTFBiasResult | None
     timeline: EntrySignalTimeline | None
     special_session_schedule: SpecialSessionSchedule | None = None
+    liquidity_store: Any | None = None
+    """A ``LiquidityStoreReader`` when the levels are memory-mapped rather than
+    held as objects.
+
+    Present only for a context assembled from a shard bundle. When set, the
+    simulation builds its ``LiquidityTargetIndex`` from the mapping instead of
+    from ``swing_equal_liquidity_results``/``session_liquidity_results`` --
+    which the simulation never dereferences anyway once an index exists (see
+    ``tp_targets.py:251``, ``sl_targets.py:239``), and which are therefore
+    ``None`` in that case. Optional and last, so every existing construction
+    site is unaffected."""
 
 
 SIMULATION_UNUSED_CONTEXT_FIELDS: tuple[str, ...] = (

@@ -100,6 +100,7 @@ class ProcessMemory:
     phys_footprint_peak_bytes: int | None = None
     rss_bytes: int | None = None
     compressed_bytes: int | None = None
+    internal_bytes: int | None = None
     peak_rss_bytes: int | None = None
     source: str = "unavailable"
 
@@ -137,8 +138,16 @@ def _macos_rusage() -> tuple[int | None, int | None, int | None]:
         return None, None, None
 
 
-def _macos_task_vm_info() -> tuple[int | None, int | None]:
-    """``(compressed, phys_footprint)`` via task_info(TASK_VM_INFO)."""
+def _macos_task_vm_info() -> tuple[int | None, int | None, int | None]:
+    """``(compressed, phys_footprint, internal)`` via task_info(TASK_VM_INFO).
+
+    ``internal`` is private anonymous memory -- the pages this process alone is
+    charged for. It is the figure that actually answers "did copy-on-write
+    hold?": a forked child that still shares its parent's pages has a small
+    ``internal``, and one that has privatised them has a large one. Summing
+    ``phys_footprint`` across a parent and its forked children double-counts
+    whatever they still share, so it cannot answer that question.
+    """
     try:
         libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
         mach_task_self = libc.mach_task_self
@@ -149,10 +158,10 @@ def _macos_task_vm_info() -> tuple[int | None, int | None]:
         info = _TaskVMInfoPrefix()
         count = ctypes.c_uint(ctypes.sizeof(_TaskVMInfoPrefix) // 4)
         if task_info(mach_task_self(), _TASK_VM_INFO, ctypes.byref(info), ctypes.byref(count)) != 0:
-            return None, None
-        return int(info.compressed), int(info.phys_footprint)
+            return None, None, None
+        return int(info.compressed), int(info.phys_footprint), int(info.internal)
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def sample_process_memory() -> ProcessMemory:
@@ -170,7 +179,7 @@ def sample_process_memory() -> ProcessMemory:
         return ProcessMemory(rss_bytes=rss, peak_rss_bytes=peak_rss, source="linux" if rss is not None else "unavailable")
 
     footprint, footprint_peak, resident = _macos_rusage()
-    compressed, task_footprint = _macos_task_vm_info()
+    compressed, task_footprint, internal = _macos_task_vm_info()
     if footprint is None:
         footprint = task_footprint
     if footprint is None and compressed is None:
@@ -180,6 +189,7 @@ def sample_process_memory() -> ProcessMemory:
         phys_footprint_peak_bytes=footprint_peak,
         rss_bytes=resident,
         compressed_bytes=compressed,
+        internal_bytes=internal,
         peak_rss_bytes=peak_rss,
         source="macos",
     )
@@ -237,3 +247,116 @@ def sample_system_memory_pressure() -> SystemMemoryPressure:
         return SystemMemoryPressure(swap_used_bytes=int(usage.xsu_used), swap_total_bytes=int(usage.xsu_total))
     except Exception:
         return SystemMemoryPressure()
+
+
+@dataclass(frozen=True)
+class SystemMemory:
+    """Machine-wide memory, for judging what a *set* of processes really costs.
+
+    Summing ``phys_footprint`` across a parent and its forked children
+    double-counts every page they still share, so it systematically
+    over-reports a fork/COW pool. The honest question is what the machine has
+    left, which is what ``available_bytes`` answers: free plus inactive plus
+    speculative plus purgeable, the pages the kernel can hand out without
+    swapping anything.
+    """
+
+    total_bytes: int | None = None
+    available_bytes: int | None = None
+    free_bytes: int | None = None
+    compressed_bytes: int | None = None
+    swap_used_bytes: int | None = None
+    swap_total_bytes: int | None = None
+
+    @property
+    def used_bytes(self) -> int | None:
+        if self.total_bytes is None or self.available_bytes is None:
+            return None
+        return self.total_bytes - self.available_bytes
+
+    def to_dict(self) -> dict:
+        out = {key: value for key, value in asdict(self).items() if value is not None}
+        if self.used_bytes is not None:
+            out["used_bytes"] = self.used_bytes
+        return out
+
+
+class _VMStatistics64(ctypes.Structure):
+    """``vm_statistics64_data_t`` prefix -- the page counters this module reads."""
+
+    _fields_ = [
+        ("free_count", ctypes.c_uint32),
+        ("active_count", ctypes.c_uint32),
+        ("inactive_count", ctypes.c_uint32),
+        ("wire_count", ctypes.c_uint32),
+        ("zero_fill_count", ctypes.c_uint64),
+        ("reactivations", ctypes.c_uint64),
+        ("pageins", ctypes.c_uint64),
+        ("pageouts", ctypes.c_uint64),
+        ("faults", ctypes.c_uint64),
+        ("cow_faults", ctypes.c_uint64),
+        ("lookups", ctypes.c_uint64),
+        ("hits", ctypes.c_uint64),
+        ("purges", ctypes.c_uint64),
+        ("purgeable_count", ctypes.c_uint32),
+        ("speculative_count", ctypes.c_uint32),
+        ("decompressions", ctypes.c_uint64),
+        ("compressions", ctypes.c_uint64),
+        ("swapins", ctypes.c_uint64),
+        ("swapouts", ctypes.c_uint64),
+        ("compressor_page_count", ctypes.c_uint32),
+        ("throttled_count", ctypes.c_uint32),
+        ("external_page_count", ctypes.c_uint32),
+        ("internal_page_count", ctypes.c_uint32),
+        ("total_uncompressed_pages_in_compressor", ctypes.c_uint64),
+    ]
+
+
+_HOST_VM_INFO64 = 4
+_HOST_VM_INFO64_COUNT = ctypes.sizeof(_VMStatistics64) // 4
+
+
+def sample_system_memory() -> SystemMemory:
+    """Machine-wide memory via ``host_statistics64`` -- no subprocess."""
+    swap = sample_system_memory_pressure()
+    if not _IS_MACOS:
+        return SystemMemory(swap_used_bytes=swap.swap_used_bytes, swap_total_bytes=swap.swap_total_bytes)
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        total = ctypes.c_uint64()
+        size = ctypes.c_size_t(ctypes.sizeof(total))
+        libc.sysctlbyname(b"hw.memsize", ctypes.byref(total), ctypes.byref(size), None, 0)
+        page_size = ctypes.c_uint64()
+        psize = ctypes.c_size_t(ctypes.sizeof(page_size))
+        if libc.sysctlbyname(b"vm.pagesize", ctypes.byref(page_size), ctypes.byref(psize), None, 0) != 0:
+            page_size.value = 16384
+
+        mach_host_self = libc.mach_host_self
+        mach_host_self.restype = ctypes.c_uint
+        host_statistics64 = libc.host_statistics64
+        host_statistics64.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+        host_statistics64.restype = ctypes.c_int
+        stats = _VMStatistics64()
+        count = ctypes.c_uint(_HOST_VM_INFO64_COUNT)
+        if host_statistics64(mach_host_self(), _HOST_VM_INFO64, ctypes.byref(stats), ctypes.byref(count)) != 0:
+            return SystemMemory(
+                total_bytes=int(total.value) or None,
+                swap_used_bytes=swap.swap_used_bytes, swap_total_bytes=swap.swap_total_bytes,
+            )
+        page = int(page_size.value)
+        # What the kernel can hand out without swapping: free, plus the
+        # inactive/speculative/purgeable pages it can reclaim cheaply.
+        available = (
+            int(stats.free_count) + int(stats.inactive_count)
+            + int(stats.speculative_count) + int(stats.purgeable_count)
+        ) * page
+        return SystemMemory(
+            total_bytes=int(total.value) or None,
+            available_bytes=available,
+            free_bytes=int(stats.free_count) * page,
+            compressed_bytes=int(stats.compressor_page_count) * page,
+            swap_used_bytes=swap.swap_used_bytes,
+            swap_total_bytes=swap.swap_total_bytes,
+        )
+    except Exception:
+        return SystemMemory(swap_used_bytes=swap.swap_used_bytes, swap_total_bytes=swap.swap_total_bytes)

@@ -150,7 +150,18 @@ class BarRangeIndex:
         *,
         on_progress: Callable[[str, int, int, int], None] | None = None,
     ) -> "BarRangeIndex":
-        timestamps = tuple(bar.timestamp for bar in bars)
+        # A memory-mapped bar series offers its columns directly. Taking them
+        # avoids materialising one Bar1m per bar just to read three fields off
+        # it, and -- more importantly -- avoids retaining a tuple of a million
+        # datetimes for the lifetime of the index. The values are the same
+        # numbers either way; only the route to them differs.
+        as_columns = getattr(bars, "as_columns", None)
+        if as_columns is not None:
+            timestamps, highs_source, lows_source = as_columns()
+        else:
+            timestamps = tuple(bar.timestamp for bar in bars)
+            highs_source = [bar.high for bar in bars]
+            lows_source = [bar.low for bar in bars]
         n = len(bars)
         size = _tree_size(n)
         if n == 0:
@@ -166,8 +177,8 @@ class BarRangeIndex:
                 "lows", level, meaningful_cells_per_tree + built, cells_total
             )
 
-        highs = _build_tree([bar.high for bar in bars], size=size, is_max=True, on_progress=highs_progress)
-        lows = _build_tree([bar.low for bar in bars], size=size, is_max=False, on_progress=lows_progress)
+        highs = _build_tree(highs_source, size=size, is_max=True, on_progress=highs_progress)
+        lows = _build_tree(lows_source, size=size, is_max=False, on_progress=lows_progress)
         return BarRangeIndex(n, timestamps, size, highs, lows)
 
     def find_bar_at_or_after(self, known_at: datetime, start_from: int = 0) -> int | None:

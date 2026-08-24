@@ -44,6 +44,52 @@ class AccountMarkToMarketAudit:
     timestamp_of_worst_equity: datetime | None
 
 
+
+def _as_sequence(bars):
+    """Bind ``bars`` without copying when it is already an indexable sequence.
+
+    ``tuple(bars)`` is free for a tuple but catastrophic for a memory-mapped
+    bar series: it materialises every ``Bar1m``, which on the real artifact is
+    1,057,182 objects built and thrown away *per audited variant* -- the exact
+    cost the mapping exists to avoid, and measured at a 2.9x throughput
+    regression before this was fixed. Everything below needs only ``len()``,
+    indexing and slicing, all of which a mapped series provides directly.
+
+    A one-shot iterator still gets materialised, because it must be traversed
+    more than once.
+    """
+    if hasattr(bars, "__len__") and hasattr(bars, "__getitem__"):
+        return bars
+    return tuple(bars)
+
+
+
+def _low_high_time_range(bars, start: int, stop: int):
+    """``(low, high, mark)`` for each bar in ``[start, stop)``.
+
+    The production mark-to-market loop reads exactly these three fields. A
+    memory-mapped series exposes each as a column, so iterating the columns
+    avoids materialising a ``Bar1m`` per minute of every audited trade's span --
+    thousands of objects for a multi-day trade, rebuilt for every exit variant.
+    A plain tuple or list falls through to attribute access and behaves exactly
+    as before.
+
+    ``mark`` is a bar *position* for a mapped series and a ``datetime`` for a
+    plain one; the caller decodes it only when a bar actually sets a new worst
+    mark, which is rare, so no timestamp is built for the common case.
+    """
+    low_at = getattr(bars, "low_at", None)
+    high_at = getattr(bars, "high_at", None)
+    timestamp_at = getattr(bars, "timestamp_at", None)
+    if low_at is not None and high_at is not None and timestamp_at is not None:
+        for position in range(start, stop):
+            yield low_at(position), high_at(position), position
+        return
+    for position in range(start, stop):
+        bar = bars[position]
+        yield bar.low, bar.high, bar.timestamp
+
+
 def audit_trade_paths(
     trades: tuple[ExecutedTrade, ...] | list[ExecutedTrade],
     account_result: AccountBacktestResult,
@@ -56,7 +102,7 @@ def audit_trade_paths(
     adverse excursion.
     """
     executions = {trade.trade_id: trade for trade in trades}
-    ordered_bars = tuple(bars)
+    ordered_bars = _as_sequence(bars)
     timestamps = [bar.timestamp for bar in ordered_bars]
     if timestamps != sorted(timestamps) or len(set(timestamps)) != len(timestamps):
         raise ValueError("bars must be strictly timestamp-ordered with no duplicates")
@@ -102,7 +148,7 @@ def _audit_account_mark_to_market_reference(
 ) -> AccountMarkToMarketAudit:
     """Original full-bar replay retained as the equivalence oracle."""
     executions = {trade.trade_id: trade for trade in trades}
-    ordered_bars = tuple(bars)
+    ordered_bars = _as_sequence(bars)
     if not ordered_bars:
         return AccountMarkToMarketAudit(initial_balance_usd, 0.0, None)
     by_timestamp = {bar.timestamp: bar for bar in ordered_bars}
@@ -176,7 +222,7 @@ def audit_account_mark_to_market(
     never a silently optimistic risk result.
     """
     executions = {trade.trade_id: trade for trade in trades}
-    ordered_bars = tuple(bars)
+    ordered_bars = _as_sequence(bars)
     if not ordered_bars:
         return AccountMarkToMarketAudit(initial_balance_usd, 0.0, None)
     index = bar_range_index if bar_range_index is not None else BarRangeIndex.build(ordered_bars)
@@ -213,9 +259,11 @@ def audit_account_mark_to_market(
         previous_end = end
         balance -= open_trade.entry_cost_usd
         pv = point_value_usd(open_trade.instrument)
-        for bar in ordered_bars[start:end + 1]:
-            adverse_price = bar.low if open_trade.direction == "long" else bar.high
-            favourable_price = bar.high if open_trade.direction == "long" else bar.low
+        long_side = open_trade.direction == "long"
+        timestamp_at = getattr(ordered_bars, "timestamp_at", None)
+        for bar_low, bar_high, bar_mark in _low_high_time_range(ordered_bars, start, end + 1):
+            adverse_price = bar_low if long_side else bar_high
+            favourable_price = bar_high if long_side else bar_low
             adverse_points = (
                 adverse_price - open_trade.entry_price
                 if open_trade.direction == "long"
@@ -234,7 +282,8 @@ def audit_account_mark_to_market(
             peak = max(peak, favourable_marked)
             max_drawdown = max(max_drawdown, peak - adverse_marked)
             if adverse_marked < worst:
-                worst, worst_at = adverse_marked, bar.timestamp
+                worst = adverse_marked
+                worst_at = timestamp_at(bar_mark) if timestamp_at is not None else bar_mark
         if open_trade.exit_timestamp is not None:
             assert open_trade.gross_pnl_usd is not None
             balance += open_trade.gross_pnl_usd

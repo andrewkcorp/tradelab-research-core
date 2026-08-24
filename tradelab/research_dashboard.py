@@ -764,12 +764,21 @@ DASHBOARD_HTML = r"""<!doctype html>
           <span class="stat" title="Variants per second across all workers.">Aggregate: <b id="mp-throughput">-</b></span>
           <span class="stat">Shards: <b id="mp-shards">-</b></span>
           <span class="stat" title="Coordinator process footprint. Workers are listed separately below.">Parent memory: <b id="mp-parent-mem">-</b></span>
-          <span class="stat" title="Parent plus all workers.">Aggregate memory: <b id="mp-total-mem">-</b></span>
+          <span class="stat" title="Sum of every process footprint. Under a forked pool this double-counts pages shared between parent and children, so it is an upper bound; the private total below is the lower bound.">Aggregate memory: <b id="mp-total-mem">-</b></span>
+        </div>
+        <div class="progress-row">
+          <span class="stat" title="How worker processes are started, and how the simulation context reaches them.">Pool mode: <b id="mp-mode">-</b></span>
+          <span class="stat" title="Read-only bars, liquidity levels and entry store that every worker maps instead of copying. File-backed and clean, so the kernel shares these pages and they are no process's private memory.">Mapped context: <b id="mp-mapped">-</b></span>
+          <span class="stat" title="Memory the machine can still hand out without swapping: free plus inactive plus speculative plus purgeable.">System available: <b id="mp-available">-</b></span>
+          <span class="stat" title="Machine-wide swap growth since this run started. Pre-existing swap from unrelated processes is not counted against this run.">Swap since start: <b id="mp-swap-delta">-</b></span>
+          <span class="stat" title="Share of physical RAM in use machine-wide, including compressed pages.">Memory pressure: <b id="mp-pressure">-</b></span>
         </div>
         <div id="mp-degraded" class="warn-banner" style="display:none"></div>
         <table class="mp-table"><thead><tr>
           <th>Worker</th><th>PID</th><th>State</th><th>Shard</th><th>Shards done</th>
-          <th>Variants</th><th>Throughput</th><th>Process memory</th>
+          <th>Variants</th><th>Throughput</th><th title="Total physical footprint of the worker process.">Process memory</th>
+          <th title="Private anonymous memory: pages this worker alone owns. Under fork, this rising toward the full footprint is copy-on-write breaking down.">Private</th>
+          <th title="Footprint minus private. macOS does not define this as shared memory, so it is shown as unattributed rather than labelled a sharing figure; the mapped context size above is the real shared total.">Unattributed</th>
         </tr></thead><tbody id="mp-rows"></tbody></table>
       </div>
       <div class="timeline" id="phase-timeline"></div>
@@ -919,10 +928,40 @@ function renderMultiprocess(mp) {
   document.getElementById("mp-shards").textContent =
     fmtNum(mp.shards_completed || 0) + " / " + fmtNum(mp.shards_total || 0)
     + ((mp.shards_failed && mp.shards_failed.length) ? "  (" + mp.shards_failed.length + " failed)" : "");
-  document.getElementById("mp-parent-mem").textContent = fmtBytes(mp.parent_phys_footprint_bytes);
+  document.getElementById("mp-parent-mem").textContent =
+    fmtBytes(mp.parent_phys_footprint_bytes)
+    + (mp.parent_private_bytes ? " (" + fmtBytes(mp.parent_private_bytes) + " private)" : "");
   document.getElementById("mp-total-mem").textContent =
     fmtBytes(mp.aggregate_phys_footprint_bytes)
-    + (mp.budget_bytes ? " / " + fmtBytes(mp.budget_bytes) + " budget" : "");
+    + (mp.budget_bytes ? " / " + fmtBytes(mp.budget_bytes) + " budget" : "")
+    + (mp.aggregate_private_bytes ? "  ·  " + fmtBytes(mp.aggregate_private_bytes) + " private" : "");
+
+  document.getElementById("mp-mode").textContent =
+    (mp.start_method || "?") + (mp.context_sharing ? " · " + mp.context_sharing : "");
+  document.getElementById("mp-available").textContent = fmtBytes(mp.system_available_bytes);
+  document.getElementById("mp-mapped").textContent =
+    mp.mapped_context_bytes ? fmtBytes(mp.mapped_context_bytes) + " shared" : "-";
+
+  // Swap growth attributable to this run, not the machine's absolute swap:
+  // a machine already swapping for unrelated reasons is not this run's doing.
+  const swapDelta = (mp.system_swap_growth_bytes === null || mp.system_swap_growth_bytes === undefined)
+    ? null : mp.system_swap_growth_bytes;
+  const swapEl = document.getElementById("mp-swap-delta");
+  swapEl.textContent = swapDelta === null ? "-"
+    : (swapDelta > 0 ? "+" : "") + fmtBytes(swapDelta);
+  swapEl.style.color = (swapDelta !== null && swapDelta > 1024 * 1024 * 1024) ? "var(--danger, #c0392b)" : "";
+
+  const pressureEl = document.getElementById("mp-pressure");
+  if (mp.physical_ram_bytes && mp.system_used_bytes) {
+    const used = mp.system_used_bytes / mp.physical_ram_bytes;
+    pressureEl.textContent = Math.round(used * 100) + "% of "
+      + fmtBytes(mp.physical_ram_bytes) + " in use"
+      + (mp.system_compressed_bytes ? " (" + fmtBytes(mp.system_compressed_bytes) + " compressed)" : "");
+    pressureEl.style.color = used > 0.9 ? "var(--danger, #c0392b)" : "";
+  } else {
+    pressureEl.textContent = "-";
+    pressureEl.style.color = "";
+  }
 
   const degraded = document.getElementById("mp-degraded");
   if (mp.degraded_reason) {
@@ -940,9 +979,11 @@ function renderMultiprocess(mp) {
     + "<td>" + fmtNum(w.shards_completed || 0) + "</td>"
     + "<td>" + fmtNum(w.variants_completed || 0) + "</td>"
     + "<td>" + (w.throughput_per_second === null || w.throughput_per_second === undefined ? "-" : fmtNum(w.throughput_per_second) + "/s") + "</td>"
-    + "<td>" + fmtBytes(w.phys_footprint_bytes) + "</td></tr>"
+    + "<td>" + fmtBytes(w.phys_footprint_bytes) + "</td>"
+    + "<td>" + fmtBytes(w.private_bytes) + "</td>"
+    + "<td>" + fmtBytes(w.shared_bytes) + "</td></tr>"
   ).join("");
-  document.getElementById("mp-rows").innerHTML = rows || "<tr><td colspan=\"8\">no workers reported yet</td></tr>";
+  document.getElementById("mp-rows").innerHTML = rows || "<tr><td colspan=\"10\">no workers reported yet</td></tr>";
 }
 
 function fmtAgo(iso) { if (!iso) return "-"; const s = (Date.now() - new Date(iso).getTime()) / 1000; if (s < 0) return "just now"; if (s < 2) return "just now"; return fmtSeconds(s) + " ago"; }
