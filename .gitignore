@@ -55,3 +55,8 @@ research_journal.sqlite3
 /shards/
 **/shards/
 *.shard
+
+# Whole run directories a diagnostic may produce under .diag (the scripts and
+# their small JSON reports are covered by the rules above).
+.diag/equiv-runs/
+.diag/shard-bundle*/
