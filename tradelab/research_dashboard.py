@@ -44,6 +44,7 @@ from urllib.parse import parse_qs, urlparse
 from tradelab.research_run import list_run_ids, read_leaderboard, read_live_status, read_progress_events, read_run_manifest
 from tradelab.session_analysis import SessionFilter, analyse as analyse_session_subset, filter_trades
 from tradelab.trading_sessions import session_catalog
+from tradelab.worker_policy import worker_policy
 
 DEFAULT_PORT = 8765
 UNIVERSE_PAGE_DEFAULT = 100
@@ -580,6 +581,9 @@ class _DashboardRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/runs":
                 self._handle_list_runs()
                 return
+            if path == "/api/worker-policy":
+                self._handle_worker_policy()
+                return
             if path.startswith("/api/runs/"):
                 self._handle_run_endpoint(path, query)
                 return
@@ -588,6 +592,13 @@ class _DashboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "run artifact not found -- the run may not have written it yet"}, status=404)
         except Exception as exc:  # pragma: no cover -- defensive: never crash the read-only server on a bad artifact
             self._send_json({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+
+    def _handle_worker_policy(self) -> None:
+        """The configured production worker count and the benchmark that chose
+        it, read from ``tradelab.worker_policy`` rather than restated here --
+        a number shown beside a justification has to be the number the code
+        actually uses."""
+        self._send_json(worker_policy())
 
     def _handle_list_runs(self) -> None:
         runs = []
@@ -784,6 +795,8 @@ DASHBOARD_HTML = r"""<!doctype html>
   main { padding: 20px; max-width: 1560px; margin: 0 auto; }
   .demo-banner { background: linear-gradient(90deg, rgba(168,85,247,0.18), rgba(168,85,247,0.05)); border: 1px solid rgba(168,85,247,0.4); color: var(--demo); padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; font-weight: 600; font-size: 13px; display: none; }
   .empty-state { color: var(--text-faint); font-size: 13px; text-align: center; padding: 30px 10px; }
+  .policy-note { color: var(--text-faint); font-size: 11.5px; }
+  .policy-note a { color: inherit; text-decoration: underline dotted; }
   .posthoc-banner { background: #3a2a10; border: 1px solid #7a5a20; color: #f0d9a8; border-radius: 8px; padding: 10px 14px; font-size: 12.5px; line-height: 1.5; margin-bottom: 14px; }
   .posthoc-banner strong { color: #ffd98a; }
   .session-controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; margin-bottom: 14px; }
@@ -912,6 +925,10 @@ DASHBOARD_HTML = r"""<!doctype html>
           <span class="stat" title="Memory the machine can still hand out without swapping: free plus inactive plus speculative plus purgeable.">System available: <b id="mp-available">-</b></span>
           <span class="stat" title="Machine-wide swap growth since this run started. Pre-existing swap from unrelated processes is not counted against this run.">Swap since start: <b id="mp-swap-delta">-</b></span>
           <span class="stat" title="Share of physical RAM in use machine-wide, including compressed pages.">Memory pressure: <b id="mp-pressure">-</b></span>
+        </div>
+        <div class="progress-row" id="mp-policy-row">
+          <span class="stat" id="mp-policy" title="The worker count a production run uses unless the operator overrides it, and the benchmark that chose it. Never set from core count.">Configured default: <b id="mp-policy-count">-</b></span>
+          <span class="stat policy-note" id="mp-policy-basis"></span>
         </div>
         <div id="mp-degraded" class="warn-banner" style="display:none"></div>
         <table class="mp-table"><thead><tr>
@@ -1755,6 +1772,26 @@ function initSessionAnalysis() {
   });
 }
 
+// The configured production worker count, fetched once: it is a property of
+// the deployment, not of the selected run, and cannot change while the page is
+// open. Shown beside the live worker count so a run started with an override
+// is visibly an override rather than looking like the policy.
+let workerPolicy = null;
+
+async function loadWorkerPolicy() {
+  workerPolicy = await fetchJson("/api/worker-policy");
+  const countEl = document.getElementById("mp-policy-count");
+  const basisEl = document.getElementById("mp-policy-basis");
+  if (!workerPolicy) { countEl.textContent = "-"; basisEl.textContent = ""; return; }
+  countEl.textContent = workerPolicy.production_worker_count;
+  const ev = workerPolicy.evidence || {};
+  const measured = ev.measured_speedup_pct === null || ev.measured_speedup_pct === undefined
+    ? null
+    : `${ev.candidate_workers} vs ${ev.baseline_workers}: ${ev.measured_speedup_pct > 0 ? "+" : ""}${ev.measured_speedup_pct}% against a ${ev.required_speedup_pct}% gate`;
+  basisEl.textContent = [workerPolicy.rationale, measured, workerPolicy.benchmark_doc]
+    .filter(Boolean).join(" · ");
+}
+
 async function refresh() {
   await loadRuns();
   if (!currentRunId) return;
@@ -1847,6 +1884,7 @@ document.getElementById("leaders-scroll").addEventListener("scroll", (event) => 
 
 (async () => {
   initSessionAnalysis();
+  await loadWorkerPolicy();
   await refresh();
   // Loaded once here and then only on user interaction -- see the note above
   // loadSessionAnalysis for why this is deliberately off the poll timer.
