@@ -972,6 +972,11 @@ DASHBOARD_HTML = r"""<!doctype html>
         <span class="stat" style="min-width:170px">Bars scanned: <b id="stat-bar-progress">-</b></span>
         <div class="progress-bar-track"><div id="bar-progress-bar-fill" class="progress-bar-fill" style="width:0%"></div></div>
       </div>
+      <div id="active-work-pool" style="display:none; margin-top:12px">
+        <table class="mp-table"><thead><tr>
+          <th>Worker</th><th>State</th><th>Shard</th><th>Variants in shard</th><th>Rate</th><th>Last heartbeat</th>
+        </tr></thead><tbody id="active-work-pool-rows"></tbody></table>
+      </div>
     </div>
   </section>
 
@@ -1308,14 +1313,66 @@ function activeWorkMode(operation) {
   return found || { label: op || "-", badgeClass: "badge-phase", unitLabel: "Progress" };
 }
 
-// task 044: live_status.active_work is optional -- absent entirely on
-// older run folders written before this field existed, and null on any
-// run (old or new) that isn't currently between heartbeats. Both cases
-// render the same "no live activity yet" empty state, never an error.
+// active_work is the detailed single-process heartbeat.  A pool intentionally
+// leaves it null and publishes the real work on each worker instead.  Treating
+// that valid pool state as empty used to make Live activity look broken while
+// the pool table above proved that workers were busy.
 function renderActiveWork(status) {
   const empty = document.getElementById("active-work-empty");
   const content = document.getElementById("active-work-content");
   const work = status && status.active_work;
+  const pool = status && status.multiprocess;
+  const workers = (pool && Array.isArray(pool.workers)) ? pool.workers : [];
+  const activeWorkers = workers.filter(w => w && (w.status === "running" || w.status === "loading"));
+  const poolPanel = document.getElementById("active-work-pool");
+
+  if (!work && activeWorkers.length) {
+    empty.style.display = "none";
+    content.style.display = "block";
+    poolPanel.style.display = "block";
+
+    const modeBadge = document.getElementById("active-work-mode-badge");
+    modeBadge.textContent = "Worker pool · " + activeWorkers.length + " active";
+    modeBadge.className = "badge badge-mode-simulating";
+
+    const aggregate = pool.aggregate_throughput_per_second;
+    const shardText = activeWorkers.map(w => w.current_shard === null || w.current_shard === undefined ? "?" : w.current_shard).join(", ");
+    document.getElementById("stat-variant-id").textContent = activeWorkers.length + " workers";
+    document.getElementById("stat-active-work-updated").textContent = fmtAgo(status.updated_at);
+    document.getElementById("stat-operation-detail").textContent =
+      "Simulating shards " + shardText
+      + (aggregate === null || aggregate === undefined ? "" : " · aggregate " + fmtNum(aggregate) + "/s");
+
+    const completed = status.items_completed;
+    const total = status.items_total;
+    const unitRow = document.getElementById("active-work-unit-row");
+    unitRow.style.display = "flex";
+    document.getElementById("stat-unit-progress-label").firstChild.textContent = "Completed variants: ";
+    document.getElementById("stat-unit-progress").textContent = fmtNum(completed || 0) + " / " + (total === null || total === undefined ? "?" : fmtNum(total));
+    const itemPct = (total && total > 0) ? Math.min(100, ((completed || 0) / total) * 100) : 0;
+    document.getElementById("unit-progress-bar-fill").style.width = itemPct + "%";
+
+    const barsRow = document.getElementById("active-work-bars-row");
+    barsRow.style.display = "flex";
+    document.querySelector("#active-work-bars-row span.stat").firstChild.textContent = "Shards complete: ";
+    const shardsDone = pool.shards_completed || 0;
+    const shardsTotal = pool.shards_total;
+    document.getElementById("stat-bar-progress").textContent = fmtNum(shardsDone) + " / " + (shardsTotal === null || shardsTotal === undefined ? "?" : fmtNum(shardsTotal));
+    const shardPct = (shardsTotal && shardsTotal > 0) ? Math.min(100, (shardsDone / shardsTotal) * 100) : 0;
+    document.getElementById("bar-progress-bar-fill").style.width = shardPct + "%";
+
+    document.getElementById("active-work-pool-rows").innerHTML = activeWorkers.map(w =>
+      "<tr><td>" + w.worker_id + "</td>"
+      + "<td>" + (w.status || "-") + "</td>"
+      + "<td>" + (w.current_shard === null || w.current_shard === undefined ? "-" : w.current_shard) + "</td>"
+      + "<td>" + fmtNum(w.variants_completed || 0) + "</td>"
+      + "<td>" + (w.throughput_per_second === null || w.throughput_per_second === undefined ? "-" : fmtNum(w.throughput_per_second) + "/s") + "</td>"
+      + "<td>" + (w.seconds_since_update === null || w.seconds_since_update === undefined ? "-" : fmtSeconds(w.seconds_since_update) + " ago") + "</td></tr>"
+    ).join("");
+    return;
+  }
+
+  poolPanel.style.display = "none";
   if (!work) {
     empty.style.display = "block";
     content.style.display = "none";
@@ -1354,6 +1411,7 @@ function renderActiveWork(status) {
     barsRow.style.display = "none";
   } else {
     barsRow.style.display = "flex";
+    document.querySelector("#active-work-bars-row span.stat").firstChild.textContent = "Bars scanned: ";
     document.getElementById("stat-bar-progress").textContent = fmtNum(work.bars_scanned) + " / " + (work.bars_total === null || work.bars_total === undefined ? "?" : fmtNum(work.bars_total));
     const barsPct = (work.bars_total && work.bars_total > 0) ? Math.min(100, (work.bars_scanned / work.bars_total) * 100) : 0;
     document.getElementById("bar-progress-bar-fill").style.width = barsPct + "%";

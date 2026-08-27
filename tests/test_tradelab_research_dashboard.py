@@ -420,6 +420,19 @@ class DashboardHtmlModeLabelTests(_ServerTestCase):
         # rendering a stale/fake bar count.
         self.assertIn("work.bars_scanned === null", DASHBOARD_HTML)
 
+    def test_worker_pool_is_rendered_when_single_worker_heartbeat_is_null(self):
+        # A multiprocessing run publishes work per worker and deliberately
+        # leaves active_work null.  The dashboard must render that state as
+        # live activity, rather than the misleading empty panel.
+        for required in (
+            "const activeWorkers = workers.filter",
+            'modeBadge.textContent = "Worker pool · "',
+            '"Completed variants: "',
+            '"Shards complete: "',
+            'id="active-work-pool-rows"',
+        ):
+            self.assertIn(required, DASHBOARD_HTML, msg=f"missing pool live-activity rendering: {required!r}")
+
 
 if __name__ == "__main__":
     unittest.main()
