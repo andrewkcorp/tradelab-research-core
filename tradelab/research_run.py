@@ -94,9 +94,16 @@ class RunPhase(str, Enum):
     RANKING_RESULTS = "ranking_results"
     COMPLETED = "completed"
     FAILED = "failed"
+    # Task 051. A run refused by the preflight gate never simulated anything,
+    # and must not be left sitting in SIMULATING_BACKTESTS with
+    # items_completed=0 -- a state indistinguishable from "started and stuck".
+    # Distinct from FAILED on purpose: nothing crashed, the run was correctly
+    # and deliberately stopped before it could do harm, and its bundle and
+    # journal are intact.
+    FAILED_PREFLIGHT = "failed_preflight"
 
 
-_TERMINAL_PHASES = frozenset({RunPhase.COMPLETED, RunPhase.FAILED})
+_TERMINAL_PHASES = frozenset({RunPhase.COMPLETED, RunPhase.FAILED, RunPhase.FAILED_PREFLIGHT})
 _WORK_PHASES = frozenset(RunPhase) - _TERMINAL_PHASES
 
 
@@ -636,6 +643,13 @@ class LiveStatus:
     errors: tuple[str, ...]
     active_work: Mapping[str, Any] | None = None  # task 044 -- see ActiveWork; None on older run folders, always backward compatible
     multiprocess: Mapping[str, Any] | None = None  # worker pool state; None for single-process runs and every older run folder
+    # Task 051. Stated positively rather than inferred from the absence of
+    # `multiprocess`: a reader must be able to see "nothing was started" as a
+    # fact, not deduce it from a null. Both are 0 until the pool actually
+    # starts workers, so a refused run reads unambiguously.
+    workers_started: int = 0
+    simulations_started: int = 0
+    preflight: Mapping[str, Any] | None = None  # the gate's own verdict, when one was reached
 
     def __post_init__(self) -> None:
         RunPhase(self.phase)  # raises ValueError if not a legal phase
@@ -661,6 +675,8 @@ class LiveStatus:
             "warnings": list(self.warnings), "errors": list(self.errors),
             "active_work": (dict(self.active_work) if self.active_work is not None else None),
             "multiprocess": (dict(self.multiprocess) if self.multiprocess is not None else None),
+            "workers_started": self.workers_started, "simulations_started": self.simulations_started,
+            "preflight": (dict(self.preflight) if self.preflight is not None else None),
         }
 
     @staticmethod
@@ -677,6 +693,8 @@ class LiveStatus:
             top_strategies=tuple(d.get("top_strategies", ())), warnings=tuple(d.get("warnings", ())),
             errors=tuple(d.get("errors", ())), active_work=d.get("active_work"),  # absent on older run folders -- None, never a KeyError
             multiprocess=d.get("multiprocess"),
+            workers_started=d.get("workers_started", 0), simulations_started=d.get("simulations_started", 0),
+            preflight=d.get("preflight"),
         )
 
 
@@ -717,6 +735,11 @@ class RunReporter:
         self._errors: list[str] = []
         self._active_work: ActiveWork | None = None
         self._multiprocess: dict | None = None
+        # Task 051: 0 until something actually starts, never None. A reader
+        # must see "nothing was started" stated, not inferred from a null.
+        self._workers_started: int = 0
+        self._simulations_started: int = 0
+        self._preflight: dict | None = None
         self._last_heartbeat_monotonic: float | None = None
         # task 046: an RLock (not a plain Lock) -- _flush_status() itself
         # acquires this too (see its own docstring), and heartbeat()/
@@ -1033,6 +1056,47 @@ class RunReporter:
         self._append_event("completed", {"summary": dict(summary) if summary else {}})
         self._flush_status()
 
+    def preflight_refused(self, *, reason: str, detail: Mapping[str, Any] | None = None) -> None:
+        """End the run in ``failed_preflight``: refused before anything ran.
+
+        This is the correct terminal state for a gate refusal, and it is not
+        ``failed``: nothing crashed and nothing is corrupt -- the run was
+        stopped deliberately, and its shard payloads and journal remain valid.
+        Leaving it in ``simulating_backtests`` (which is what happened before
+        task 051) produced a run that looked permanently stuck at 0 of 687,975
+        variants, indistinguishable from a pool that had started and hung.
+
+        ``workers_started``/``simulations_started`` are pinned at 0 here rather
+        than left to be inferred from a missing ``multiprocess`` block.
+        """
+        _require(bool(reason), "preflight_refused(reason=...) must be non-empty")
+        self._phase = RunPhase.FAILED_PREFLIGHT
+        self._workers_started = 0
+        self._simulations_started = 0
+        self._preflight = {"passed": False, "reason": reason, **(dict(detail) if detail else {})}
+        self._warnings.append(f"preflight refused: {reason}")
+        self._append_event("preflight_refused", {"reason": reason, "detail": dict(detail) if detail else {}})
+        self._flush_status()
+
+    def preflight_passed(self, *, detail: Mapping[str, Any] | None = None) -> None:
+        """Record that the gate admitted the run. Not terminal: the pool
+        follows. Recorded so the dashboard can distinguish "gate passed, pool
+        starting" from "no gate has run yet"."""
+        self._preflight = {"passed": True, **(dict(detail) if detail else {})}
+        self._append_event("preflight_passed", {"detail": dict(detail) if detail else {}})
+        self._flush_status()
+
+    def pool_started(self, *, workers_started: int) -> None:
+        """The pool actually started this many worker processes."""
+        _require(workers_started >= 0, "pool_started(workers_started=...) must be >= 0")
+        self._workers_started = workers_started
+        self._flush_status()
+
+    def simulations_started(self, count: int) -> None:
+        """How many strategy-variant simulations have actually begun."""
+        _require(count >= 0, "simulations_started(count) must be >= 0")
+        self._simulations_started = count
+
     def failed(self, *, error: str, traceback_text: str | None = None) -> None:
         _require(bool(error), "failed(error=...) must be non-empty")
         self._phase = RunPhase.FAILED
@@ -1109,6 +1173,8 @@ class RunReporter:
                 backtests_completed=self._backtests_completed, top_strategies=self._top_strategies,
                 warnings=tuple(self._warnings), errors=tuple(self._errors),
                 active_work=(self._active_work.to_dict() if self._active_work is not None else None),
+                workers_started=self._workers_started, simulations_started=self._simulations_started,
+                preflight=self._preflight,
                 multiprocess=self._multiprocess,
             )
             atomic_write_json(self._run_dir / "live_status.json", status.to_dict())

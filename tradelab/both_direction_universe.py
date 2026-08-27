@@ -13,6 +13,7 @@ are deliberately removed from that stream by its conservative conflict rule.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 from datetime import datetime
 from tradelab.entry_signal_timeline import LONG, SHORT
 from tradelab.entry_strategy_universe import (
@@ -56,8 +57,36 @@ class BothDirectionUniverseResult:
     equivalence_class_count: int
 
 
-def discover_both_direction_universe(universe: EntryStrategyUniverseResult) -> BothDirectionUniverseResult:
-    """Pair every structurally symmetric eligible long/short recipe once."""
+def _entry_key(cache: dict, entry: ObservedEntry) -> tuple:
+    """The (entry_id, known_at, direction) key for one entry, built once.
+
+    Exactly the tuple that used to be constructed inline per merged stream --
+    identical contents, identical ordering, identical hashing -- but allocated
+    once per entry instead of once per stream the entry appears in.
+    """
+    key = cache.get(entry.entry_id)
+    if key is None:
+        key = (entry.entry_id, entry.known_at, entry.direction)
+        cache[entry.entry_id] = key
+    elif key != (entry.entry_id, entry.known_at, entry.direction):
+        raise ValueError(f"entry_id {entry.entry_id!r} describes two different entries")
+    return key
+
+
+def discover_both_direction_universe(
+    universe: EntryStrategyUniverseResult,
+    *,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> BothDirectionUniverseResult:
+    """Pair every structurally symmetric eligible long/short recipe once.
+
+    ``on_progress`` (task 051), if given, is called with ``(pairs_processed,
+    pairs_total)`` as the merge loop advances. Purely observational: nothing it
+    reports is read back, and it never changes what is computed. On real MNQ
+    this phase runs for around seven minutes with no milestone of its own, so
+    without it the dashboard cannot distinguish "deduplicating" from "hung".
+    The caller is expected to pass an already time-throttled callback.
+    """
     class_by_spec_id: dict[str, EntryStrategyEquivalenceClass] = {}
     specs: list[EntryStrategySpec] = []
     for equivalence_class in universe.equivalence_classes:
@@ -100,8 +129,12 @@ def discover_both_direction_universe(universe: EntryStrategyUniverseResult) -> B
     # safe because `universe` keeps every one of them alive for this whole
     # function, so an id cannot be recycled while in use.
     merged_cache: dict[tuple[int, int, tuple], tuple[tuple[ObservedEntry, ...], tuple]] = {}
+    entry_key_by_id: dict[str, tuple] = {}
 
-    for pair in pairs:
+    total_pairs = len(pairs)
+    for pair_index, pair in enumerate(pairs, start=1):
+        if on_progress is not None:
+            on_progress(pair_index, total_pairs)
         fvg_link_selectors = _fvg_link_selectors(pair.long_spec)
         long_entries = class_by_spec_id[pair.long_spec.spec_id].observed_entries
         short_entries = class_by_spec_id[pair.short_spec.spec_id].observed_entries
@@ -110,8 +143,13 @@ def discover_both_direction_universe(universe: EntryStrategyUniverseResult) -> B
         merged = merged_cache.get(merge_key)
         if merged is None:
             entries = _merge_for_key(long_entries, short_entries)
+            # One key tuple per entry, shared across every merged stream that
+            # entry appears in, rather than a fresh 3-tuple per stream. Same
+            # reasoning -- and the same measured effect -- as the memoisation
+            # in tradelab.entry_strategy_universe; see
+            # docs/preflight-swap-diagnosis.md.
             sequence_key = (
-                tuple((entry.entry_id, entry.known_at, entry.direction) for entry in entries),
+                tuple(_entry_key(entry_key_by_id, entry) for entry in entries),
                 fvg_link_selectors,
             )
             merged = (entries, sequence_key)

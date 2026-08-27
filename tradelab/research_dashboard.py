@@ -795,6 +795,11 @@ DASHBOARD_HTML = r"""<!doctype html>
   main { padding: 20px; max-width: 1560px; margin: 0 auto; }
   .demo-banner { background: linear-gradient(90deg, rgba(168,85,247,0.18), rgba(168,85,247,0.05)); border: 1px solid rgba(168,85,247,0.4); color: var(--demo); padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; font-weight: 600; font-size: 13px; display: none; }
   .empty-state { color: var(--text-faint); font-size: 13px; text-align: center; padding: 30px 10px; }
+  .preflight-banner { background: rgba(248,113,113,0.10); border: 1px solid rgba(248,113,113,0.45); border-radius: 8px; padding: 12px 14px; margin: 10px 0; }
+  .preflight-title { color: var(--bad); font-weight: 600; font-size: 13px; margin-bottom: 5px; }
+  .preflight-reason { font-size: 12.5px; line-height: 1.5; margin-bottom: 8px; }
+  .preflight-facts { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--text-faint); }
+  .preflight-facts b { color: var(--text); }
   .policy-note { color: var(--text-faint); font-size: 11.5px; }
   .policy-note a { color: inherit; text-decoration: underline dotted; }
   .posthoc-banner { background: #3a2a10; border: 1px solid #7a5a20; color: #f0d9a8; border-radius: 8px; padding: 10px 14px; font-size: 12.5px; line-height: 1.5; margin-bottom: 14px; }
@@ -910,6 +915,11 @@ DASHBOARD_HTML = r"""<!doctype html>
       </div>
       <div class="progress-row">
         <div class="progress-bar-track"><div id="progress-bar-fill" class="progress-bar-fill" style="width:0%"></div></div>
+      </div>
+      <div id="preflight-banner" class="preflight-banner" style="display:none">
+        <div class="preflight-title" id="preflight-title"></div>
+        <div class="preflight-reason" id="preflight-reason"></div>
+        <div class="preflight-facts" id="preflight-facts"></div>
       </div>
       <div id="mp-panel" style="display:none">
         <div class="progress-row">
@@ -1096,7 +1106,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 
 <script>
 const PHASES = ["preparing_data","discovering_entries","deduplicating_entries","expanding_exit_variants","simulating_backtests","ranking_results"];
-const PHASE_LABELS = {preparing_data:"Preparing data", discovering_entries:"Discovering entries", deduplicating_entries:"Deduplicating", expanding_exit_variants:"Exit variants", simulating_backtests:"Backtests", ranking_results:"Ranking", completed:"Completed", failed:"Failed"};
+const PHASE_LABELS = {preparing_data:"Preparing data", discovering_entries:"Discovering entries", deduplicating_entries:"Deduplicating", expanding_exit_variants:"Exit variants", simulating_backtests:"Backtests", ranking_results:"Ranking", completed:"Completed", failed:"Failed", failed_preflight:"Refused by preflight"};
 
 let currentRunId = null;
 let pollTimer = null;
@@ -1219,9 +1229,39 @@ function showEmptyProgress() {
   document.getElementById("progress-content").style.display = "none";
 }
 
+// A refused run must say so in the plainest possible terms, and must state
+// what did NOT happen as a fact rather than leaving it to be inferred from an
+// empty worker table.
+function renderPreflight(status) {
+  const banner = document.getElementById("preflight-banner");
+  const refused = status.phase === "failed_preflight";
+  if (!refused) { banner.style.display = "none"; return; }
+  banner.style.display = "block";
+  const pf = status.preflight || {};
+  document.getElementById("preflight-title").textContent =
+    "Refused by the preflight gate \u2014 nothing was simulated";
+  document.getElementById("preflight-reason").textContent = pf.reason || "(no reason recorded)";
+  const facts = [
+    ["Workers started", fmtNum(status.workers_started ?? 0)],
+    ["Simulations started", fmtNum(status.simulations_started ?? 0)],
+    ["Variants planned", pf.planned_variant_runs === undefined ? "\u2014" : fmtNum(pf.planned_variant_runs)],
+    ["Peak parent footprint", pf.peak_footprint_gb === undefined ? "\u2014" : fmtNum(pf.peak_footprint_gb) + " GB"],
+    ["Budget", pf.budget_gb === undefined ? "\u2014" : fmtNum(pf.budget_gb) + " GB"],
+    ["Swap", (pf.swap_baseline_gb === undefined || pf.swap_after_gb === undefined) ? "\u2014"
+      : fmtNum(pf.swap_baseline_gb) + " \u2192 " + fmtNum(pf.swap_after_gb) + " GB"],
+  ];
+  document.getElementById("preflight-facts").innerHTML =
+    facts.map(f => `<span>${f[0]}: <b>${f[1]}</b></span>`).join("")
+    + (pf.bundle_intact ? `<span>Shard payloads and journal: <b>intact</b></span>` : "");
+}
+
 function renderTimeline(phase) {
   const el = document.getElementById("phase-timeline");
-  const failed = phase === "failed";
+  // A preflight refusal stops the timeline too -- it is terminal. Shown as its
+  // own step rather than as "Failed", because nothing crashed: the gate
+  // deliberately stopped the run before it could start.
+  const refused = phase === "failed_preflight";
+  const failed = phase === "failed" || refused;
   const currentIndex = PHASES.indexOf(phase);
   el.innerHTML = PHASES.map((p, i) => {
     let cls = "timeline-step";
@@ -1229,7 +1269,9 @@ function renderTimeline(phase) {
     else if (phase === "completed" || i < currentIndex) cls += " done";
     else if (i === currentIndex) cls += " current";
     return `<div class="${cls}">${PHASE_LABELS[p]}</div>`;
-  }).join("") + (failed ? `<div class="timeline-step failed-step">Failed</div>` : (phase === "completed" ? `<div class="timeline-step done">Completed</div>` : ""));
+  }).join("") + (refused ? `<div class="timeline-step failed-step">Refused by preflight</div>`
+      : failed ? `<div class="timeline-step failed-step">Failed</div>`
+      : (phase === "completed" ? `<div class="timeline-step done">Completed</div>` : ""));
 }
 
 function renderCards(status) {
@@ -1809,7 +1851,9 @@ async function refresh() {
 
   const phaseBadge = document.getElementById("phase-badge");
   phaseBadge.textContent = PHASE_LABELS[status.phase] || status.phase;
-  phaseBadge.className = "badge " + (status.phase === "completed" ? "badge-completed" : status.phase === "failed" ? "badge-failed" : "badge-phase");
+  phaseBadge.className = "badge " + (status.phase === "completed" ? "badge-completed"
+    : (status.phase === "failed" || status.phase === "failed_preflight") ? "badge-failed" : "badge-phase");
+  renderPreflight(status);
 
   const demoBadge = document.getElementById("demo-badge");
   const demoBanner = document.getElementById("demo-banner");

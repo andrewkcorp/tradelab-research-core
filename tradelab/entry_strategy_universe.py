@@ -100,6 +100,7 @@ writeup and real-data results.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import gc
 from datetime import datetime, timezone
 from enum import Enum
 from itertools import combinations, product
@@ -521,9 +522,42 @@ def discover_entry_strategy_universe(
     context_subset_lookup = _build_context_subset_lookup()
     bias_pattern_lookup = _build_bias_pattern_lookup()
 
+    # The market-state snapshots were needed only to build the items above.
+    # Holding them through the cell loops kept every event's snapshot wrapper
+    # and its per-direction selector sets alive for the whole of discovery, for
+    # nothing: what an ObservedEntry actually keeps is the zone-id mapping it
+    # already took a reference to. Dropping the index here is the single
+    # cheapest reduction in this function and changes no computed value.
+    del market_state_by_event_id
+    gc.collect()
+
     eligible_specs: list[EntryStrategySpec] = []
     classes_by_sequence_key: dict[tuple, list[EntryStrategySpec]] = {}
     observed_by_sequence_key: dict[tuple, tuple[ObservedEntry, ...]] = {}
+
+    # One (entry_id, known_at, direction) tuple per *entry*, reused by every
+    # cell that entry lands in.
+    #
+    # This used to be built inline in _accept_cell, so an entry appearing in
+    # 512 accepted cells allocated 512 identical 3-tuples. At real-MNQ scale
+    # that is tens of millions of objects whose only purpose is to be hashed
+    # and discarded -- measured as the dominant allocation of the discovery
+    # phase (see docs/preflight-swap-diagnosis.md). The keys built from these
+    # are byte-for-byte what they were before; only the number of times each
+    # inner tuple is constructed changes.
+    entry_key_by_id: dict[str, tuple[str, datetime, str]] = {}
+    for items in items_by_primary.values():
+        for observed, _s, _b in items:
+            key = (observed.entry_id, observed.known_at, observed.direction)
+            existing = entry_key_by_id.setdefault(observed.entry_id, key)
+            if existing != key:
+                # Two distinct observed entries sharing an id would make the
+                # memoised key wrong rather than merely wasteful, so it is
+                # checked rather than assumed.
+                raise ValueError(
+                    f"entry_id {observed.entry_id!r} describes two different entries: "
+                    f"{existing!r} and {key!r}"
+                )
 
     def _cells_for(
         items: list[tuple[ObservedEntry, frozenset[str], tuple[str, str, str]]],
@@ -546,9 +580,13 @@ def discover_entry_strategy_universe(
             required_fvg_context_selectors=req, bias_requirement=pattern,
         )
         eligible_specs.append(spec)
-        sequence_key = tuple((o.entry_id, o.known_at, o.direction) for o in observed_list)
+        sequence_key = tuple(entry_key_by_id[o.entry_id] for o in observed_list)
         classes_by_sequence_key.setdefault(sequence_key, []).append(spec)
-        observed_by_sequence_key[sequence_key] = tuple(observed_list)
+        # Only the first spec to reach a given sequence needs to materialise
+        # the tuple: every later one would build an identical copy and throw
+        # the previous away.
+        if sequence_key not in observed_by_sequence_key:
+            observed_by_sequence_key[sequence_key] = tuple(observed_list)
 
     def _opposite_primary(primary: PrimaryTriggerSpec) -> PrimaryTriggerSpec:
         direction = SHORT if primary.direction == LONG else LONG
