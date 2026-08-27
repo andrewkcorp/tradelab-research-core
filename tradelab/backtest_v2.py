@@ -190,7 +190,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, TypeVar, Union
+from typing import Any, Callable, Iterable, Mapping, Sequence, TypeVar, Union
 
 from tradelab.accounting import AccountBacktestResult, Instrument, RiskConfig, apply_accounting
 from tradelab.apex_eod import ApexEODAudit, ApexEODConfig, audit_apex_eod
@@ -222,6 +222,8 @@ from tradelab.entry_strategy_universe import (
     discover_entry_strategy_universe,
 )
 from tradelab.entry_target_cache import EntryTargetCache
+from tradelab.fixed_rr_targets import FIXED_RR_MULTIPLES, build_fixed_rr_tp_candidate, fixed_rr_variant_label
+from tradelab.session_execution import SESSION_CLOSE_POLICY_ID, SessionCloseIndex, SessionClosePolicy
 from tradelab.shard_plan import (
     BacktestShardPlan,
     ShardFingerprint,
@@ -301,6 +303,11 @@ _SL_FVG_TIMEFRAMES: tuple[str, ...] = tuple(sorted(FVG_SL_TIMEFRAMES))  # ("15m"
 class TPVariantKind(str, Enum):
     LIQUIDITY_RANK = "liquidity_rank"
     DATA_WICK = "data_wick"
+    # Task 048. Unlike the other two, this TP is a function of the trade's own
+    # entry and stop, so it is resolved AFTER the SL rather than before it --
+    # see _resolve_targets_for_entry for why that reordering leaves every
+    # pre-existing variant bit-identical.
+    FIXED_RR = "fixed_rr"
 
 
 class SLVariantKind(str, Enum):
@@ -316,17 +323,25 @@ class ExitVariantSpec:
 
     variant_id: str
     tp_kind: TPVariantKind
-    tp_rank: int | None  # 1..3 for LIQUIDITY_RANK, None for DATA_WICK
+    tp_rank: int | None  # 1..3 for LIQUIDITY_RANK, None for DATA_WICK/FIXED_RR
     sl_kind: SLVariantKind
     sl_rank: int | None  # 1..3 for LIQUIDITY_RANK, None for FVG_BOUNDARY
     sl_fvg_timeframe: str | None  # "5m"/"15m" for FVG_BOUNDARY, None for LIQUIDITY_RANK
+    # FIXED_RR only. Last and defaulted so every existing positional
+    # construction site keeps working unchanged.
+    tp_rr_multiple: float | None = None
 
     def __post_init__(self) -> None:
         if self.tp_kind == TPVariantKind.LIQUIDITY_RANK:
             if self.tp_rank not in _TP_LIQUIDITY_RANKS:
                 raise ValueError(f"ExitVariantSpec.tp_rank must be one of {_TP_LIQUIDITY_RANKS} for LIQUIDITY_RANK, got {self.tp_rank!r}")
         elif self.tp_rank is not None:
-            raise ValueError("ExitVariantSpec.tp_rank must be None for DATA_WICK")
+            raise ValueError(f"ExitVariantSpec.tp_rank must be None for {self.tp_kind.value}")
+        if self.tp_kind == TPVariantKind.FIXED_RR:
+            if self.tp_rr_multiple not in FIXED_RR_MULTIPLES:
+                raise ValueError(f"ExitVariantSpec.tp_rr_multiple must be one of {FIXED_RR_MULTIPLES} for FIXED_RR, got {self.tp_rr_multiple!r}")
+        elif self.tp_rr_multiple is not None:
+            raise ValueError(f"ExitVariantSpec.tp_rr_multiple must be None for {self.tp_kind.value}")
         if self.sl_kind == SLVariantKind.LIQUIDITY_RANK:
             if self.sl_rank not in _SL_LIQUIDITY_RANKS:
                 raise ValueError(f"ExitVariantSpec.sl_rank must be one of {_SL_LIQUIDITY_RANKS} for LIQUIDITY_RANK, got {self.sl_rank!r}")
@@ -340,25 +355,38 @@ class ExitVariantSpec:
 
 
 def enumerate_exit_variants() -> tuple[ExitVariantSpec, ...]:
-    """The full, fixed 4 (TP) x 5 (SL) = 20-combination exit-variant
+    """The full, fixed 6 (TP) x 5 (SL) = 30-combination exit-variant
     catalog -- always enumerated in full, deterministic order,
     regardless of whether a given strategy's own data can actually
     produce trades for every combination (an infeasible one simply
-    yields zero or few trades -- see module docstring)."""
+    yields zero or few trades -- see module docstring).
+
+    Task 048 added the two ``fixed_rr`` TP families, taking the catalog from
+    20 to 30. They are appended *after* the pre-existing four, so every
+    already-enumerated variant keeps its exact position and ``variant_id``;
+    a journal written before this change still resumes, because resume keys
+    on ``strategy_variant_id``, and the new ids are simply absent from it.
+    The run's own manifest still refuses a resume whose exit-variant *set*
+    differs, which is correct: the universe changed, so the run is new."""
     variants: list[ExitVariantSpec] = []
-    tp_options: list[tuple[TPVariantKind, int | None, str]] = [(TPVariantKind.LIQUIDITY_RANK, r, f"liquidity_rank_{r}") for r in _TP_LIQUIDITY_RANKS]
-    tp_options.append((TPVariantKind.DATA_WICK, None, "data_wick"))
+    tp_options: list[tuple[TPVariantKind, int | None, float | None, str]] = [
+        (TPVariantKind.LIQUIDITY_RANK, r, None, f"liquidity_rank_{r}") for r in _TP_LIQUIDITY_RANKS
+    ]
+    tp_options.append((TPVariantKind.DATA_WICK, None, None, "data_wick"))
+    tp_options.extend(
+        (TPVariantKind.FIXED_RR, None, multiple, fixed_rr_variant_label(multiple)) for multiple in FIXED_RR_MULTIPLES
+    )
     sl_options: list[tuple[SLVariantKind, int | None, str | None, str]] = [
         (SLVariantKind.LIQUIDITY_RANK, r, None, f"liquidity_rank_{r}") for r in _SL_LIQUIDITY_RANKS
     ]
     sl_options.extend((SLVariantKind.FVG_BOUNDARY, None, tf, f"fvg_boundary_{tf}") for tf in _SL_FVG_TIMEFRAMES)
 
-    for tp_kind, tp_rank, tp_label in tp_options:
+    for tp_kind, tp_rank, tp_rr, tp_label in tp_options:
         for sl_kind, sl_rank, sl_tf, sl_label in sl_options:
             variants.append(
                 ExitVariantSpec(
                     variant_id=f"tp={tp_label}|sl={sl_label}", tp_kind=tp_kind, tp_rank=tp_rank,
-                    sl_kind=sl_kind, sl_rank=sl_rank, sl_fvg_timeframe=sl_tf,
+                    sl_kind=sl_kind, sl_rank=sl_rank, sl_fvg_timeframe=sl_tf, tp_rr_multiple=tp_rr,
                 )
             )
     return tuple(variants)
@@ -375,6 +403,12 @@ ALL_EXIT_VARIANTS: tuple[ExitVariantSpec, ...] = enumerate_exit_variants()
 class ExecutionSkipReason(str, Enum):
     POSITION_ALREADY_OPEN = "skipped_position_already_open"
     NEWS_BLOCK = "news_block"
+    # Task 048: the fill bar falls inside the hard CME session-close blackout
+    # (the last hour before the session's own close). A separate reason from
+    # NEWS_BLOCK on purpose -- one is a data-driven event window, the other a
+    # fixed execution rule, and collapsing them would hide which is refusing
+    # a setup.
+    SESSION_CLOSE_BLOCK = "session_close_block"
     NO_BAR_AVAILABLE = "no_bar_available"
     MISSING_TP_TARGET = "missing_tp_target"
     MISSING_SL_TARGET = "missing_sl_target"
@@ -690,6 +724,146 @@ def _resolve_sl_candidate(
     return result.fvg_targets[0] if result.fvg_targets else None
 
 
+def _resolve_targets_for_entry(
+    variant: ExitVariantSpec,
+    entry: ObservedEntry,
+    market_entry: MarketEntryContext,
+    context: PreparedBacktestContext,
+    *,
+    entry_target_cache: "EntryTargetCache | None" = None,
+    liquidity_target_index: LiquidityTargetIndex | None = None,
+    fvg_link_selectors: tuple[str, ...] | None = None,
+) -> tuple[TPTargetCandidate | None, SLTargetCandidate | None, ExecutionSkipReason | None]:
+    """Both targets for one entry, or the reason it cannot be traded.
+
+    **The resolution ORDER depends on the TP family, and that is the whole
+    point.** A liquidity-rank or data-wick TP is independent of the stop, so
+    it is resolved first, exactly as it always was -- same calls, same
+    arguments, same skip precedence (``MISSING_TP_TARGET`` before
+    ``MISSING_SL_TARGET``). Those variants are therefore bit-identical to
+    what this code produced before task 048, which is what makes an
+    unchanged-variant equivalence test meaningful.
+
+    A ``fixed_rr`` TP is a *function of the stop*, so the stop must be
+    resolved first. For that family the skip precedence is necessarily the
+    mirror image (``MISSING_SL_TARGET`` first), and ``MISSING_TP_TARGET`` is
+    effectively unreachable: given a stop on the correct side of entry, the
+    target always exists. It can still be returned -- a degenerate stop
+    distance produces no target -- and is reported honestly rather than being
+    folded into ``NON_POSITIVE_RISK``.
+
+    ``NON_POSITIVE_RISK`` stays the final check for both families, applied to
+    the same pair of distances as before.
+    """
+    if variant.tp_kind == TPVariantKind.FIXED_RR:
+        sl_candidate = _resolve_sl_candidate(
+            variant, entry, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results,
+            entry_target_cache=entry_target_cache, liquidity_target_index=liquidity_target_index,
+            fvg_link_selectors=fvg_link_selectors,
+        )
+        if sl_candidate is None:
+            return None, None, ExecutionSkipReason.MISSING_SL_TARGET
+        tp_candidate = build_fixed_rr_tp_candidate(
+            market_entry, sl_price=sl_candidate.price, multiple=variant.tp_rr_multiple,
+            tick_size=context.tick_size, source_id=sl_candidate.source_id,
+        )
+        if tp_candidate is None:
+            return None, sl_candidate, ExecutionSkipReason.MISSING_TP_TARGET
+    else:
+        tp_candidate = _resolve_tp_candidate(
+            variant, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results,
+            context.data_wick_result, entry_target_cache=entry_target_cache,
+            liquidity_target_index=liquidity_target_index,
+        )
+        if tp_candidate is None:
+            return None, None, ExecutionSkipReason.MISSING_TP_TARGET
+        sl_candidate = _resolve_sl_candidate(
+            variant, entry, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results,
+            entry_target_cache=entry_target_cache, liquidity_target_index=liquidity_target_index,
+            fvg_link_selectors=fvg_link_selectors,
+        )
+        if sl_candidate is None:
+            return tp_candidate, None, ExecutionSkipReason.MISSING_SL_TARGET
+
+    if sl_candidate.distance <= 0 or tp_candidate.distance <= 0:
+        return tp_candidate, sl_candidate, ExecutionSkipReason.NON_POSITIVE_RISK
+    return tp_candidate, sl_candidate, None
+
+
+def _resolve_exit(
+    bars: tuple[Bar1m, ...],
+    bar_range_index: BarRangeIndex,
+    position: _OpenPosition,
+    lo: int,
+    hi: int,
+    session_index: SessionCloseIndex | None,
+) -> tuple[int, TradeExitReason, float] | None:
+    """``_find_first_exit`` with the hard session-close policy applied.
+
+    Without a ``session_index`` this is exactly ``_find_first_exit`` -- the
+    pre-task-048 behaviour, kept reachable so a context built without a
+    calendar (synthetic fixtures) is unchanged.
+
+    With one, the search range is cut at the first forced-exit bar inside
+    ``[lo, hi)``, *inclusive of that bar*: a TP or SL touched intrabar on the
+    session's last minute is a genuine fill and must win. Only a position that
+    survives that whole bar is closed at its close, as
+    ``TradeExitReason.SESSION_CLOSE_EXIT``.
+    """
+    if session_index is None:
+        return _find_first_exit(bars, bar_range_index, position, lo, hi)
+    forced_index = session_index.next_forced_exit_index(lo)
+    if forced_index is None or forced_index >= hi:
+        return _find_first_exit(bars, bar_range_index, position, lo, hi)
+    hit = _find_first_exit(bars, bar_range_index, position, lo, forced_index + 1)
+    if hit is not None:
+        return hit
+    return forced_index, TradeExitReason.SESSION_CLOSE_EXIT, bars[forced_index].close
+
+
+_SESSION_INDEX_CACHE_ATTR = "_session_close_index_cache"
+
+
+def session_close_index_for(context: PreparedBacktestContext) -> SessionCloseIndex:
+    """The context's session-close index, built on first use and memoized.
+
+    **Why this is derived rather than passed.** The hard session-close policy
+    is mandatory for every MNQ strategy -- there is no variant, no run mode
+    and no call site that may opt out. Threading an optional argument through
+    the dozen call sites that already thread ``bar_range_index`` would make
+    "forgot to pass it" a silent correctness failure that no test could
+    reliably catch, since the result would simply be the old, wrong execution.
+    Deriving it from the context makes that impossible: any simulation over a
+    context gets the policy, full stop.
+
+    The index is cached on the context instance (the dataclass is frozen, so
+    the write goes through ``object.__setattr__``), which is exactly the
+    ``BarRangeIndex`` lifetime -- one build per context, shared by every
+    variant executed against it. The explicit ``session_index`` parameter on
+    the simulate functions remains, for tests that need to inject one built
+    from a specific calendar.
+    """
+    cached = context.__dict__.get(_SESSION_INDEX_CACHE_ATTR)
+    if cached is None:
+        cached = build_session_close_index(context)
+        object.__setattr__(context, _SESSION_INDEX_CACHE_ATTR, cached)
+    return cached
+
+
+def build_session_close_index(context: PreparedBacktestContext) -> SessionCloseIndex:
+    """The per-bar session-close index for one prepared context.
+
+    Built once and shared by every strategy variant executed against that
+    context, exactly like ``BarRangeIndex``. The policy is bound to the
+    context's own ``special_session_schedule`` -- the same checksummed
+    calendar the 1m validation and the 5m/15m/1H/4H/1D aggregation use, which
+    is what the spec requires; a context carrying none falls back to the
+    regular weekly schedule, which is correct for a synthetic fixture and
+    never happens in production, where the manifest always pins one.
+    """
+    return SessionCloseIndex.build(context.bars_1m, SessionClosePolicy(context.special_session_schedule))
+
+
 def _find_fill_bar_index(bars: tuple[Bar1m, ...], sorted_timestamps: list[datetime], known_at: datetime, start_from: int) -> int | None:
     """Index of the first bar at or after ``known_at``, searching only
     from ``start_from`` onward (observed entries are processed in
@@ -708,6 +882,7 @@ def _simulate_market_execution_reference(
     strategy_variant_id: str,
     *,
     on_bar_progress: Callable[[int, int], None] | None = None,
+    session_index: SessionCloseIndex | None = None,
 ) -> tuple[list[ExecutedTrade], list[SkippedEntryV2]]:
     """**The slow, unaccelerated reference implementation (task 045).**
     Byte-for-byte the original execution loop -- next-bar-open fill,
@@ -726,7 +901,20 @@ def _simulate_market_execution_reference(
     range_index``'s own module docstring."""
     bars = context.bars_1m
     total_bars = len(bars)
+    if session_index is None:
+        session_index = session_close_index_for(context)
     sorted_timestamps = [b.timestamp for b in bars]  # already chronological by construction
+
+    def _advance_one_bar(open_position: _OpenPosition, bar_index: int) -> tuple[TradeExitReason, float] | None:
+        """One bar of position management: normal TP/SL first, then the hard
+        session close. Bar-by-bar, exactly as this reference is meant to be --
+        the accelerated loop reaches the same answer with a range query."""
+        outcome = _check_exit(open_position, bars[bar_index])
+        if outcome is not None:
+            return outcome
+        if session_index is not None and session_index.is_forced_exit_bar(bar_index):
+            return TradeExitReason.SESSION_CLOSE_EXIT, bars[bar_index].close
+        return None
     trades: list[ExecutedTrade] = []
     skipped: list[SkippedEntryV2] = []
     position: _OpenPosition | None = None
@@ -744,7 +932,7 @@ def _simulate_market_execution_reference(
         advance_to = fill_index if fill_index is not None else len(bars)
         while bar_cursor < advance_to:
             if position is not None:
-                exit_outcome = _check_exit(position, bars[bar_cursor])
+                exit_outcome = _advance_one_bar(position, bar_cursor)
                 if exit_outcome is not None:
                     reason, exit_price = exit_outcome
                     trades.append(_finalize_trade(position, exit_timestamp=bars[bar_cursor].timestamp, exit_price=exit_price, reason=reason))
@@ -761,6 +949,10 @@ def _simulate_market_execution_reference(
 
         if position is not None:
             skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.POSITION_ALREADY_OPEN))
+            continue
+
+        if session_index is not None and session_index.blocks_new_entry(fill_index):
+            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.SESSION_CLOSE_BLOCK))
             continue
 
         blocked, _blocking = is_entry_blocked(fill_bar.timestamp, context.news_events)
@@ -781,26 +973,20 @@ def _simulate_market_execution_reference(
         # .signal_known_at below -- never used for target-eligibility filtering.
         market_entry = MarketEntryContext(entry_id=trade_id, direction=entry.direction, entry_price=fill_bar.open, entry_known_at=fill_bar.timestamp)
 
-        tp_candidate = _resolve_tp_candidate(variant, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results, context.data_wick_result)
-        if tp_candidate is None:
-            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.MISSING_TP_TARGET))
-            continue
-
-        sl_candidate = _resolve_sl_candidate(variant, entry, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results)
-        if sl_candidate is None:
-            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.MISSING_SL_TARGET))
-            continue
-
-        if sl_candidate.distance <= 0 or tp_candidate.distance <= 0:
-            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.NON_POSITIVE_RISK))
+        tp_candidate, sl_candidate, skip_reason = _resolve_targets_for_entry(variant, entry, market_entry, context)
+        if skip_reason is not None:
+            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=skip_reason))
             continue
 
         position = _OpenPosition(
             trade_id=trade_id, strategy_id=strategy_variant_id, direction=entry.direction, signal_known_at=entry.known_at,
             entry_timestamp=fill_bar.timestamp, entry_price=fill_bar.open, tp_candidate=tp_candidate, sl_candidate=sl_candidate,
         )
-        # Evaluate TP/SL starting with the entry bar itself (spec).
-        exit_outcome = _check_exit(position, fill_bar)
+        # Evaluate TP/SL starting with the entry bar itself (spec). The
+        # session-close check is included: entries are blacked out for the
+        # whole final hour, so a fill bar can never *be* the forced-exit bar,
+        # but the loop must not depend on that coincidence to stay correct.
+        exit_outcome = _advance_one_bar(position, fill_index)
         if exit_outcome is not None:
             reason, exit_price = exit_outcome
             trades.append(_finalize_trade(position, exit_timestamp=fill_bar.timestamp, exit_price=exit_price, reason=reason))
@@ -815,7 +1001,7 @@ def _simulate_market_execution_reference(
 
     # Drain any still-open position through the remaining bars.
     while bar_cursor < len(bars) and position is not None:
-        exit_outcome = _check_exit(position, bars[bar_cursor])
+        exit_outcome = _advance_one_bar(position, bar_cursor)
         if exit_outcome is not None:
             reason, exit_price = exit_outcome
             trades.append(_finalize_trade(position, exit_timestamp=bars[bar_cursor].timestamp, exit_price=exit_price, reason=reason))
@@ -886,6 +1072,7 @@ def simulate_market_execution(
     news_blackout_index: NewsBlackoutIndex | None = None,
     stage_timings: StageTimings | None = None,
     fvg_link_selectors: tuple[str, ...] | None = None,
+    session_index: SessionCloseIndex | None = None,
 ) -> tuple[list[ExecutedTrade], list[SkippedEntryV2]]:
     """**The real, accelerated execution loop (task 045).** Identical
     rules to ``_simulate_market_execution_reference`` -- same observed
@@ -944,6 +1131,8 @@ def simulate_market_execution(
     total_bars = len(bars)
     total_entries = len(observed_entries)
     index = bar_range_index if bar_range_index is not None else BarRangeIndex.build(bars)
+    if session_index is None:
+        session_index = session_close_index_for(context)
     trades: list[ExecutedTrade] = []
     skipped: list[SkippedEntryV2] = []
     position: _OpenPosition | None = None
@@ -964,7 +1153,7 @@ def simulate_market_execution(
             if position is not None:
                 if stage_timings is not None:
                     _t0 = time.perf_counter()
-                hit = _find_first_exit(bars, index, position, bar_cursor, advance_to)
+                hit = _resolve_exit(bars, index, position, bar_cursor, advance_to, session_index)
                 if stage_timings is not None:
                     stage_timings.record("exit_resolution", time.perf_counter() - _t0)
                 if hit is not None:
@@ -983,6 +1172,10 @@ def simulate_market_execution(
 
         if position is not None:
             skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.POSITION_ALREADY_OPEN))
+            continue
+
+        if session_index is not None and session_index.blocks_new_entry(fill_index):
+            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.SESSION_CLOSE_BLOCK))
             continue
 
         blocked = (
@@ -1013,42 +1206,28 @@ def simulate_market_execution(
 
         if stage_timings is not None:
             _t0 = time.perf_counter()
-        tp_candidate = _resolve_tp_candidate(
-            variant, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results, context.data_wick_result,
-            entry_target_cache=entry_target_cache,
-            liquidity_target_index=liquidity_target_index,
-        )
-        if stage_timings is not None:
-            stage_timings.record("entry_target_resolution", time.perf_counter() - _t0)
-        if tp_candidate is None:
-            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.MISSING_TP_TARGET))
-            continue
-
-        if stage_timings is not None:
-            _t0 = time.perf_counter()
-        sl_candidate = _resolve_sl_candidate(
-            variant, entry, market_entry, context.swing_equal_liquidity_results, context.session_liquidity_results,
+        tp_candidate, sl_candidate, skip_reason = _resolve_targets_for_entry(
+            variant, entry, market_entry, context,
             entry_target_cache=entry_target_cache,
             liquidity_target_index=liquidity_target_index,
             fvg_link_selectors=fvg_link_selectors,
         )
         if stage_timings is not None:
             stage_timings.record("entry_target_resolution", time.perf_counter() - _t0)
-        if sl_candidate is None:
-            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.MISSING_SL_TARGET))
-            continue
-
-        if sl_candidate.distance <= 0 or tp_candidate.distance <= 0:
-            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=ExecutionSkipReason.NON_POSITIVE_RISK))
+        if skip_reason is not None:
+            skipped.append(SkippedEntryV2(entry_id=entry.entry_id, known_at=entry.known_at, direction=entry.direction, reason=skip_reason))
             continue
 
         position = _OpenPosition(
             trade_id=trade_id, strategy_id=strategy_variant_id, direction=entry.direction, signal_known_at=entry.known_at,
             entry_timestamp=fill_bar.timestamp, entry_price=fill_bar.open, tp_candidate=tp_candidate, sl_candidate=sl_candidate,
         )
-        # Evaluate TP/SL starting with the entry bar itself (spec) --
-        # a single-bar check, same as the reference implementation.
+        # Evaluate TP/SL starting with the entry bar itself (spec) -- a
+        # single-bar check, same as the reference implementation, including
+        # its session-close fallback.
         exit_outcome = _check_exit(position, fill_bar)
+        if exit_outcome is None and session_index is not None and session_index.is_forced_exit_bar(fill_index):
+            exit_outcome = (TradeExitReason.SESSION_CLOSE_EXIT, fill_bar.close)
         if exit_outcome is not None:
             reason, exit_price = exit_outcome
             trades.append(_finalize_trade(position, exit_timestamp=fill_bar.timestamp, exit_price=exit_price, reason=reason))
@@ -1063,7 +1242,7 @@ def simulate_market_execution(
     if bar_cursor < len(bars) and position is not None:
         if stage_timings is not None:
             _t0 = time.perf_counter()
-        hit = _find_first_exit(bars, index, position, bar_cursor, len(bars))
+        hit = _resolve_exit(bars, index, position, bar_cursor, len(bars), session_index)
         if stage_timings is not None:
             stage_timings.record("exit_resolution", time.perf_counter() - _t0)
         if hit is not None:
@@ -1137,6 +1316,7 @@ def simulate_market_execution_batched(
     news_blackout_index: NewsBlackoutIndex | None = None,
     compact_skip_counts: bool = False,
     fvg_link_selectors: tuple[str, ...] | None = None,
+    session_index: SessionCloseIndex | None = None,
 ) -> dict[str, tuple[list[ExecutedTrade], list[SkippedEntryV2] | dict[str, int]]]:
     """Execute every supplied exit variant in one chronological entry pass.
 
@@ -1156,6 +1336,8 @@ def simulate_market_execution_batched(
 
     bars = context.bars_1m
     index = bar_range_index if bar_range_index is not None else BarRangeIndex.build(bars)
+    if session_index is None:
+        session_index = session_close_index_for(context)
     cache = entry_target_cache if entry_target_cache is not None else EntryTargetCache()
     states = [
         _BatchedVariantState(
@@ -1181,6 +1363,9 @@ def simulate_market_execution_batched(
             continue
 
         fill_bar = bars[fill_index]
+        # Both entry gates are variant-invariant, so both are evaluated once
+        # per entry and shared, exactly like the fill lookup above.
+        session_blocked = session_index is not None and session_index.blocks_new_entry(fill_index)
         blocked = (
             news_blackout_index.is_blocked(fill_bar.timestamp)
             if news_blackout_index is not None
@@ -1208,6 +1393,9 @@ def simulate_market_execution_batched(
             if state.position is not None:
                 _record_execution_skip(state.skipped, entry, ExecutionSkipReason.POSITION_ALREADY_OPEN)
                 continue
+            if session_blocked:
+                _record_execution_skip(state.skipped, entry, ExecutionSkipReason.SESSION_CLOSE_BLOCK)
+                continue
             if blocked:
                 _record_execution_skip(state.skipped, entry, ExecutionSkipReason.NEWS_BLOCK)
                 continue
@@ -1219,26 +1407,14 @@ def simulate_market_execution_batched(
             state.trade_seq += 1
             # The cache makes discovery once-per-entry/confluence; selection
             # of rank/timeframe remains variant-specific and exact.
-            tp_candidate = _resolve_tp_candidate(
-                state.variant, market_entry, context.swing_equal_liquidity_results,
-                context.session_liquidity_results, context.data_wick_result,
+            tp_candidate, sl_candidate, skip_reason = _resolve_targets_for_entry(
+                state.variant, entry, market_entry, context,
                 entry_target_cache=cache,
-                liquidity_target_index=liquidity_target_index,
-            )
-            if tp_candidate is None:
-                _record_execution_skip(state.skipped, entry, ExecutionSkipReason.MISSING_TP_TARGET)
-                continue
-            sl_candidate = _resolve_sl_candidate(
-                state.variant, entry, market_entry, context.swing_equal_liquidity_results,
-                context.session_liquidity_results, entry_target_cache=cache,
                 liquidity_target_index=liquidity_target_index,
                 fvg_link_selectors=fvg_link_selectors,
             )
-            if sl_candidate is None:
-                _record_execution_skip(state.skipped, entry, ExecutionSkipReason.MISSING_SL_TARGET)
-                continue
-            if sl_candidate.distance <= 0 or tp_candidate.distance <= 0:
-                _record_execution_skip(state.skipped, entry, ExecutionSkipReason.NON_POSITIVE_RISK)
+            if skip_reason is not None:
+                _record_execution_skip(state.skipped, entry, skip_reason)
                 continue
 
             position = _OpenPosition(
@@ -1252,9 +1428,11 @@ def simulate_market_execution_batched(
                 sl_candidate=sl_candidate,
             )
             exit_outcome = _check_exit(position, fill_bar)
+            if exit_outcome is None and session_index is not None and session_index.is_forced_exit_bar(fill_index):
+                exit_outcome = (TradeExitReason.SESSION_CLOSE_EXIT, fill_bar.close)
             if exit_outcome is None:
                 state.position = position
-                state.scheduled_exit = _find_first_exit(bars, index, position, fill_index + 1, len(bars))
+                state.scheduled_exit = _resolve_exit(bars, index, position, fill_index + 1, len(bars), session_index)
             else:
                 reason, exit_price = exit_outcome
                 state.trades.append(_finalize_trade(position, exit_timestamp=fill_bar.timestamp, exit_price=exit_price, reason=reason))
@@ -1703,11 +1881,40 @@ def _to_leaderboard_entry(result: StrategyVariantResult, rank: int) -> Leaderboa
     equity_curve = tuple({"ts": p.timestamp.isoformat(), "equity": p.balance_usd} for p in result.equity_result.equity_points)
     trade_pnls = tuple(t.net_pnl_usd for t in result.account_result.accounted_trades if t.net_pnl_usd is not None)
     trades_by_month = {k: v["trade_count"] for k, v in result.monthly.items()}
+    # Trade-level detail for the post-hoc session view (task 048). Timestamps
+    # are ISO-8601 UTC, always -- the session label is derived from them at
+    # write time, never carried here, so changing the session boundaries
+    # re-labels history without needing a rerun.
+    # AccountedTrade carries sizing and USD P&L but not the exit price, which
+    # lives on the ExecutedTrade it was built from; joined here by trade_id
+    # rather than duplicated onto the accounting model.
+    exit_price_by_trade_id = {t.trade_id: t.exit_price for t in result.trades}
+    trades = tuple(
+        {
+            "direction": t.direction,
+            "entry_at": t.entry_timestamp.astimezone(timezone.utc).isoformat(),
+            "exit_at": t.exit_timestamp.astimezone(timezone.utc).isoformat() if t.exit_timestamp is not None else None,
+            "entry_price": t.entry_price,
+            "exit_price": exit_price_by_trade_id.get(t.trade_id),
+            "exit_reason": t.exit_reason.value,
+            "net_pnl_usd": t.net_pnl_usd,
+            "contracts": t.quantity,
+            # Kept separate, not folded into net: the post-hoc session view
+            # rebuilds its equity curve with tradelab.equity's own two-event
+            # model (entry cost booked at entry, gross P&L at exit), and
+            # collapsing them here would make a filtered curve's intermediate
+            # drawdown disagree with the full run's for no reason.
+            "entry_cost_usd": t.entry_cost_usd,
+            "gross_pnl_usd": t.gross_pnl_usd,
+            "trade_id": t.trade_id,
+        }
+        for t in result.account_result.accounted_trades
+    )
     return LeaderboardEntry(
         rank=rank, strategy_id=result.strategy_variant_id, pnl=result.net_pnl_usd, roi=result.roi,
         win_rate=(result.win_rate if result.win_rate is not None else 0.0), trade_count=result.trade_count,
         max_drawdown=result.max_drawdown_usd, drawdowns_over_2000_count=result.drawdowns_over_2000_count,
-        equity_curve=equity_curve, trade_pnls=trade_pnls, trades_by_month=trades_by_month,
+        equity_curve=equity_curve, trade_pnls=trade_pnls, trades_by_month=trades_by_month, trades=trades,
     )
 
 
@@ -2301,8 +2508,43 @@ def _expand_and_simulate(
     reporter.phase_started(RunPhase.RANKING_RESULTS, items_total=1)
     final_leaderboard = _merged_leaderboard(durable_top_n, top_n, top_n_leaderboard)
     reporter.update_leaderboard(final_leaderboard)
+    # Trade-level persistence happens here and nowhere else in the run: the
+    # simulation is finished, so this single bounded transaction cannot
+    # contend with the hot commit path for the write lock.
+    persist_leaderboard_trades(journal, final_leaderboard)
     reporter.progress(items_completed=1)
     return completed, final_leaderboard
+
+
+def persist_leaderboard_trades(journal: BacktestV2Journal, entries: Sequence[LeaderboardEntry]) -> int:
+    """Write the final leaderboard's trade-level rows into the journal.
+
+    Task 048, backlog item C. Called **once, at the end of a run**, never from
+    the per-variant commit path: a full run enumerates ~10^6 variants at
+    hundreds of trades each, so persisting all of them is not a storage
+    decision to be made lightly -- it is terabytes. The bound is the
+    leaderboard itself, which is also exactly the set the dashboard can
+    select, so nothing the UI can ask for is missing.
+
+    Entries with no trade detail are skipped rather than written as empty:
+    a resumed run rebuilds older leaderboard entries from durable summaries,
+    which never carried trades (see ``_leaderboard_entry_from_journal_
+    summary``), and blanking a previously-written variant's rows because this
+    process happened not to recompute it would lose real data.
+
+    Returns the number of trade rows written.
+    """
+    # A worker's journal is a shim that forwards rows to the coordinator; it
+    # owns nothing durable and has no such method (see tradelab.shard_pool:
+    # "The parent owns everything durable"). Trade rows are written by the
+    # coordinator once every worker has stopped, so a worker reaching this is
+    # correctly a no-op rather than an error.
+    if not hasattr(journal, "replace_variant_trades"):
+        return 0
+    payload = {entry.strategy_id: entry.trades for entry in entries if entry.trades}
+    if not payload:
+        return 0
+    return journal.replace_variant_trades(payload)
 
 
 def _open_journal(
@@ -2339,6 +2581,13 @@ def _open_journal(
     news_csv_path = Path(news_csv_path) if news_csv_path is not None else None
     repo_root = Path(__file__).resolve().parents[1]
     current_git_commit, _dirty = _current_git_provenance(repo_root)
+    # Task 048: the hard session-close policy is stamped into the manifest
+    # here, not by callers, so every run records it and no caller can omit it.
+    # An existing journal written under a different (or absent) policy has a
+    # different parameters_json and is refused on resume, naming this field --
+    # which is the intent: results produced under two different execution rule
+    # sets must never be merged, resumed into one another, or compared.
+    parameters = {**dict(parameters), "session_close_policy": SESSION_CLOSE_POLICY_ID}
     return BacktestV2Journal(
         reporter.run_dir / "backtest_v2_journal.sqlite3",
         run_id=reporter.run_id,

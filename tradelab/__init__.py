@@ -153,7 +153,13 @@ from tradelab.selector_catalog import (
     is_canonical_selector,
     opposite_liquidity_selector,
 )
+from tradelab.session_analysis import SessionFilter, analyse_session_subset, filter_session_trades
 from tradelab.session_calendar import expected_open_minutes, is_regular_session_open
+from tradelab.session_execution import (
+    SESSION_CLOSE_POLICY_ID,
+    SessionCloseIndex,
+    SessionClosePolicy,
+)
 from tradelab.session_liquidity import detect_session_liquidity
 from tradelab.sl_targets import (
     FVG_SL_TIMEFRAMES,
@@ -172,6 +178,7 @@ from tradelab.strategy_spec import (
     selector_fixed_direction,
     selector_timeframe,
 )
+from tradelab.fixed_rr_targets import FIXED_RR_MULTIPLES, build_fixed_rr_tp_candidate, fixed_rr_variant_label
 from tradelab.tp_targets import (
     LiquiditySourceFamily,
     MarketEntryContext,
@@ -180,6 +187,7 @@ from tradelab.tp_targets import (
     TPTargetCandidateResult,
     detect_tp_target_candidates,
 )
+from tradelab.trading_sessions import SESSION_KEYS, SessionWindow, ny_hour, session_catalog, session_for
 from tradelab.trade_execution import (
     MarketTradeRequest,
     TickPriceEvent,
@@ -235,6 +243,20 @@ __all__ = [
     "read_parquet_bars",
     "is_regular_session_open",
     "expected_open_minutes",
+    "SESSION_CLOSE_POLICY_ID",
+    "SessionCloseIndex",
+    "SessionClosePolicy",
+    "SessionFilter",
+    "SessionWindow",
+    "SESSION_KEYS",
+    "analyse_session_subset",
+    "filter_session_trades",
+    "ny_hour",
+    "session_catalog",
+    "session_for",
+    "FIXED_RR_MULTIPLES",
+    "build_fixed_rr_tp_candidate",
+    "fixed_rr_variant_label",
     "NewsEvent",
     "validate_news_events",
     "is_entry_blocked",

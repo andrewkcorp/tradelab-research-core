@@ -56,7 +56,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-JOURNAL_SCHEMA_VERSION = "1.2"
+JOURNAL_SCHEMA_VERSION = "1.3"
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS run_manifest (
@@ -112,6 +112,52 @@ CREATE TABLE IF NOT EXISTS variant_summaries (
     stop_slippage_sensitivity_json TEXT NOT NULL DEFAULT '{}',
     committed_at TEXT NOT NULL
 );
+
+-- Task 048, backlog item C: trade-level rows for the run's leaderboard
+-- variants, so the dashboard can slice an already-finished result by session
+-- and hour without re-running anything.
+--
+-- Deliberately NOT one row per trade for every variant. A full run enumerates
+-- on the order of a million variants at hundreds of trades each; persisting
+-- all of them is terabytes, which is precisely why variant_summaries is lean.
+-- This table is bounded to the variants the dashboard can actually select --
+-- the final top-N leaderboard -- and is written ONCE, after the run's own
+-- simulation work is finished, never from the hot commit path. That is what
+-- keeps it from competing with a live run for the write lock.
+CREATE TABLE IF NOT EXISTS variant_trades (
+    strategy_variant_id TEXT NOT NULL,
+    trade_seq INTEGER NOT NULL,
+    direction TEXT NOT NULL,
+    entry_at TEXT NOT NULL,          -- ISO-8601 UTC, always
+    exit_at TEXT,                    -- NULL only for an unresolved open trade
+    entry_price REAL,
+    exit_price REAL,
+    exit_reason TEXT NOT NULL,
+    net_pnl_usd REAL,                -- NULL for an unresolved open trade
+    gross_pnl_usd REAL,              -- NULL for an unresolved open trade
+    entry_cost_usd REAL NOT NULL,    -- charged even for an unresolved trade
+    contracts INTEGER,
+    entry_session TEXT NOT NULL,     -- tradelab.trading_sessions label at write time
+    entry_hour_ny INTEGER NOT NULL,  -- New York local hour, 0-23
+    PRIMARY KEY (strategy_variant_id, trade_seq)
+);
+
+-- The two access paths the session view actually uses: "all trades of one
+-- variant, in order" and "trades of one variant in these sessions". The
+-- primary key already covers the first; this covers the second without a
+-- scan, and keeps the ORDER BY free.
+CREATE INDEX IF NOT EXISTS idx_variant_trades_session
+    ON variant_trades (strategy_variant_id, entry_session, entry_at);
+CREATE INDEX IF NOT EXISTS idx_variant_trades_hour
+    ON variant_trades (strategy_variant_id, entry_hour_ny, entry_at);
+
+-- The universe browser sorts and filters variant_summaries over the whole
+-- population on every page. These cover its two default orderings and its
+-- eligibility predicate, which were full scans before.
+CREATE INDEX IF NOT EXISTS idx_variant_summaries_pnl
+    ON variant_summaries (research_eligible, net_pnl_usd DESC, max_drawdown_usd ASC);
+CREATE INDEX IF NOT EXISTS idx_variant_summaries_trades
+    ON variant_summaries (research_eligible, trade_count DESC);
 """
 
 _MANIFEST_COLUMNS = (
@@ -401,6 +447,83 @@ class BacktestV2Journal:
                     _utc_now_iso(),
                 ),
             )
+
+    def replace_variant_trades(self, trades_by_variant: Mapping[str, Sequence[Mapping[str, Any]]]) -> int:
+        """Write the trade-level rows for the run's leaderboard variants.
+
+        **Called once, after the run's simulation work is finished** -- never
+        from ``commit_summary``'s hot path. One transaction; every variant it
+        names is fully replaced, so re-running finalisation (a resumed run
+        reaching the end again, say) is idempotent rather than duplicating.
+        Variants not named are left alone.
+
+        Returns the number of trade rows written, so the caller can report a
+        real figure rather than asserting it worked.
+
+        Each mapping needs ``direction``, ``entry_at`` (tz-aware datetime or
+        ISO-8601 UTC string), ``exit_reason``, and optionally ``exit_at``,
+        ``entry_price``, ``exit_price``, ``net_pnl_usd`` and ``contracts``.
+        The session label and NY hour are derived here, from ``entry_at``, so
+        exactly one implementation owns that conversion.
+        """
+        from tradelab.trading_sessions import ny_hour, session_for
+
+        def _as_utc_iso(value: Any) -> str:
+            if isinstance(value, datetime):
+                if value.tzinfo is None:
+                    raise ValueError("variant trade timestamps must be timezone-aware")
+                return value.astimezone(timezone.utc).isoformat()
+            parsed = datetime.fromisoformat(str(value))
+            if parsed.tzinfo is None:
+                raise ValueError("variant trade timestamps must be timezone-aware")
+            return parsed.astimezone(timezone.utc).isoformat()
+
+        def _as_utc(value: Any) -> datetime:
+            return datetime.fromisoformat(_as_utc_iso(value))
+
+        written = 0
+        with self._conn:
+            for strategy_variant_id, trades in trades_by_variant.items():
+                self._conn.execute("DELETE FROM variant_trades WHERE strategy_variant_id = ?", (strategy_variant_id,))
+                payload = []
+                for seq, trade in enumerate(trades, start=1):
+                    entry_at = _as_utc(trade["entry_at"])
+                    payload.append((
+                        strategy_variant_id, seq, trade["direction"], entry_at.isoformat(),
+                        _as_utc_iso(trade["exit_at"]) if trade.get("exit_at") is not None else None,
+                        trade.get("entry_price"), trade.get("exit_price"), trade["exit_reason"],
+                        trade.get("net_pnl_usd"), trade.get("gross_pnl_usd"),
+                        float(trade.get("entry_cost_usd") or 0.0), trade.get("contracts"),
+                        session_for(entry_at), ny_hour(entry_at),
+                    ))
+                if payload:
+                    self._conn.executemany(
+                        "INSERT INTO variant_trades (strategy_variant_id, trade_seq, direction, entry_at, exit_at, "
+                        "entry_price, exit_price, exit_reason, net_pnl_usd, gross_pnl_usd, entry_cost_usd, contracts, "
+                        "entry_session, entry_hour_ny) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        payload,
+                    )
+                    written += len(payload)
+        return written
+
+    def variant_trades(self, strategy_variant_id: str) -> list[dict[str, Any]]:
+        """Every persisted trade for one variant, in execution order."""
+        rows = self._conn.execute(
+            "SELECT trade_seq, direction, entry_at, exit_at, entry_price, exit_price, exit_reason, net_pnl_usd, "
+            "gross_pnl_usd, entry_cost_usd, contracts, entry_session, entry_hour_ny "
+            "FROM variant_trades WHERE strategy_variant_id = ? ORDER BY trade_seq",
+            (strategy_variant_id,),
+        ).fetchall()
+        keys = ("trade_seq", "direction", "entry_at", "exit_at", "entry_price", "exit_price", "exit_reason",
+                "net_pnl_usd", "gross_pnl_usd", "entry_cost_usd", "contracts", "entry_session", "entry_hour_ny")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def variants_with_trades(self) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT DISTINCT strategy_variant_id FROM variant_trades ORDER BY strategy_variant_id"
+        ).fetchall()
+        return [row[0] for row in rows]
 
     def top_n_summaries(self, n: int) -> list[JournalVariantSummary]:
         """The current top ``n`` completed summaries, ranked exactly

@@ -36,6 +36,15 @@ context_profile.json
 *.db
 research_journal.sqlite3
 
+# Archived run directories -- the same run artifacts as ./runs, moved aside
+# after completion (3+ GB of SQLite journals and event logs per run). Never
+# committed, for the same reason ./runs is not.
+/archive/
+**/archive/
+
+# macOS Finder metadata.
+.DS_Store
+
 # Local research run artifacts (tradelab.research_run / tradelab.
 # research_demo / tradelab.research_dashboard) -- live-status/checkpoint/
 # leaderboard JSON and progress event logs for a research run (demo or

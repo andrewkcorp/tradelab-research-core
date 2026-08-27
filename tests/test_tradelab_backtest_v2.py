@@ -357,10 +357,45 @@ def observed(entry_event: EntryEvent) -> ObservedEntry:
 
 
 class ExitVariantGrammarTests(unittest.TestCase):
-    def test_exactly_20_variants_4_tp_times_5_sl(self):
+    def test_exactly_30_variants_6_tp_times_5_sl(self):
         variants = enumerate_exit_variants()
-        self.assertEqual(len(variants), 20)
-        self.assertEqual(len(set(v.variant_id for v in variants)), 20)
+        self.assertEqual(len(variants), 30)
+        self.assertEqual(len(set(v.variant_id for v in variants)), 30)
+
+    def test_fixed_rr_tp_families_appended_without_moving_the_original_20(self):
+        """The pre-task-048 catalog must still occupy positions 0..19 with its
+        exact original ids, so an id recorded by an earlier run still names the
+        same rule."""
+        variants = enumerate_exit_variants()
+        original = [v for v in variants[:20]]
+        self.assertTrue(all(v.tp_kind != TPVariantKind.FIXED_RR for v in original))
+        self.assertEqual(
+            [v.variant_id for v in variants[20:]],
+            [
+                "tp=fixed_rr_1|sl=liquidity_rank_1", "tp=fixed_rr_1|sl=liquidity_rank_2",
+                "tp=fixed_rr_1|sl=liquidity_rank_3", "tp=fixed_rr_1|sl=fvg_boundary_15m",
+                "tp=fixed_rr_1|sl=fvg_boundary_5m", "tp=fixed_rr_2|sl=liquidity_rank_1",
+                "tp=fixed_rr_2|sl=liquidity_rank_2", "tp=fixed_rr_2|sl=liquidity_rank_3",
+                "tp=fixed_rr_2|sl=fvg_boundary_15m", "tp=fixed_rr_2|sl=fvg_boundary_5m",
+            ],
+        )
+
+    def test_fixed_rr_variants_carry_their_multiple_and_no_rank(self):
+        fixed = [v for v in ALL_EXIT_VARIANTS if v.tp_kind == TPVariantKind.FIXED_RR]
+        self.assertEqual(len(fixed), 10)  # two multiples x five SL kinds
+        self.assertTrue(all(v.tp_rank is None for v in fixed))
+        self.assertEqual(sorted({v.tp_rr_multiple for v in fixed}), [1.0, 2.0])
+
+    def test_rr_multiple_rejected_on_non_fixed_rr_and_required_on_fixed_rr(self):
+        with self.assertRaises(ValueError):
+            ExitVariantSpec(variant_id="x", tp_kind=TPVariantKind.LIQUIDITY_RANK, tp_rank=1,
+                            sl_kind=SLVariantKind.LIQUIDITY_RANK, sl_rank=1, sl_fvg_timeframe=None, tp_rr_multiple=1.0)
+        with self.assertRaises(ValueError):
+            ExitVariantSpec(variant_id="x", tp_kind=TPVariantKind.FIXED_RR, tp_rank=None,
+                            sl_kind=SLVariantKind.LIQUIDITY_RANK, sl_rank=1, sl_fvg_timeframe=None, tp_rr_multiple=None)
+        with self.assertRaises(ValueError):
+            ExitVariantSpec(variant_id="x", tp_kind=TPVariantKind.FIXED_RR, tp_rank=None,
+                            sl_kind=SLVariantKind.LIQUIDITY_RANK, sl_rank=1, sl_fvg_timeframe=None, tp_rr_multiple=3.0)
 
     def test_tp_liquidity_ranks_are_exactly_1_2_3(self):
         tp_ranks = sorted({v.tp_rank for v in ALL_EXIT_VARIANTS if v.tp_kind == TPVariantKind.LIQUIDITY_RANK})
@@ -1810,7 +1845,8 @@ class PreflightTests(unittest.TestCase):
                 exit_variants=liquidity_only_variants, throughput_sample_size=4, command="test",
             )
             preflight = read_preflight(reporter.run_dir)
-            self.assertEqual(preflight["exit_variant_count"], 15)
+            # 30-variant catalog minus the five data-wick TP combinations.
+            self.assertEqual(preflight["exit_variant_count"], 25)
             sample = preflight["throughput_estimate"]
             self.assertIsNotNone(sample)
             self.assertEqual(sample["sample_size_requested"], 4)

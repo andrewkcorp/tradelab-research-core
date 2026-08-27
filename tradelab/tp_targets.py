@@ -93,6 +93,13 @@ MAX_DATA_WICK_TARGET_DISTANCE_POINTS = 100.0
 class TPSourceType(str, Enum):
     LIQUIDITY = "liquidity"
     DATA_WICK = "data_wick"
+    # A TP derived arithmetically from this trade's own entry and stop, with
+    # no market structure behind it at all -- see tradelab.fixed_rr_targets.
+    # Deliberately a third source type rather than a flavour of LIQUIDITY:
+    # none of the liquidity audit fields mean anything for it, and none of
+    # the no-lookahead timing checks apply, because there is no external
+    # source whose known_at could be in the future.
+    FIXED_RR = "fixed_rr"
 
 
 class LiquiditySourceFamily(str, Enum):
@@ -167,6 +174,13 @@ class TPTargetCandidate:
     event_ids: tuple[str, ...] | None
     wick_direction: DataWickDirection | None
     timestamp: datetime | None
+
+    # FIXED_RR-only audit: the R multiple this target was built from, and the
+    # stop it was measured against. Defaulted so every existing construction
+    # site -- all of which build LIQUIDITY or DATA_WICK candidates -- is
+    # untouched and keeps producing byte-identical objects.
+    rr_multiple: float | None = None
+    rr_sl_price: float | None = None
 
 
 @dataclass(frozen=True)

@@ -458,6 +458,12 @@ class LeaderboardEntry:
     equity_curve: tuple[Mapping[str, Any], ...] = ()  # [{"ts": iso str, "equity": float}, ...]
     trade_pnls: tuple[float, ...] = ()
     trades_by_month: Mapping[str, int] = None  # {"2024-01": count, ...}
+    # Task 048, backlog item C: the trade-level detail the post-hoc session
+    # view needs -- entry/exit instants in UTC, direction, outcome and P&L.
+    # Only leaderboard entries carry it (persisting every variant's trades is
+    # terabytes; see the variant_trades table's own comment), and it is what
+    # the run's finalisation step writes into SQLite.
+    trades: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         _require(self.rank >= 1, "LeaderboardEntry.rank must be >= 1")
@@ -469,14 +475,26 @@ class LeaderboardEntry:
         if self.trades_by_month is None:
             object.__setattr__(self, "trades_by_month", {})
 
-    def to_dict(self) -> dict:
-        return {
+    def to_dict(self, *, include_trades: bool = True) -> dict:
+        """``include_trades=False`` drops the trade-level detail.
+
+        Used when writing ``leaderboard.json``, which the dashboard polls
+        repeatedly: twenty-five variants at several hundred trades each would
+        multiply that file's size for data no chart on that page reads. The
+        trades still travel with the entry over worker IPC (default ``True``)
+        and are persisted to the journal's ``variant_trades`` table, which is
+        where the post-hoc session view reads them from.
+        """
+        payload = {
             "rank": self.rank, "strategy_id": self.strategy_id, "pnl": self.pnl, "roi": self.roi,
             "win_rate": self.win_rate, "trade_count": self.trade_count, "max_drawdown": self.max_drawdown,
             "drawdowns_over_2000_count": self.drawdowns_over_2000_count,
             "equity_curve": list(self.equity_curve), "trade_pnls": list(self.trade_pnls),
             "trades_by_month": dict(self.trades_by_month),
         }
+        if include_trades:
+            payload["trades"] = [dict(t) for t in self.trades]
+        return payload
 
     @staticmethod
     def from_dict(d: Mapping[str, Any]) -> "LeaderboardEntry":
@@ -485,6 +503,7 @@ class LeaderboardEntry:
             trade_count=d["trade_count"], max_drawdown=d["max_drawdown"], drawdowns_over_2000_count=d["drawdowns_over_2000_count"],
             equity_curve=tuple(d.get("equity_curve", ())), trade_pnls=tuple(d.get("trade_pnls", ())),
             trades_by_month=dict(d.get("trades_by_month", {})),
+            trades=tuple(dict(t) for t in d.get("trades", ())),
         )
 
     def as_top_strategy(self) -> TopStrategy:
@@ -502,9 +521,11 @@ class Leaderboard:
     entries: tuple[LeaderboardEntry, ...]
 
     def to_dict(self) -> dict:
+        # Trade-level detail is deliberately not part of the published
+        # leaderboard document -- see LeaderboardEntry.to_dict.
         return {
             "schema_version": self.schema_version, "run_id": self.run_id, "updated_at": self.updated_at,
-            "entries": [e.to_dict() for e in self.entries],
+            "entries": [e.to_dict(include_trades=False) for e in self.entries],
         }
 
     @staticmethod

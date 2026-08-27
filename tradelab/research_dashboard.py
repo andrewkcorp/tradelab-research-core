@@ -42,6 +42,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from tradelab.research_run import list_run_ids, read_leaderboard, read_live_status, read_progress_events, read_run_manifest
+from tradelab.session_analysis import SessionFilter, analyse as analyse_session_subset, filter_trades
+from tradelab.trading_sessions import session_catalog
 
 DEFAULT_PORT = 8765
 UNIVERSE_PAGE_DEFAULT = 100
@@ -405,6 +407,128 @@ def _read_universe_leaders(
     }
 
 
+# ---------------------------------------------------------------------------
+# Post-hoc session analysis (task 048, backlog item C)
+# ---------------------------------------------------------------------------
+# Read-only, WAL, short timeout -- exactly the same discipline every other
+# journal read on this page uses. The rows this queries are written once, at
+# the end of a run, so in practice there is no writer to contend with; the
+# read-only connection guarantees this page can never become one either.
+
+_TRADE_COLUMNS = (
+    "trade_seq", "direction", "entry_at", "exit_at", "entry_price", "exit_price", "exit_reason",
+    "net_pnl_usd", "gross_pnl_usd", "entry_cost_usd", "contracts", "entry_session", "entry_hour_ny",
+)
+
+
+def _open_journal_readonly(run_dir: Path, *, timeout: float = 1.0):
+    db_path = run_dir / "backtest_v2_journal.sqlite3"
+    if not db_path.exists():
+        return None
+    try:
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=timeout)
+    except sqlite3.Error:
+        return None
+    connection.execute("PRAGMA query_only=1")
+    return connection
+
+
+def _session_analysis_variants(run_dir: Path) -> list[str]:
+    connection = _open_journal_readonly(run_dir)
+    if connection is None:
+        return []
+    try:
+        return [row[0] for row in connection.execute(
+            "SELECT DISTINCT strategy_variant_id FROM variant_trades ORDER BY strategy_variant_id"
+        ).fetchall()]
+    except sqlite3.Error:
+        # A journal written before this table existed. An empty list is the
+        # honest answer: that run has no trade-level detail, and the endpoint
+        # says so rather than pretending the run had no trades.
+        return []
+    finally:
+        connection.close()
+
+
+def _read_variant_trades(run_dir: Path, strategy_variant_id: str) -> list[dict] | None:
+    connection = _open_journal_readonly(run_dir)
+    if connection is None:
+        return None
+    try:
+        rows = connection.execute(
+            f"SELECT {', '.join(_TRADE_COLUMNS)} FROM variant_trades WHERE strategy_variant_id = ? ORDER BY trade_seq",
+            (strategy_variant_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    return [dict(zip(_TRADE_COLUMNS, row)) for row in rows]
+
+
+def _parse_session_filter(query: dict) -> SessionFilter:
+    raw_sessions = [value for item in query.get("sessions", []) for value in item.split(",") if value]
+    hour_from = query.get("hour_from", [None])[0]
+    hour_to = query.get("hour_to", [None])[0]
+    return SessionFilter(
+        sessions=frozenset(raw_sessions),
+        hour_from=int(hour_from) if hour_from not in (None, "") else None,
+        hour_to=int(hour_to) if hour_to not in (None, "") else None,
+    )
+
+
+def _session_analysis_payload(run_dir: Path, query: dict) -> dict:
+    strategy_id = query.get("strategy_id", [""])[0]
+    catalog = session_catalog()
+    available = _session_analysis_variants(run_dir)
+    payload: dict[str, object] = {
+        # Repeated in the payload, not only in the UI, so any consumer of this
+        # endpoint -- a notebook, a script -- carries the caveat with the data.
+        "post_hoc": True,
+        "disclaimer": (
+            "Post-hoc view of an already-completed run. These trades were NOT produced by a "
+            "session-filtered strategy: the filter is applied after the fact to trades the "
+            "unfiltered strategy actually took. A session chosen because it looks best here is a "
+            "hypothesis and must be confirmed on a separate, unused holdout before it becomes a "
+            "production filter."
+        ),
+        "sessions": catalog,
+        "available_strategy_ids": available,
+        "strategy_id": strategy_id or None,
+    }
+    if not strategy_id:
+        payload["result"] = None
+        payload["notice"] = "Select a strategy to analyse." if available else (
+            "This run has no persisted trade-level detail. Trade rows are written for the final "
+            "leaderboard variants when a run completes."
+        )
+        return payload
+
+    trades = _read_variant_trades(run_dir, strategy_id)
+    if not trades:
+        payload["result"] = None
+        payload["notice"] = f"No persisted trades for {strategy_id!r}."
+        return payload
+
+    try:
+        selection = _parse_session_filter(query)
+    except ValueError as error:
+        payload["result"] = None
+        payload["error"] = str(error)
+        return payload
+
+    selected = filter_trades(trades, selection)
+    payload["filter"] = {
+        "sessions": sorted(selection.sessions),
+        "hour_from": selection.hour_from,
+        "hour_to": selection.hour_to,
+        "is_identity": selection.is_identity,
+    }
+    payload["baseline"] = analyse_session_subset(trades)
+    payload["result"] = analyse_session_subset(selected)
+    return payload
+
+
 def _json_bytes(payload) -> bytes:
     return json.dumps(payload).encode("utf-8")
 
@@ -581,6 +705,8 @@ class _DashboardRequestHandler(BaseHTTPRequestHandler):
         elif endpoint == "events":
             limit = int(query.get("limit", ["50"])[0])
             self._send_json({"events": read_progress_events(run_dir, limit=limit)})
+        elif endpoint == "session-analysis":
+            self._send_json(_session_analysis_payload(run_dir, query))
         else:
             self._send_json({"error": f"unknown endpoint {endpoint!r}"}, status=404)
 
@@ -658,6 +784,20 @@ DASHBOARD_HTML = r"""<!doctype html>
   main { padding: 20px; max-width: 1560px; margin: 0 auto; }
   .demo-banner { background: linear-gradient(90deg, rgba(168,85,247,0.18), rgba(168,85,247,0.05)); border: 1px solid rgba(168,85,247,0.4); color: var(--demo); padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; font-weight: 600; font-size: 13px; display: none; }
   .empty-state { color: var(--text-faint); font-size: 13px; text-align: center; padding: 30px 10px; }
+  .posthoc-banner { background: #3a2a10; border: 1px solid #7a5a20; color: #f0d9a8; border-radius: 8px; padding: 10px 14px; font-size: 12.5px; line-height: 1.5; margin-bottom: 14px; }
+  .posthoc-banner strong { color: #ffd98a; }
+  .session-controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; margin-bottom: 14px; }
+  .session-controls label { display: block; font-size: 11px; color: var(--text-faint); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
+  .session-controls select, .session-controls input { background: var(--bg-card); color: inherit; border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 12.5px; }
+  .session-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .session-chip { display: inline-flex; align-items: center; gap: 5px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 999px; padding: 4px 11px; font-size: 12px; cursor: pointer; }
+  .session-chip input { margin: 0; }
+  .session-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .session-table th, .session-table td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  .session-table th:first-child, .session-table td:first-child { text-align: left; }
+  .session-table thead th { color: var(--text-faint); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .session-delta-pos { color: #6ee7a8; }
+  .session-delta-neg { color: #f2909a; }
   section { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; }
   section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-dim); margin: 0 0 12px 0; }
   .progress-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
@@ -873,6 +1013,51 @@ DASHBOARD_HTML = r"""<!doctype html>
       <div class="chart-box"><div class="chart-title-row"><h3>Selected trade P&amp;L distribution</h3><span class="chart-key">Net P&amp;L per trade</span></div><div class="chart-subtitle">X: realised net P&amp;L (USD) · Y: number of trades</div><canvas id="chart-trade-pnl"></canvas></div>
       <div class="chart-box"><div class="chart-title-row"><h3>Selected realised drawdown</h3><span class="chart-key">Cash-based</span></div><div class="chart-subtitle">X: trade time · Y: peak-to-trough drawdown (USD)</div><canvas id="chart-drawdown"></canvas></div>
       <div class="chart-box wide"><div class="chart-title-row"><h3 id="month-title">Monthly trade activity</h3><span class="chart-key">Selected strategy</span></div><div class="chart-subtitle">X: month · Y: completed trades</div><canvas id="chart-by-month"></canvas></div>
+    </div>
+  </section>
+
+  <section id="section-session-analysis">
+    <h2>Session analysis <span class="chart-key">post-hoc</span></h2>
+    <div class="posthoc-banner">
+      <strong>This is a post-hoc view, not a strategy result.</strong>
+      These trades were taken by the <em>unfiltered</em> strategy; the session filter is applied
+      afterwards to trades that already happened. Nothing here re-detects confluence or re-runs a
+      backtest. A session that looks best here was chosen on the same data that produced it, so it is
+      a hypothesis &mdash; confirm it on a separate, unused holdout before treating it as a production filter.
+    </div>
+    <div class="session-controls">
+      <div>
+        <label for="session-strategy">Strategy</label>
+        <select id="session-strategy"></select>
+      </div>
+      <div>
+        <label>Sessions (New York time)</label>
+        <div class="session-chips" id="session-chips"></div>
+      </div>
+      <div>
+        <label for="session-hour-from">NY hour from</label>
+        <input id="session-hour-from" type="number" min="0" max="23" placeholder="any" style="width:74px">
+      </div>
+      <div>
+        <label for="session-hour-to">NY hour to</label>
+        <input id="session-hour-to" type="number" min="0" max="23" placeholder="any" style="width:74px">
+      </div>
+      <div><button id="session-reset" class="sort-button">Clear filter</button></div>
+    </div>
+    <div id="session-empty" class="empty-state">Select a strategy to analyse.</div>
+    <div id="session-content" style="display:none">
+      <table class="session-table" id="session-metrics">
+        <thead><tr><th>Metric</th><th>All trades</th><th>Filtered subset</th><th>Delta</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="chart-box wide" style="margin-top:14px">
+        <div class="chart-title-row"><h3>Filtered equity curve</h3><span class="chart-key">Y: account equity (USD) &middot; X: trade time</span></div>
+        <canvas id="chart-session-equity"></canvas>
+      </div>
+      <table class="session-table" id="session-breakdown" style="margin-top:14px">
+        <thead><tr><th>Session</th><th>Trades</th><th>Net P&amp;L (USD)</th><th>Win rate</th></tr></thead>
+        <tbody></tbody>
+      </table>
     </div>
   </section>
 
@@ -1447,6 +1632,129 @@ async function loadLeaderboardPage(reset = false) {
   renderCharts(lastLeaderboard, lastEventsData);
 }
 
+// ---------------------------------------------------------------------------
+// Post-hoc session analysis
+// ---------------------------------------------------------------------------
+// Fetched on demand (strategy or filter change), never on the poll timer: this
+// view describes a finished run, so re-querying it every few seconds would be
+// pure load on the journal for data that cannot have changed.
+let sessionCatalogRendered = false;
+let sessionStrategyId = "";
+
+function sessionFilterQuery() {
+  const checked = Array.from(document.querySelectorAll("#session-chips input:checked")).map(i => i.value);
+  const params = new URLSearchParams();
+  if (sessionStrategyId) params.set("strategy_id", sessionStrategyId);
+  if (checked.length) params.set("sessions", checked.join(","));
+  const from = document.getElementById("session-hour-from").value;
+  const to = document.getElementById("session-hour-to").value;
+  // The API requires both ends or neither -- a half-specified range is a
+  // user mid-edit, not a filter, so it is simply not sent.
+  if (from !== "" && to !== "") { params.set("hour_from", from); params.set("hour_to", to); }
+  return params.toString();
+}
+
+function renderSessionChips(sessions) {
+  if (sessionCatalogRendered) return;
+  const host = document.getElementById("session-chips");
+  host.innerHTML = "";
+  (sessions || []).forEach(sess => {
+    const label = document.createElement("label");
+    label.className = "session-chip";
+    label.innerHTML = `<input type="checkbox" value="${sess.key}"><span>${sess.label} <span style="color:var(--text-faint)">${sess.start_ny}\u2013${sess.end_ny}</span></span>`;
+    label.querySelector("input").addEventListener("change", loadSessionAnalysis);
+    host.appendChild(label);
+  });
+  sessionCatalogRendered = true;
+}
+
+function sessionDeltaCell(baseline, filtered, formatter, higherIsBetter) {
+  if (baseline === null || baseline === undefined || filtered === null || filtered === undefined) return "-";
+  const delta = filtered - baseline;
+  if (Math.abs(delta) < 1e-9) return "0";
+  const good = higherIsBetter ? delta > 0 : delta < 0;
+  return `<span class="${good ? "session-delta-pos" : "session-delta-neg"}">${delta > 0 ? "+" : ""}${formatter(delta)}</span>`;
+}
+
+function renderSessionAnalysis(payload) {
+  const empty = document.getElementById("session-empty");
+  const content = document.getElementById("session-content");
+  renderSessionChips(payload && payload.sessions);
+
+  const select = document.getElementById("session-strategy");
+  const available = (payload && payload.available_strategy_ids) || [];
+  const currentOptions = Array.from(select.options).map(o => o.value).join("|");
+  if (currentOptions !== ["", ...available].join("|")) {
+    select.innerHTML = "";
+    const blank = document.createElement("option");
+    blank.value = ""; blank.textContent = available.length ? "Select a strategy\u2026" : "No trade-level detail in this run";
+    select.appendChild(blank);
+    available.forEach(id => {
+      const option = document.createElement("option");
+      option.value = id; option.textContent = id;
+      select.appendChild(option);
+    });
+    select.value = sessionStrategyId;
+  }
+
+  if (!payload || !payload.result) {
+    empty.textContent = (payload && (payload.error || payload.notice)) || "Select a strategy to analyse.";
+    empty.style.display = "block";
+    content.style.display = "none";
+    return;
+  }
+  empty.style.display = "none";
+  content.style.display = "block";
+
+  const base = payload.baseline || {};
+  const res = payload.result;
+  const rows = [
+    ["Trades", fmtNum(base.trade_count), fmtNum(res.trade_count), sessionDeltaCell(base.trade_count, res.trade_count, fmtNum, true)],
+    ["Net P&L", fmtMoney(base.net_pnl_usd), fmtMoney(res.net_pnl_usd), sessionDeltaCell(base.net_pnl_usd, res.net_pnl_usd, fmtMoney, true)],
+    ["ROI", fmtPct(base.roi), fmtPct(res.roi), sessionDeltaCell(base.roi, res.roi, fmtPct, true)],
+    ["Win rate", fmtPct(base.win_rate), fmtPct(res.win_rate), sessionDeltaCell(base.win_rate, res.win_rate, fmtPct, true)],
+    ["Max drawdown", fmtMoney(base.max_drawdown_usd), fmtMoney(res.max_drawdown_usd), sessionDeltaCell(base.max_drawdown_usd, res.max_drawdown_usd, fmtMoney, false)],
+    ["$2k drawdown episodes", fmtNum(base.drawdown_over_2000_episode_count), fmtNum(res.drawdown_over_2000_episode_count), sessionDeltaCell(base.drawdown_over_2000_episode_count, res.drawdown_over_2000_episode_count, fmtNum, false)],
+    ["Final balance", fmtMoney(base.final_balance_usd), fmtMoney(res.final_balance_usd), sessionDeltaCell(base.final_balance_usd, res.final_balance_usd, fmtMoney, true)],
+  ];
+  document.querySelector("#session-metrics tbody").innerHTML = rows
+    .map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td>${r[3]}</td></tr>`).join("");
+
+  drawLineChart(
+    document.getElementById("chart-session-equity"),
+    (res.equity_curve || []).map((p, i) => ({x: i, y: p.equity})),
+    {color: "#6ee7a8"},
+  );
+
+  const bySession = res.by_session || {};
+  document.querySelector("#session-breakdown tbody").innerHTML = Object.keys(bySession)
+    .map(key => {
+      const b = bySession[key];
+      return `<tr><td>${key}</td><td>${fmtNum(b.trade_count)}</td><td>${fmtMoney(b.net_pnl_usd)}</td><td>${fmtPct(b.win_rate)}</td></tr>`;
+    }).join("");
+}
+
+async function loadSessionAnalysis() {
+  if (!currentRunId) return;
+  const payload = await fetchJson(`/api/runs/${currentRunId}/session-analysis?${sessionFilterQuery()}`);
+  renderSessionAnalysis(payload);
+}
+
+function initSessionAnalysis() {
+  document.getElementById("session-strategy").addEventListener("change", event => {
+    sessionStrategyId = event.target.value;
+    loadSessionAnalysis();
+  });
+  document.getElementById("session-hour-from").addEventListener("change", loadSessionAnalysis);
+  document.getElementById("session-hour-to").addEventListener("change", loadSessionAnalysis);
+  document.getElementById("session-reset").addEventListener("click", () => {
+    document.querySelectorAll("#session-chips input").forEach(i => { i.checked = false; });
+    document.getElementById("session-hour-from").value = "";
+    document.getElementById("session-hour-to").value = "";
+    loadSessionAnalysis();
+  });
+}
+
 async function refresh() {
   await loadRuns();
   if (!currentRunId) return;
@@ -1538,7 +1846,11 @@ document.getElementById("leaders-scroll").addEventListener("scroll", (event) => 
 });
 
 (async () => {
+  initSessionAnalysis();
   await refresh();
+  // Loaded once here and then only on user interaction -- see the note above
+  // loadSessionAnalysis for why this is deliberately off the poll timer.
+  await loadSessionAnalysis();
   pollTimer = setInterval(refresh, POLL_MS);
 })();
 </script>

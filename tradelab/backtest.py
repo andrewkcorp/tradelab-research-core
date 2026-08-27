@@ -204,6 +204,12 @@ class TradeExitReason(str, Enum):
     TP_HIT = "tp_hit"
     SL_HIT = "sl_hit"
     OPEN_UNRESOLVED = "open_unresolved"
+    # Task 048: the hard CME session-close policy closed the position at the
+    # last bar of its session rather than letting it carry across the daily
+    # maintenance break. See tradelab.session_execution. A TP or SL touched
+    # on that same bar still wins -- this reason means the position survived
+    # the whole bar and was closed at its close.
+    SESSION_CLOSE_EXIT = "session_close_exit"
 
 
 @dataclass(frozen=True)
