@@ -69,3 +69,9 @@ research_journal.sqlite3
 # their small JSON reports are covered by the rules above).
 .diag/equiv-runs/
 .diag/shard-bundle*/
+
+# Atlas regeneration baselines and scratch: local research output, like every
+# other .diag JSON. The committed docs/atlas-report-checksums.json is what makes
+# a regeneration verifiable without them.
+.diag/atlas-baseline/
+.diag/atlas-regen/
