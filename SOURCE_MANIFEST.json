@@ -1,0 +1,858 @@
+{
+  "engine_modules": [
+    "__init__",
+    "accounting",
+    "aggregate",
+    "apex_eod",
+    "backtest",
+    "backtest_v2",
+    "backtest_v2_journal",
+    "bar",
+    "bar_range_index",
+    "bias",
+    "both_direction_universe",
+    "continuous_futures",
+    "data_wicks",
+    "databento_parent_csv",
+    "diagnose_context_preparation",
+    "entry_signal_timeline",
+    "entry_store",
+    "entry_strategy_universe",
+    "entry_target_cache",
+    "equity",
+    "fixed_rr_targets",
+    "fvg",
+    "fvg_entry",
+    "fvg_touch",
+    "liquidity",
+    "liquidity_entry",
+    "liquidity_store",
+    "liquidity_target_index",
+    "loaders",
+    "market_data_artifact",
+    "news",
+    "news_loaders",
+    "observed_strategy_universe",
+    "outlier_audit",
+    "process_memory",
+    "profile_research_context",
+    "research_dashboard",
+    "research_demo",
+    "research_journal",
+    "research_period",
+    "research_run",
+    "research_runner",
+    "research_validation",
+    "selector_catalog",
+    "session_analysis",
+    "session_calendar",
+    "session_execution",
+    "session_liquidity",
+    "shard_bundle",
+    "shard_payload",
+    "shard_plan",
+    "shared_context",
+    "sl_targets",
+    "stage_timings",
+    "strategy_spec",
+    "sweep_fvg_setup",
+    "tp_targets",
+    "trade_execution",
+    "trade_path_audit",
+    "trading_sessions",
+    "validation",
+    "volume_roll_continuous",
+    "worker_policy"
+  ],
+  "files": {
+    ".github/ISSUE_TEMPLATE/bug.yml": {
+      "bytes": 887,
+      "sha256": "e23faee8ed4c93bd5758c68dfb80d45861945c31d385c61c186f667867afc17e"
+    },
+    ".github/ISSUE_TEMPLATE/proposal.yml": {
+      "bytes": 487,
+      "sha256": "9256958ffbfab057971084947a3ffd3d35ee119f685413cf3d994083c0b90714"
+    },
+    ".github/PULL_REQUEST_TEMPLATE.md": {
+      "bytes": 638,
+      "sha256": "4d65731a9b6928f04b26d82c8d29eba85f6cbb427be555639fb49f522176101e"
+    },
+    ".github/workflows/ci.yml": {
+      "bytes": 1201,
+      "sha256": "6ebbf5a8165c7ecc178257f1f62aacfd67b03bc3538cfeefbf024a195710f7e2"
+    },
+    ".gitignore": {
+      "bytes": 389,
+      "sha256": "81ab98f43ab44c863c81d68790f0dd22269537e5800d2aeb0e879206cbb51ea0"
+    },
+    "AGENTS.md": {
+      "bytes": 1320,
+      "sha256": "54c8731e808d3a4bb25f51de65619007e295f6f5f805ff012f445eb252725f67"
+    },
+    "CHANGELOG.md": {
+      "bytes": 1125,
+      "sha256": "4822c416f64f052939a6aefccb74855694de5f43048a6054bd82cf93ab591637"
+    },
+    "CODE_OF_CONDUCT.md": {
+      "bytes": 928,
+      "sha256": "204263b11fc00f0e2fdf49a00d8ffe05791e2eb229bf1a176bd427db4044fe56"
+    },
+    "CONTRIBUTING.md": {
+      "bytes": 2339,
+      "sha256": "6cb30c53d2756ea2d8200056d9241765632243e0697fdbc91f8d13653bc0aece"
+    },
+    "GOVERNANCE.md": {
+      "bytes": 1071,
+      "sha256": "c780f44aa3ec3833a8a6c88e7e68efbd6b6425fbd262df21f9ce90f19fb2e3b1"
+    },
+    "LICENSE": {
+      "bytes": 1078,
+      "sha256": "19316e665ce168e9ec56aaef2073c4b7191d42b382f6520f5cf322099f9fd211"
+    },
+    "README.md": {
+      "bytes": 5295,
+      "sha256": "7cc8f7cd20aa6e6148b5e95e1e3718708922ac20264e6385920c8005f4e48163"
+    },
+    "SECURITY.md": {
+      "bytes": 1586,
+      "sha256": "972aa2387366079c7802c27a37490d5cfa1290ba9bc1aedaa417ff717144b84a"
+    },
+    "docs/architecture.md": {
+      "bytes": 2078,
+      "sha256": "9415f3b79e49b5cc90a6ccd40310670d4496d6fd5ac891a3a617b792bc245884"
+    },
+    "docs/data-policy.md": {
+      "bytes": 1339,
+      "sha256": "3875726fb0b75c7e62111dd17163a5fcd53ff0f5b1010815a0a9fc2d6e0f8313"
+    },
+    "docs/methodology.md": {
+      "bytes": 3240,
+      "sha256": "009dbb01d5d6f62db07977d3b1322f5db8a2f79803a38cff928814345cd3152a"
+    },
+    "docs/roadmap.md": {
+      "bytes": 1512,
+      "sha256": "75d681b9e2c2054d4837c4466fd2083ab174b3d8a70cdd4b4879ac413546e5a3"
+    },
+    "pyproject.toml": {
+      "bytes": 906,
+      "sha256": "266b382a56106f696888f5f3049db39a5b0a3db483ecbbdf599d4ebd8f309f4d"
+    },
+    "tests/__init__.py": {
+      "bytes": 46,
+      "sha256": "196d576cf3b324d8e1fb3563776d66b42789cb4dfdf613745dccf34788f2225f"
+    },
+    "tests/test_public_examples.py": {
+      "bytes": 2006,
+      "sha256": "b0534d6e30ebf1d56d15f24fa8e3d92a8bcf4cc28cf6982a74e7fbea125e7e2c"
+    },
+    "tests/test_public_safety.py": {
+      "bytes": 2180,
+      "sha256": "3171293146a49e7ff98843fe7ba17736c79dc6ee0b2ab49d7f6a403ca2d5e766"
+    },
+    "tests/test_tradelab_accounting.py": {
+      "bytes": 17360,
+      "sha256": "453dd53c87dbb4893da46b7c4ff9cf43c93b778ad7f4d06b903ef470c082ca3d"
+    },
+    "tests/test_tradelab_aggregate.py": {
+      "bytes": 15125,
+      "sha256": "580f453d0ebf332d3ba1c4e046382fe0f6e0b9fff3178f6028faa9fc9499412f"
+    },
+    "tests/test_tradelab_apex_eod.py": {
+      "bytes": 5257,
+      "sha256": "c1caa612e6cd2b7821c6ab4d88f5e2e028c4c8b94ddad5cd9b4bf5440f54785d"
+    },
+    "tests/test_tradelab_backtest.py": {
+      "bytes": 53545,
+      "sha256": "0a965265665bff6c916ea9b5d6a54498f3216321f38bd6c58b557d3cb9e53003"
+    },
+    "tests/test_tradelab_backtest_v2.py": {
+      "bytes": 174726,
+      "sha256": "45d61f9191436b3cc0c35bf628e1ec50c8bd1ae145af5d7b9825611f5cc88b21"
+    },
+    "tests/test_tradelab_backtest_v2_journal.py": {
+      "bytes": 12487,
+      "sha256": "3cd825c95525457aaea727520701036027018d41ea71efab74421cb73eed9e3a"
+    },
+    "tests/test_tradelab_bar.py": {
+      "bytes": 2738,
+      "sha256": "731d2c4043f9ecea293a7226738ab364087aa2ac51fe910f0dcb411353af39a6"
+    },
+    "tests/test_tradelab_bar_range_index.py": {
+      "bytes": 8363,
+      "sha256": "bed9420b97b3aea20f39367888739a3f4726f74d1d29bd33436ce7fd6a7f7113"
+    },
+    "tests/test_tradelab_bias.py": {
+      "bytes": 16984,
+      "sha256": "1ab4b25830177579b3a01fc93e8ead2499460910eb835af904f4e80169ec79e2"
+    },
+    "tests/test_tradelab_both_direction_universe.py": {
+      "bytes": 8932,
+      "sha256": "14107553a5667ea7f4a59e6ab229610457420a8d92caf73b6ddffb8b8b7e0e1f"
+    },
+    "tests/test_tradelab_continuous_futures.py": {
+      "bytes": 13924,
+      "sha256": "ddebf60a2bd83582633d631b8a52157952d2f67c6380e79e7d0cbd1580111daa"
+    },
+    "tests/test_tradelab_data_wicks.py": {
+      "bytes": 15895,
+      "sha256": "7d38164d9509449d89ffea6c98eccfba71cfab16c88f56e838a74cb648b42dd3"
+    },
+    "tests/test_tradelab_databento_parent_csv.py": {
+      "bytes": 8510,
+      "sha256": "9f3432ffb4efb0c69332dd4834be0c8da4cc92c66495429aaae49d46fd3d7bac"
+    },
+    "tests/test_tradelab_diagnose_context_preparation.py": {
+      "bytes": 8893,
+      "sha256": "d7176b2fd5386ab9025ad7bd23ca459a4d5501aa18ee82151fb40a954d11094b"
+    },
+    "tests/test_tradelab_entry_signal_timeline.py": {
+      "bytes": 125760,
+      "sha256": "1ef9c51bc45a82b427f6af0831d6e5e9777d50649c0f1433898c07145a7c57e5"
+    },
+    "tests/test_tradelab_entry_store.py": {
+      "bytes": 12114,
+      "sha256": "3f6813d2f5893d5dd6316ca3d267681f12aaad8daadfd33503fb151121ebb011"
+    },
+    "tests/test_tradelab_entry_strategy_universe.py": {
+      "bytes": 34936,
+      "sha256": "fdbd40476f63c52c5b9833cfc43d2f12292957ed60a41d329d7b4fc77c5a88e8"
+    },
+    "tests/test_tradelab_entry_target_cache.py": {
+      "bytes": 4895,
+      "sha256": "b59da2eafebfee3e82a63e9a05913f6f7520a374a67b3a46a288f62bdd1c941c"
+    },
+    "tests/test_tradelab_equity.py": {
+      "bytes": 14596,
+      "sha256": "cd1620f97bc1116689b06a688b4d34ce527b04ed3ad8caef6dd245094e71b402"
+    },
+    "tests/test_tradelab_fixed_rr_targets.py": {
+      "bytes": 16452,
+      "sha256": "20cd26e36d7194e3f6a11b5d3549c09740bb0592625f188f762e013663ede0dc"
+    },
+    "tests/test_tradelab_fvg.py": {
+      "bytes": 20154,
+      "sha256": "544210e49b5e3e64ee987b4c152d58d95630b44362cd6e524d6b7117916d2e81"
+    },
+    "tests/test_tradelab_fvg_entry.py": {
+      "bytes": 27028,
+      "sha256": "84979aab2d10bdc2ca095ec8bcf164e9f4e5205055275730f78b4d410554b77e"
+    },
+    "tests/test_tradelab_fvg_touch.py": {
+      "bytes": 12573,
+      "sha256": "939637dc7069407e66534c66da4e33d11c9e720c613fc7497250ad5c49ad2a62"
+    },
+    "tests/test_tradelab_liquidity.py": {
+      "bytes": 33181,
+      "sha256": "61814c9790f224666019629ddc46d513fe670faa50c1f30ea53645ddb3734f56"
+    },
+    "tests/test_tradelab_liquidity_entry.py": {
+      "bytes": 21760,
+      "sha256": "f0fb1c60687c50fa764c2d3a6c73a1f62c2699c9dd5fa45efdd29ade30b30d1a"
+    },
+    "tests/test_tradelab_liquidity_store.py": {
+      "bytes": 16480,
+      "sha256": "27d83e58b445dd64fd53458d012d82968f2e0d7ded44448bac36967b58dc9c00"
+    },
+    "tests/test_tradelab_liquidity_target_index.py": {
+      "bytes": 1405,
+      "sha256": "8618109a6db0ceca073bb06a0dd0a034acfa38e9b49d12688b5511e073533599"
+    },
+    "tests/test_tradelab_loaders.py": {
+      "bytes": 4931,
+      "sha256": "d49498dcb5954e6786cd28575e9f83f998ff6cc85b46a4cc46a6260f6ba263b7"
+    },
+    "tests/test_tradelab_market_data_artifact.py": {
+      "bytes": 30510,
+      "sha256": "5951cf02f0ef28498d363a148e2ad71633af0b240a68000a48e7a9daa00a44d4"
+    },
+    "tests/test_tradelab_news.py": {
+      "bytes": 12258,
+      "sha256": "b6bc5a76b23764c39f037d729e798a84bc07b7b8fa9386a03ba99c625a4fe827"
+    },
+    "tests/test_tradelab_news_loaders.py": {
+      "bytes": 8790,
+      "sha256": "ec60d9d16cd92a72e00327545c4865e2bd077b20a3b2bef5a4b9295eb4c9f041"
+    },
+    "tests/test_tradelab_observed_strategy_universe.py": {
+      "bytes": 39701,
+      "sha256": "32ab22a8574d19a2614b3c424b5b5798011dfbf70c170e1d8ea4a126c8a1585e"
+    },
+    "tests/test_tradelab_outlier_audit.py": {
+      "bytes": 2055,
+      "sha256": "179d74fd5c26f47c9aae4331e2d9cfb385d4ffdf9cd96f8667ed5fe181f4dac5"
+    },
+    "tests/test_tradelab_process_memory.py": {
+      "bytes": 4921,
+      "sha256": "f799ab1e98c87ac74e8ad2f0e95b0b846be5438acef381cc72b2272edad9acdf"
+    },
+    "tests/test_tradelab_profile_research_context.py": {
+      "bytes": 70717,
+      "sha256": "7876fea17e55b0e1f93c4695f6d37e049fe95651c35e26f6916a94951a469f37"
+    },
+    "tests/test_tradelab_research_dashboard.py": {
+      "bytes": 23253,
+      "sha256": "a4f3d0bc1fa50255a29877fa2af9e79f561ec51337693704cd53ae819d6e51b8"
+    },
+    "tests/test_tradelab_research_demo.py": {
+      "bytes": 5038,
+      "sha256": "4f00c69d62c839ff9f217de297adeef4adac4e8abac3453c28cd5a371df5fb53"
+    },
+    "tests/test_tradelab_research_journal.py": {
+      "bytes": 28885,
+      "sha256": "c5a0b25395f2d0c938db46f9aaabcaf18bcfcd0729cc7329852ad4201a887a5d"
+    },
+    "tests/test_tradelab_research_period.py": {
+      "bytes": 1355,
+      "sha256": "b146f8f66c8291e42cdfeadd1de8c1aa39bb6e2e6a9021b210aefa8a91eae618"
+    },
+    "tests/test_tradelab_research_run.py": {
+      "bytes": 44962,
+      "sha256": "b4d38ec7f6e99143f9f38d6fd5e33ab684fed67d6db33dc576eb0b0ab5d56d4d"
+    },
+    "tests/test_tradelab_research_runner.py": {
+      "bytes": 24498,
+      "sha256": "944e3371bd36749e10b604d9703871f0ca4bd31435b77ada0a96f1725d2af242"
+    },
+    "tests/test_tradelab_research_validation.py": {
+      "bytes": 3967,
+      "sha256": "5835f7facf6896e9113f3df996e707b5e58191514fd0a060d8433234284484f9"
+    },
+    "tests/test_tradelab_selector_catalog.py": {
+      "bytes": 12671,
+      "sha256": "d16da536fa81485267a8004bd249afe7dd0b6e38750f2a6f240dbedf7916ef35"
+    },
+    "tests/test_tradelab_session_analysis.py": {
+      "bytes": 22811,
+      "sha256": "e1ce0d0a5a56d3ef1250a678c99933425b4dbf730d71883fabb456b495cb8a81"
+    },
+    "tests/test_tradelab_session_calendar.py": {
+      "bytes": 6564,
+      "sha256": "933bd8df06d653ab4f42bd54b5056be69be587044c91699556a1bc6c2201080f"
+    },
+    "tests/test_tradelab_session_execution.py": {
+      "bytes": 24824,
+      "sha256": "00b9633594c5796b2ca439449e43e952ae451128e1b6095a6cccbabf24908a9e"
+    },
+    "tests/test_tradelab_session_liquidity.py": {
+      "bytes": 27025,
+      "sha256": "507e1ab22c01277b5b30b9e4d09e59561977b3ad4b30f2d228a0dac13af12fff"
+    },
+    "tests/test_tradelab_shard_plan.py": {
+      "bytes": 8697,
+      "sha256": "84350d18b24469d693e1c41cf32240e36d0e2948ca588a59d1ff029085253c50"
+    },
+    "tests/test_tradelab_shared_context.py": {
+      "bytes": 14877,
+      "sha256": "cb1bdd1574a9362baf65ba86209a8b41c0ae4b021be98dcee125a6ff135eab01"
+    },
+    "tests/test_tradelab_sl_targets.py": {
+      "bytes": 22331,
+      "sha256": "da1b7b6b8ab8637cf255d9d06b1df984ee493a60d29c9a5bbaa9880d7638b8ff"
+    },
+    "tests/test_tradelab_stage_timings.py": {
+      "bytes": 1598,
+      "sha256": "a9bdf5f32fc58696706c2e0bfa902110c6adfe8aa4045ed4fdfa20683ce2fa53"
+    },
+    "tests/test_tradelab_strategy_spec.py": {
+      "bytes": 22778,
+      "sha256": "1e15bb59ed750b125809fb7eb967c765576f3140484a43ecfd3627d0749788e0"
+    },
+    "tests/test_tradelab_sweep_fvg_setup.py": {
+      "bytes": 14224,
+      "sha256": "d581120bec528decbf31bcab34c11010a4a0913fae6b5daceb8bfae91ecfacaa"
+    },
+    "tests/test_tradelab_tp_targets.py": {
+      "bytes": 22890,
+      "sha256": "c14f00b9d4ec38efe4d23683ee17ccb29bf6bb992be9807c4b2a27fb3977174b"
+    },
+    "tests/test_tradelab_trade_execution.py": {
+      "bytes": 13850,
+      "sha256": "dab0b2217e6d38ebdc5512d3eadffab54919a33931f82a0a8476a6e4033b7874"
+    },
+    "tests/test_tradelab_trade_path_audit.py": {
+      "bytes": 7832,
+      "sha256": "c09ebbe27e254039bb3e102fe499099785bf8c2b5a30e934ee9d4ad799be4bc7"
+    },
+    "tests/test_tradelab_validation.py": {
+      "bytes": 7103,
+      "sha256": "a1959799b1c5d49dc1db4793fdb32574c2d7096d1ecdbf16ca109f9e2934a099"
+    },
+    "tests/test_tradelab_volume_roll_continuous.py": {
+      "bytes": 19746,
+      "sha256": "830cb55322706be07f212855a6a01e4230a3890bef33d7fcbe3f5e8920b39893"
+    },
+    "tools/__init__.py": {
+      "bytes": 67,
+      "sha256": "6678270f6639e1a7326afa32fa4def25972509b246c4bc2e31278cee2880f4c7"
+    },
+    "tools/check_public_tree.py": {
+      "bytes": 5604,
+      "sha256": "508b426fa1a45b207d2aedce8232274d646dcca92a03fa48e4a928107b6a1c1b"
+    },
+    "tradelab/__init__.py": {
+      "bytes": 11107,
+      "sha256": "7a54734e87aa3b242d600cb3026f0866b732aa630ff479783ed5d3421d102d64"
+    },
+    "tradelab/_resources/research_period_policy.json": {
+      "bytes": 453,
+      "sha256": "215868c569a013400f3981733b40421558ac6a128b8a6dd3e917de5ab2171a07"
+    },
+    "tradelab/accounting.py": {
+      "bytes": 13050,
+      "sha256": "543c3a8a3533c916c6d06bb0da85a33575d02828f6bf4fb2c4edce073a789949"
+    },
+    "tradelab/aggregate.py": {
+      "bytes": 7949,
+      "sha256": "b2e5e673eb931fdb875229d54a20966758a07b2a8c2b7b6bf3aa755b8bb97f13"
+    },
+    "tradelab/apex_eod.py": {
+      "bytes": 15401,
+      "sha256": "1200f20e888970748a13d32a41cc149d678ca55b6c103bbe8df8ae63d0c15292"
+    },
+    "tradelab/backtest.py": {
+      "bytes": 40185,
+      "sha256": "a650b6b094aca909f43ed116c3c1110a7d6b3d97474895c885c6c40a74037054"
+    },
+    "tradelab/backtest_v2.py": {
+      "bytes": 215592,
+      "sha256": "bf794c8eb89e3ff640fe88876413851cd0d3314af1ccfb55bf4e83b9a11f8457"
+    },
+    "tradelab/backtest_v2_journal.py": {
+      "bytes": 30765,
+      "sha256": "c02c96ef420a712496f0a6466c70d7928de63dfedb722a854fae599addc2d3ef"
+    },
+    "tradelab/bar.py": {
+      "bytes": 1255,
+      "sha256": "46837a220d5407351582a05628b3854ce345a1bab584a826a5204b21f6bd6088"
+    },
+    "tradelab/bar_range_index.py": {
+      "bytes": 7377,
+      "sha256": "db70122bb7205bdbf1456f67597889eb22bca35c5e6f8940d7c55e339974fd6d"
+    },
+    "tradelab/bias.py": {
+      "bytes": 9126,
+      "sha256": "61a4b6338ac845e88ca7142b56bf00ecaea55ad06daef875c71a3582006466b9"
+    },
+    "tradelab/both_direction_universe.py": {
+      "bytes": 10598,
+      "sha256": "c34663af9db8bf5e3871328d90f6785eff44bbb98654382759b935541fb620bb"
+    },
+    "tradelab/continuous_futures.py": {
+      "bytes": 15226,
+      "sha256": "1ed1bcf65c3f737f6f748d9090708fd3fdea63253a9a67608e6c48fa78285dd3"
+    },
+    "tradelab/data_wicks.py": {
+      "bytes": 9521,
+      "sha256": "b6d55c585757ccccce86f8cdc7f5a4349239b1ae376996c6cf79e7cb1c0c9cb6"
+    },
+    "tradelab/databento_parent_csv.py": {
+      "bytes": 8361,
+      "sha256": "2772aafa3eb82bbcfbdbd13ad94192eacee3b607a2c10e30146e0309629f5a1f"
+    },
+    "tradelab/diagnose_context_preparation.py": {
+      "bytes": 9751,
+      "sha256": "c1851ab1c9ac68788951b0e28c3c7032e65b5ec61c422dd6d29989c37bafa012"
+    },
+    "tradelab/entry_signal_timeline.py": {
+      "bytes": 87231,
+      "sha256": "317742a426131b39e171d7567f3ccc075348c7598351f0da29f7d1a8cb881aa7"
+    },
+    "tradelab/entry_store.py": {
+      "bytes": 16436,
+      "sha256": "271c4b9ab37f3cd7ec201e09ba4c8825296afc25b3922ea62062b1f1d87f1e7f"
+    },
+    "tradelab/entry_strategy_universe.py": {
+      "bytes": 39515,
+      "sha256": "306ea9f2217906ea865475247d9c09d9826a20b761b88d6322efe4e378ca8ad7"
+    },
+    "tradelab/entry_target_cache.py": {
+      "bytes": 10134,
+      "sha256": "7b0c11a06574c85807b5c7fd68bcd2cff3db1f3b0f6d8116bf9ac04f1fa039d5"
+    },
+    "tradelab/equity.py": {
+      "bytes": 8082,
+      "sha256": "ab3badbb62ad4e1cf155940ae04ec2738cf8e30cd10701d1fbd61b3bbfeed423"
+    },
+    "tradelab/fixed_rr_targets.py": {
+      "bytes": 6717,
+      "sha256": "3536291a64c5b86449fcfb87a2e65e41b4994da4568e27a2065ec87b7cb1166b"
+    },
+    "tradelab/fvg.py": {
+      "bytes": 15487,
+      "sha256": "9e51d57c7934bd0918a3ad3ccaae91dc71eeb69286e27634f055cf7f055827ea"
+    },
+    "tradelab/fvg_entry.py": {
+      "bytes": 21394,
+      "sha256": "0449c61e5f2ffbcd10cd77589da21199a9cc3a872f6184159c69cc35f01a6bdd"
+    },
+    "tradelab/fvg_touch.py": {
+      "bytes": 8158,
+      "sha256": "9bdc69d4009d08e9ee97a0d4f68459ccb2379b1139776d5ab550be3b8a554829"
+    },
+    "tradelab/liquidity.py": {
+      "bytes": 26371,
+      "sha256": "fab5220075261f53f372cdafb0efd8e77ca59b87de603cadcd464bda1cfc96be"
+    },
+    "tradelab/liquidity_entry.py": {
+      "bytes": 14096,
+      "sha256": "6f7aa16bbf44a2d2302ebde4b0f689c5d267399dba6c0ccea368def708064f45"
+    },
+    "tradelab/liquidity_store.py": {
+      "bytes": 24789,
+      "sha256": "d01cc3d0db08278e934141a376f305ca313c32798dcc035a9fc31000b5b999ab"
+    },
+    "tradelab/liquidity_target_index.py": {
+      "bytes": 11110,
+      "sha256": "cce9d1de76dc723dbb61d784f1e9c05ac8f8d5bd76d1f3b86171dbe1f43dc570"
+    },
+    "tradelab/loaders.py": {
+      "bytes": 5232,
+      "sha256": "24ff810df0f359736404eb0cef79a5208afa668428f959def2ff820b60f34708"
+    },
+    "tradelab/market_data_artifact.py": {
+      "bytes": 35467,
+      "sha256": "ba121452b318d2c55146622b0738fa8277c37279667e9580e81473d8da421237"
+    },
+    "tradelab/news.py": {
+      "bytes": 10424,
+      "sha256": "7f3a164ff97686b801353c7fab82c814cdf810bc01544b29c130b8c7e7c83d3a"
+    },
+    "tradelab/news_loaders.py": {
+      "bytes": 6259,
+      "sha256": "e31de60d48c06de66366e392031c637aceb16244afe0071e47de667d356ed0a6"
+    },
+    "tradelab/observed_strategy_universe.py": {
+      "bytes": 41098,
+      "sha256": "df41efe5ef95afb5854740414eab85690fdd76146498c60d999afc0a41e817c4"
+    },
+    "tradelab/outlier_audit.py": {
+      "bytes": 3690,
+      "sha256": "43c5663014d956dcc0c063be8a586805d650258daa64fc6bc58d797760185ced"
+    },
+    "tradelab/process_memory.py": {
+      "bytes": 15202,
+      "sha256": "818e9df4ade32843f320b5e3a493e0cb53b2aabf03ee94f9dbdff44623f75cc5"
+    },
+    "tradelab/profile_research_context.py": {
+      "bytes": 66113,
+      "sha256": "9d5713955860bd6421bce9e3cfc70fd47ea637e2df3cec8705afaea4deda61be"
+    },
+    "tradelab/research_dashboard.py": {
+      "bytes": 129206,
+      "sha256": "8ecb16ffaaf72bc8d1d8acec830bf43f27d9b48375d6b01eb78d584e18bfdd24"
+    },
+    "tradelab/research_demo.py": {
+      "bytes": 10161,
+      "sha256": "954cb931fe0ba22faeff1acc1bfb05c13db73aa828f35648006eab36ac2cb368"
+    },
+    "tradelab/research_journal.py": {
+      "bytes": 24351,
+      "sha256": "52046b7c71d94af7308787baa4e08f52d0a6def6e61cd7d103c4a28054073f30"
+    },
+    "tradelab/research_period.py": {
+      "bytes": 4028,
+      "sha256": "8417629a9a6d6e78e1546a07847793a9426fb6547d256df8e8f70b5db95108e4"
+    },
+    "tradelab/research_run.py": {
+      "bytes": 63617,
+      "sha256": "c24f47267c25f72bfc6e65a65130737e5844f68521cb8351c090f4bad28a714d"
+    },
+    "tradelab/research_runner.py": {
+      "bytes": 14901,
+      "sha256": "e318154d73640ac0c0eb5e13937afb4ddf78bcc3c6db376c4f194d30aa7ae332"
+    },
+    "tradelab/research_validation.py": {
+      "bytes": 9585,
+      "sha256": "4d62b1db6bed492f1629271cbcafa3aacd2bedd3c24a13115cc1c84decf441a6"
+    },
+    "tradelab/selector_catalog.py": {
+      "bytes": 13345,
+      "sha256": "fe3879501d66e83abe4aa37b541177101515c56b18cb2fa018c192f9ae70733c"
+    },
+    "tradelab/session_analysis.py": {
+      "bytes": 8340,
+      "sha256": "c5113bf81088715e1b08e738dec76f7afa4fa017333ce94529ad1618e038c8fe"
+    },
+    "tradelab/session_calendar.py": {
+      "bytes": 9854,
+      "sha256": "cc837285b2949163df1c312428c8e4ae56a41bcd6c0e0aa5b7a4e8013e107cd0"
+    },
+    "tradelab/session_execution.py": {
+      "bytes": 12162,
+      "sha256": "78f614c4087eb33e478f3c963777fd1bde1503ebe1426e6be4a7f1b0ae1b2e31"
+    },
+    "tradelab/session_liquidity.py": {
+      "bytes": 17318,
+      "sha256": "7316c1faf8741cedc548cf97012fb779b4c999bb39eea863b59c706b63e9b430"
+    },
+    "tradelab/shard_bundle.py": {
+      "bytes": 17387,
+      "sha256": "7073d3c2652ada0e96f6ca115ade0c3a429abfa1ad7b5b736973c773c1ea8c26"
+    },
+    "tradelab/shard_payload.py": {
+      "bytes": 10294,
+      "sha256": "42922bac73ac48b7af0a95409afd41382444d0268dcd0bfcb79c7da4a9598606"
+    },
+    "tradelab/shard_plan.py": {
+      "bytes": 11981,
+      "sha256": "3c38a9a17fc3703f5ba9a4e19dbb675aea14b58d8dfe4a15ef02afe99d597ada"
+    },
+    "tradelab/shared_context.py": {
+      "bytes": 19190,
+      "sha256": "51a9dc9cd4bdb0eb09612d02c89edb5e26c37c7895df2df5fcbd3f68de0a18b5"
+    },
+    "tradelab/sl_targets.py": {
+      "bytes": 18919,
+      "sha256": "a21543ae18e9942cebbf176eba3cdf67043ca35e09cf1c27ee2adc2306002a29"
+    },
+    "tradelab/stage_timings.py": {
+      "bytes": 1858,
+      "sha256": "041e573abe9022a4b01c2e6781f599bf3065e7819045f89799b2ae345b7cf8b9"
+    },
+    "tradelab/strategy_spec.py": {
+      "bytes": 21589,
+      "sha256": "f2ceeb43f360a87d19a7f1cfa09764025010dd205ba00bbda09723ce8a799e45"
+    },
+    "tradelab/sweep_fvg_setup.py": {
+      "bytes": 15423,
+      "sha256": "6f9751c300fbfaa6c464ea63546b58a3b7323e569f0dd5ebb67a470c836d5511"
+    },
+    "tradelab/synthetic_demo.py": {
+      "bytes": 2753,
+      "sha256": "a0765f75224b91971d0ceea3db15976fdc928c7d364561409f78e1386e6756c2"
+    },
+    "tradelab/tp_targets.py": {
+      "bytes": 18664,
+      "sha256": "003e4b1cd0a51c2f5c5b8365f8155eae0179e15e73f5cb58dfa62eaa24f29a8b"
+    },
+    "tradelab/trade_execution.py": {
+      "bytes": 11965,
+      "sha256": "9d60af98d619affcb2500430a3a9651e9d9c9e4e27b8da181714f44018fead60"
+    },
+    "tradelab/trade_path_audit.py": {
+      "bytes": 14447,
+      "sha256": "8a49f20f9d73943eb11619a637929738ca28f40943a6970b491993ada1901c27"
+    },
+    "tradelab/trading_sessions.py": {
+      "bytes": 4853,
+      "sha256": "b265d392b25ee7eec49906899104963e69f540f32e9d085f8f81b0190cd1858e"
+    },
+    "tradelab/validation.py": {
+      "bytes": 5675,
+      "sha256": "78fd42c6fc3607630a36ce5a84e7cbfe2310ad124fe0c34479f2a8b122e4e9cf"
+    },
+    "tradelab/volume_roll_continuous.py": {
+      "bytes": 23590,
+      "sha256": "496d1ea5004039c3ac1a3772aa97b7b8d4830d6c57cba63e9326f9b52c214d77"
+    },
+    "tradelab/worker_policy.py": {
+      "bytes": 2829,
+      "sha256": "6f1986f757f54f46d6381433bd0d4c8ff30c128b85e094100e36f3b25a1c62a5"
+    }
+  },
+  "filtered_history": {
+    "authors_and_dates_preserved": true,
+    "commit_messages_preserved": true,
+    "filtered_history_tip": "21f4795f7c67deb8866f69d96037f90288e27472",
+    "original_signatures_preserved": false,
+    "retained_commit_count": 127,
+    "scope": "Allowed literal paths among ancestors of pinned source baseline only",
+    "source_ancestor_count": 245
+  },
+  "history_included": true,
+  "limitations": [
+    "Heuristic secret scan, not a security guarantee.",
+    "License and third-party contribution rights require owner approval before publishing.",
+    "This export is not the latest private research branch; no private result or live-execution parity is claimed."
+  ],
+  "public_source_adaptations": {
+    "tests/test_tradelab_profile_research_context.py": "Packaging/resource path or source-archive test adaptation; simulation rules unchanged.",
+    "tradelab/research_period.py": "Packaging/resource path or source-archive test adaptation; simulation rules unchanged."
+  },
+  "schema": 1,
+  "source_commit": "b4f60d6f1930e4ccaba6f66bfc7c2d272300a3c1",
+  "source_policy": "Approved public files plus genuine allowed-path history; no private branches, datasets or original unfiltered history.",
+  "upstream_original_sha256": {
+    "tests/test_tradelab_accounting.py": "453dd53c87dbb4893da46b7c4ff9cf43c93b778ad7f4d06b903ef470c082ca3d",
+    "tests/test_tradelab_aggregate.py": "580f453d0ebf332d3ba1c4e046382fe0f6e0b9fff3178f6028faa9fc9499412f",
+    "tests/test_tradelab_apex_eod.py": "c1caa612e6cd2b7821c6ab4d88f5e2e028c4c8b94ddad5cd9b4bf5440f54785d",
+    "tests/test_tradelab_backtest.py": "0a965265665bff6c916ea9b5d6a54498f3216321f38bd6c58b557d3cb9e53003",
+    "tests/test_tradelab_backtest_v2.py": "45d61f9191436b3cc0c35bf628e1ec50c8bd1ae145af5d7b9825611f5cc88b21",
+    "tests/test_tradelab_backtest_v2_journal.py": "3cd825c95525457aaea727520701036027018d41ea71efab74421cb73eed9e3a",
+    "tests/test_tradelab_bar.py": "731d2c4043f9ecea293a7226738ab364087aa2ac51fe910f0dcb411353af39a6",
+    "tests/test_tradelab_bar_range_index.py": "bed9420b97b3aea20f39367888739a3f4726f74d1d29bd33436ce7fd6a7f7113",
+    "tests/test_tradelab_bias.py": "1ab4b25830177579b3a01fc93e8ead2499460910eb835af904f4e80169ec79e2",
+    "tests/test_tradelab_both_direction_universe.py": "14107553a5667ea7f4a59e6ab229610457420a8d92caf73b6ddffb8b8b7e0e1f",
+    "tests/test_tradelab_continuous_futures.py": "ddebf60a2bd83582633d631b8a52157952d2f67c6380e79e7d0cbd1580111daa",
+    "tests/test_tradelab_data_wicks.py": "7d38164d9509449d89ffea6c98eccfba71cfab16c88f56e838a74cb648b42dd3",
+    "tests/test_tradelab_databento_parent_csv.py": "9f3432ffb4efb0c69332dd4834be0c8da4cc92c66495429aaae49d46fd3d7bac",
+    "tests/test_tradelab_diagnose_context_preparation.py": "d7176b2fd5386ab9025ad7bd23ca459a4d5501aa18ee82151fb40a954d11094b",
+    "tests/test_tradelab_entry_signal_timeline.py": "1ef9c51bc45a82b427f6af0831d6e5e9777d50649c0f1433898c07145a7c57e5",
+    "tests/test_tradelab_entry_store.py": "3f6813d2f5893d5dd6316ca3d267681f12aaad8daadfd33503fb151121ebb011",
+    "tests/test_tradelab_entry_strategy_universe.py": "fdbd40476f63c52c5b9833cfc43d2f12292957ed60a41d329d7b4fc77c5a88e8",
+    "tests/test_tradelab_entry_target_cache.py": "b59da2eafebfee3e82a63e9a05913f6f7520a374a67b3a46a288f62bdd1c941c",
+    "tests/test_tradelab_equity.py": "cd1620f97bc1116689b06a688b4d34ce527b04ed3ad8caef6dd245094e71b402",
+    "tests/test_tradelab_fixed_rr_targets.py": "20cd26e36d7194e3f6a11b5d3549c09740bb0592625f188f762e013663ede0dc",
+    "tests/test_tradelab_fvg.py": "544210e49b5e3e64ee987b4c152d58d95630b44362cd6e524d6b7117916d2e81",
+    "tests/test_tradelab_fvg_entry.py": "84979aab2d10bdc2ca095ec8bcf164e9f4e5205055275730f78b4d410554b77e",
+    "tests/test_tradelab_fvg_touch.py": "939637dc7069407e66534c66da4e33d11c9e720c613fc7497250ad5c49ad2a62",
+    "tests/test_tradelab_liquidity.py": "61814c9790f224666019629ddc46d513fe670faa50c1f30ea53645ddb3734f56",
+    "tests/test_tradelab_liquidity_entry.py": "f0fb1c60687c50fa764c2d3a6c73a1f62c2699c9dd5fa45efdd29ade30b30d1a",
+    "tests/test_tradelab_liquidity_store.py": "27d83e58b445dd64fd53458d012d82968f2e0d7ded44448bac36967b58dc9c00",
+    "tests/test_tradelab_liquidity_target_index.py": "8618109a6db0ceca073bb06a0dd0a034acfa38e9b49d12688b5511e073533599",
+    "tests/test_tradelab_loaders.py": "d49498dcb5954e6786cd28575e9f83f998ff6cc85b46a4cc46a6260f6ba263b7",
+    "tests/test_tradelab_market_data_artifact.py": "5951cf02f0ef28498d363a148e2ad71633af0b240a68000a48e7a9daa00a44d4",
+    "tests/test_tradelab_news.py": "b6bc5a76b23764c39f037d729e798a84bc07b7b8fa9386a03ba99c625a4fe827",
+    "tests/test_tradelab_news_loaders.py": "ec60d9d16cd92a72e00327545c4865e2bd077b20a3b2bef5a4b9295eb4c9f041",
+    "tests/test_tradelab_observed_strategy_universe.py": "32ab22a8574d19a2614b3c424b5b5798011dfbf70c170e1d8ea4a126c8a1585e",
+    "tests/test_tradelab_outlier_audit.py": "179d74fd5c26f47c9aae4331e2d9cfb385d4ffdf9cd96f8667ed5fe181f4dac5",
+    "tests/test_tradelab_process_memory.py": "f799ab1e98c87ac74e8ad2f0e95b0b846be5438acef381cc72b2272edad9acdf",
+    "tests/test_tradelab_profile_research_context.py": "69f975d2dfe20d5f14997ac8f3da0d8b377b73dda617978f888bb089678cc9bf",
+    "tests/test_tradelab_research_dashboard.py": "a4f3d0bc1fa50255a29877fa2af9e79f561ec51337693704cd53ae819d6e51b8",
+    "tests/test_tradelab_research_demo.py": "4f00c69d62c839ff9f217de297adeef4adac4e8abac3453c28cd5a371df5fb53",
+    "tests/test_tradelab_research_journal.py": "c5a0b25395f2d0c938db46f9aaabcaf18bcfcd0729cc7329852ad4201a887a5d",
+    "tests/test_tradelab_research_period.py": "b146f8f66c8291e42cdfeadd1de8c1aa39bb6e2e6a9021b210aefa8a91eae618",
+    "tests/test_tradelab_research_run.py": "b4d38ec7f6e99143f9f38d6fd5e33ab684fed67d6db33dc576eb0b0ab5d56d4d",
+    "tests/test_tradelab_research_runner.py": "944e3371bd36749e10b604d9703871f0ca4bd31435b77ada0a96f1725d2af242",
+    "tests/test_tradelab_research_validation.py": "5835f7facf6896e9113f3df996e707b5e58191514fd0a060d8433234284484f9",
+    "tests/test_tradelab_selector_catalog.py": "d16da536fa81485267a8004bd249afe7dd0b6e38750f2a6f240dbedf7916ef35",
+    "tests/test_tradelab_session_analysis.py": "e1ce0d0a5a56d3ef1250a678c99933425b4dbf730d71883fabb456b495cb8a81",
+    "tests/test_tradelab_session_calendar.py": "933bd8df06d653ab4f42bd54b5056be69be587044c91699556a1bc6c2201080f",
+    "tests/test_tradelab_session_execution.py": "00b9633594c5796b2ca439449e43e952ae451128e1b6095a6cccbabf24908a9e",
+    "tests/test_tradelab_session_liquidity.py": "507e1ab22c01277b5b30b9e4d09e59561977b3ad4b30f2d228a0dac13af12fff",
+    "tests/test_tradelab_shard_plan.py": "84350d18b24469d693e1c41cf32240e36d0e2948ca588a59d1ff029085253c50",
+    "tests/test_tradelab_shared_context.py": "cb1bdd1574a9362baf65ba86209a8b41c0ae4b021be98dcee125a6ff135eab01",
+    "tests/test_tradelab_sl_targets.py": "da1b7b6b8ab8637cf255d9d06b1df984ee493a60d29c9a5bbaa9880d7638b8ff",
+    "tests/test_tradelab_stage_timings.py": "a9bdf5f32fc58696706c2e0bfa902110c6adfe8aa4045ed4fdfa20683ce2fa53",
+    "tests/test_tradelab_strategy_spec.py": "1e15bb59ed750b125809fb7eb967c765576f3140484a43ecfd3627d0749788e0",
+    "tests/test_tradelab_sweep_fvg_setup.py": "d581120bec528decbf31bcab34c11010a4a0913fae6b5daceb8bfae91ecfacaa",
+    "tests/test_tradelab_tp_targets.py": "c14f00b9d4ec38efe4d23683ee17ccb29bf6bb992be9807c4b2a27fb3977174b",
+    "tests/test_tradelab_trade_execution.py": "dab0b2217e6d38ebdc5512d3eadffab54919a33931f82a0a8476a6e4033b7874",
+    "tests/test_tradelab_trade_path_audit.py": "c09ebbe27e254039bb3e102fe499099785bf8c2b5a30e934ee9d4ad799be4bc7",
+    "tests/test_tradelab_validation.py": "a1959799b1c5d49dc1db4793fdb32574c2d7096d1ecdbf16ca109f9e2934a099",
+    "tests/test_tradelab_volume_roll_continuous.py": "830cb55322706be07f212855a6a01e4230a3890bef33d7fcbe3f5e8920b39893",
+    "tradelab/__init__.py": "7a54734e87aa3b242d600cb3026f0866b732aa630ff479783ed5d3421d102d64",
+    "tradelab/accounting.py": "543c3a8a3533c916c6d06bb0da85a33575d02828f6bf4fb2c4edce073a789949",
+    "tradelab/aggregate.py": "b2e5e673eb931fdb875229d54a20966758a07b2a8c2b7b6bf3aa755b8bb97f13",
+    "tradelab/apex_eod.py": "1200f20e888970748a13d32a41cc149d678ca55b6c103bbe8df8ae63d0c15292",
+    "tradelab/backtest.py": "a650b6b094aca909f43ed116c3c1110a7d6b3d97474895c885c6c40a74037054",
+    "tradelab/backtest_v2.py": "bf794c8eb89e3ff640fe88876413851cd0d3314af1ccfb55bf4e83b9a11f8457",
+    "tradelab/backtest_v2_journal.py": "c02c96ef420a712496f0a6466c70d7928de63dfedb722a854fae599addc2d3ef",
+    "tradelab/bar.py": "46837a220d5407351582a05628b3854ce345a1bab584a826a5204b21f6bd6088",
+    "tradelab/bar_range_index.py": "db70122bb7205bdbf1456f67597889eb22bca35c5e6f8940d7c55e339974fd6d",
+    "tradelab/bias.py": "61a4b6338ac845e88ca7142b56bf00ecaea55ad06daef875c71a3582006466b9",
+    "tradelab/both_direction_universe.py": "c34663af9db8bf5e3871328d90f6785eff44bbb98654382759b935541fb620bb",
+    "tradelab/continuous_futures.py": "1ed1bcf65c3f737f6f748d9090708fd3fdea63253a9a67608e6c48fa78285dd3",
+    "tradelab/data_wicks.py": "b6d55c585757ccccce86f8cdc7f5a4349239b1ae376996c6cf79e7cb1c0c9cb6",
+    "tradelab/databento_parent_csv.py": "2772aafa3eb82bbcfbdbd13ad94192eacee3b607a2c10e30146e0309629f5a1f",
+    "tradelab/diagnose_context_preparation.py": "c1851ab1c9ac68788951b0e28c3c7032e65b5ec61c422dd6d29989c37bafa012",
+    "tradelab/entry_signal_timeline.py": "317742a426131b39e171d7567f3ccc075348c7598351f0da29f7d1a8cb881aa7",
+    "tradelab/entry_store.py": "271c4b9ab37f3cd7ec201e09ba4c8825296afc25b3922ea62062b1f1d87f1e7f",
+    "tradelab/entry_strategy_universe.py": "306ea9f2217906ea865475247d9c09d9826a20b761b88d6322efe4e378ca8ad7",
+    "tradelab/entry_target_cache.py": "7b0c11a06574c85807b5c7fd68bcd2cff3db1f3b0f6d8116bf9ac04f1fa039d5",
+    "tradelab/equity.py": "ab3badbb62ad4e1cf155940ae04ec2738cf8e30cd10701d1fbd61b3bbfeed423",
+    "tradelab/fixed_rr_targets.py": "3536291a64c5b86449fcfb87a2e65e41b4994da4568e27a2065ec87b7cb1166b",
+    "tradelab/fvg.py": "9e51d57c7934bd0918a3ad3ccaae91dc71eeb69286e27634f055cf7f055827ea",
+    "tradelab/fvg_entry.py": "0449c61e5f2ffbcd10cd77589da21199a9cc3a872f6184159c69cc35f01a6bdd",
+    "tradelab/fvg_touch.py": "9bdc69d4009d08e9ee97a0d4f68459ccb2379b1139776d5ab550be3b8a554829",
+    "tradelab/liquidity.py": "fab5220075261f53f372cdafb0efd8e77ca59b87de603cadcd464bda1cfc96be",
+    "tradelab/liquidity_entry.py": "6f7aa16bbf44a2d2302ebde4b0f689c5d267399dba6c0ccea368def708064f45",
+    "tradelab/liquidity_store.py": "d01cc3d0db08278e934141a376f305ca313c32798dcc035a9fc31000b5b999ab",
+    "tradelab/liquidity_target_index.py": "cce9d1de76dc723dbb61d784f1e9c05ac8f8d5bd76d1f3b86171dbe1f43dc570",
+    "tradelab/loaders.py": "24ff810df0f359736404eb0cef79a5208afa668428f959def2ff820b60f34708",
+    "tradelab/market_data_artifact.py": "ba121452b318d2c55146622b0738fa8277c37279667e9580e81473d8da421237",
+    "tradelab/news.py": "7f3a164ff97686b801353c7fab82c814cdf810bc01544b29c130b8c7e7c83d3a",
+    "tradelab/news_loaders.py": "e31de60d48c06de66366e392031c637aceb16244afe0071e47de667d356ed0a6",
+    "tradelab/observed_strategy_universe.py": "df41efe5ef95afb5854740414eab85690fdd76146498c60d999afc0a41e817c4",
+    "tradelab/outlier_audit.py": "43c5663014d956dcc0c063be8a586805d650258daa64fc6bc58d797760185ced",
+    "tradelab/process_memory.py": "818e9df4ade32843f320b5e3a493e0cb53b2aabf03ee94f9dbdff44623f75cc5",
+    "tradelab/profile_research_context.py": "9d5713955860bd6421bce9e3cfc70fd47ea637e2df3cec8705afaea4deda61be",
+    "tradelab/research_dashboard.py": "8ecb16ffaaf72bc8d1d8acec830bf43f27d9b48375d6b01eb78d584e18bfdd24",
+    "tradelab/research_demo.py": "954cb931fe0ba22faeff1acc1bfb05c13db73aa828f35648006eab36ac2cb368",
+    "tradelab/research_journal.py": "52046b7c71d94af7308787baa4e08f52d0a6def6e61cd7d103c4a28054073f30",
+    "tradelab/research_period.py": "4451cd1698790c325877dee96421f80f3f2b857899b3e982887ddbd479a78528",
+    "tradelab/research_run.py": "c24f47267c25f72bfc6e65a65130737e5844f68521cb8351c090f4bad28a714d",
+    "tradelab/research_runner.py": "e318154d73640ac0c0eb5e13937afb4ddf78bcc3c6db376c4f194d30aa7ae332",
+    "tradelab/research_validation.py": "4d62b1db6bed492f1629271cbcafa3aacd2bedd3c24a13115cc1c84decf441a6",
+    "tradelab/selector_catalog.py": "fe3879501d66e83abe4aa37b541177101515c56b18cb2fa018c192f9ae70733c",
+    "tradelab/session_analysis.py": "c5113bf81088715e1b08e738dec76f7afa4fa017333ce94529ad1618e038c8fe",
+    "tradelab/session_calendar.py": "cc837285b2949163df1c312428c8e4ae56a41bcd6c0e0aa5b7a4e8013e107cd0",
+    "tradelab/session_execution.py": "78f614c4087eb33e478f3c963777fd1bde1503ebe1426e6be4a7f1b0ae1b2e31",
+    "tradelab/session_liquidity.py": "7316c1faf8741cedc548cf97012fb779b4c999bb39eea863b59c706b63e9b430",
+    "tradelab/shard_bundle.py": "7073d3c2652ada0e96f6ca115ade0c3a429abfa1ad7b5b736973c773c1ea8c26",
+    "tradelab/shard_payload.py": "42922bac73ac48b7af0a95409afd41382444d0268dcd0bfcb79c7da4a9598606",
+    "tradelab/shard_plan.py": "3c38a9a17fc3703f5ba9a4e19dbb675aea14b58d8dfe4a15ef02afe99d597ada",
+    "tradelab/shared_context.py": "51a9dc9cd4bdb0eb09612d02c89edb5e26c37c7895df2df5fcbd3f68de0a18b5",
+    "tradelab/sl_targets.py": "a21543ae18e9942cebbf176eba3cdf67043ca35e09cf1c27ee2adc2306002a29",
+    "tradelab/stage_timings.py": "041e573abe9022a4b01c2e6781f599bf3065e7819045f89799b2ae345b7cf8b9",
+    "tradelab/strategy_spec.py": "f2ceeb43f360a87d19a7f1cfa09764025010dd205ba00bbda09723ce8a799e45",
+    "tradelab/sweep_fvg_setup.py": "6f9751c300fbfaa6c464ea63546b58a3b7323e569f0dd5ebb67a470c836d5511",
+    "tradelab/tp_targets.py": "003e4b1cd0a51c2f5c5b8365f8155eae0179e15e73f5cb58dfa62eaa24f29a8b",
+    "tradelab/trade_execution.py": "9d60af98d619affcb2500430a3a9651e9d9c9e4e27b8da181714f44018fead60",
+    "tradelab/trade_path_audit.py": "8a49f20f9d73943eb11619a637929738ca28f40943a6970b491993ada1901c27",
+    "tradelab/trading_sessions.py": "b265d392b25ee7eec49906899104963e69f540f32e9d085f8f81b0190cd1858e",
+    "tradelab/validation.py": "78fd42c6fc3607630a36ce5a84e7cbfe2310ad124fe0c34479f2a8b122e4e9cf",
+    "tradelab/volume_roll_continuous.py": "496d1ea5004039c3ac1a3772aa97b7b8d4830d6c57cba63e9326f9b52c214d77",
+    "tradelab/worker_policy.py": "6f1986f757f54f46d6381433bd0d4c8ff30c128b85e094100e36f3b25a1c62a5"
+  },
+  "upstream_test_modules": [
+    "test_tradelab_accounting",
+    "test_tradelab_aggregate",
+    "test_tradelab_apex_eod",
+    "test_tradelab_backtest",
+    "test_tradelab_backtest_v2",
+    "test_tradelab_backtest_v2_journal",
+    "test_tradelab_bar",
+    "test_tradelab_bar_range_index",
+    "test_tradelab_bias",
+    "test_tradelab_both_direction_universe",
+    "test_tradelab_continuous_futures",
+    "test_tradelab_data_wicks",
+    "test_tradelab_databento_parent_csv",
+    "test_tradelab_diagnose_context_preparation",
+    "test_tradelab_entry_signal_timeline",
+    "test_tradelab_entry_store",
+    "test_tradelab_entry_strategy_universe",
+    "test_tradelab_entry_target_cache",
+    "test_tradelab_equity",
+    "test_tradelab_fixed_rr_targets",
+    "test_tradelab_fvg",
+    "test_tradelab_fvg_entry",
+    "test_tradelab_fvg_touch",
+    "test_tradelab_liquidity",
+    "test_tradelab_liquidity_entry",
+    "test_tradelab_liquidity_store",
+    "test_tradelab_liquidity_target_index",
+    "test_tradelab_loaders",
+    "test_tradelab_market_data_artifact",
+    "test_tradelab_news",
+    "test_tradelab_news_loaders",
+    "test_tradelab_observed_strategy_universe",
+    "test_tradelab_outlier_audit",
+    "test_tradelab_process_memory",
+    "test_tradelab_profile_research_context",
+    "test_tradelab_research_dashboard",
+    "test_tradelab_research_demo",
+    "test_tradelab_research_journal",
+    "test_tradelab_research_period",
+    "test_tradelab_research_run",
+    "test_tradelab_research_runner",
+    "test_tradelab_research_validation",
+    "test_tradelab_selector_catalog",
+    "test_tradelab_session_analysis",
+    "test_tradelab_session_calendar",
+    "test_tradelab_session_execution",
+    "test_tradelab_session_liquidity",
+    "test_tradelab_shard_plan",
+    "test_tradelab_shared_context",
+    "test_tradelab_sl_targets",
+    "test_tradelab_stage_timings",
+    "test_tradelab_strategy_spec",
+    "test_tradelab_sweep_fvg_setup",
+    "test_tradelab_tp_targets",
+    "test_tradelab_trade_execution",
+    "test_tradelab_trade_path_audit",
+    "test_tradelab_validation",
+    "test_tradelab_volume_roll_continuous"
+  ]
+}

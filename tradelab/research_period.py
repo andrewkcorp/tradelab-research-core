@@ -1,8 +1,8 @@
 """Fail-closed discovery/holdout separation.
 
-TradeLab has already inspected every date in the purchased three-year sample,
-so none of it can honestly become a holdout after the fact.  This policy makes
-that contamination machine-checkable.  Production discovery rejects future
+The bundled policy is an illustrative fixture, not a statement about any
+real dataset. Discovery and holdout periods must be predeclared for each actual
+study. This policy makes that separation machine-checkable.  Production discovery rejects future
 holdout bars; final validation requires an explicit call and at least the
 configured amount of genuinely later data.
 """
@@ -17,7 +17,7 @@ from typing import Sequence
 from tradelab.bar import Bar1m
 
 SCHEMA_VERSION = "tradelab-research-period-policy-v1"
-DEFAULT_POLICY_PATH = Path(__file__).resolve().parents[1] / "configs" / "research_period_policy.json"
+DEFAULT_POLICY_PATH = Path(__file__).resolve().parent / "_resources" / "research_period_policy.json"
 
 
 def _timestamp(value: str) -> datetime:

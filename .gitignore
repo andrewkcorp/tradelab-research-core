@@ -1,77 +1,36 @@
 __pycache__/
 *.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.DS_Store
 .env
 .env.*
-backtest_results.json
-
-# Local MNQ research artifacts (tradelab.materialize_research_artifact) --
-# generated data + audit JSON, never real market data checked into git.
-# Matches the exact filenames the CLI writes, wherever they land, plus the
-# conventional local output directory name so an --output-dir pointed
-# inside the repo (e.g. for local testing) can never be committed by accident.
-tradelab_mnq_research_artifact/
-**/tradelab_mnq_research_artifact/
+*.pem
+*.key
+*.p12
+*.pfx
+*.dbn
+*.parquet
+*.sqlite3*
+*.db
+*.pkl
+*.pickle
+*.log
+*.zip
+*.gz
+*.zst
+*.csv
+data/
+runs/
+archive/
+private/
+INCOMPLETE_BUILD
+context_profile.json
 mnq_continuous_1m.csv
 source_artifact_manifest.json
 continuous_artifact_manifest.json
 volume_roll_audit.json
 materialization_summary.json
-
-# Local research context profile (tradelab.profile_research_context) --
-# a small diagnostic JSON derived from real market/news data, never
-# committed. --output-json is always caller-supplied at runtime; this
-# pattern only guards against it being pointed inside the repo by
-# accident (e.g. for local testing).
-context_profile.json
-
-# Local research journal databases (tradelab.research_journal) -- SQLite
-# checkpoint/resume state and any exported qualifying-strategy results,
-# never committed. db_path/export path are always caller-supplied at
-# runtime; these patterns only guard against one being pointed inside
-# the repo by accident (e.g. for local testing).
-*.sqlite3
-*.sqlite3-journal
-*.sqlite3-wal
-*.sqlite3-shm
-*.db
-research_journal.sqlite3
-
-# Archived run directories -- the same run artifacts as ./runs, moved aside
-# after completion (3+ GB of SQLite journals and event logs per run). Never
-# committed, for the same reason ./runs is not.
-/archive/
-**/archive/
-
-# macOS Finder metadata.
-.DS_Store
-
-# Local research run artifacts (tradelab.research_run / tradelab.
-# research_demo / tradelab.research_dashboard) -- live-status/checkpoint/
-# leaderboard JSON and progress event logs for a research run (demo or
-# real), never committed. --runs-dir is always caller-supplied at
-# runtime; this pattern only guards against the conventional ./runs
-# default landing inside the repo by accident (e.g. for local testing).
-/runs/
-**/runs/
-
-# Ad-hoc diagnostic probe outputs (the probe scripts themselves stay tracked).
-.diag/*.log
-.diag/*.pkl
-.diag/*.txt
-.diag/*.json
-
-# Shard payloads and any other on-disk worker data are generated artifacts.
-/shards/
-**/shards/
-*.shard
-
-# Whole run directories a diagnostic may produce under .diag (the scripts and
-# their small JSON reports are covered by the rules above).
-.diag/equiv-runs/
-.diag/shard-bundle*/
-
-# Atlas regeneration baselines and scratch: local research output, like every
-# other .diag JSON. The committed docs/atlas-report-checksums.json is what makes
-# a regeneration verifiable without them.
-.diag/atlas-baseline/
-.diag/atlas-regen/

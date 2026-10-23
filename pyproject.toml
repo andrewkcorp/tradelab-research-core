@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tradelab-research-core"
+version = "0.1.0a1"
+description = "Local-first, auditable OHLCV research and backtesting primitives"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "TradeLab contributors"}]
+dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+]
+
+[project.scripts]
+tradelab-synthetic-demo = "tradelab.synthetic_demo:main"
+tradelab-dashboard-demo = "tradelab.research_demo:main"
+tradelab-dashboard = "tradelab.research_dashboard:main"
+
+[tool.setuptools.packages.find]
+include = ["tradelab*"]
+exclude = ["tests*", "tools*"]
+
+[tool.setuptools.package-data]
+tradelab = ["_resources/*.json"]

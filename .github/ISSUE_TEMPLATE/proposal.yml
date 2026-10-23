@@ -1,0 +1,16 @@
+name: Research or documentation proposal
+description: Discuss a contract, API or small roadmap task before implementation
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and proposed scope
+    validations:
+      required: true
+  - type: textarea
+    id: correctness
+    attributes:
+      label: Semantics, bias risks and acceptance tests
+      description: State whether this changes a model or only an implementation.
+    validations:
+      required: true

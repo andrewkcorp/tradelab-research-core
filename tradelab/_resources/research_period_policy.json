@@ -1,0 +1,8 @@
+{
+  "schema_version": "tradelab-research-period-policy-v1",
+  "discovery_start_utc": "2023-08-18T00:00:00Z",
+  "discovery_end_exclusive_utc": "2026-08-18T00:00:00Z",
+  "holdout_start_utc": "2026-08-18T00:00:00Z",
+  "minimum_holdout_calendar_days": 365,
+  "rationale": "Illustrative dates retained for synthetic regression compatibility only. No real dataset or validated holdout is implied. Predeclare a study-specific policy before using real data."
+}

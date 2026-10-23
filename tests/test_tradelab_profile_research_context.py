@@ -1331,7 +1331,11 @@ class NoRealDataInRepoTests(unittest.TestCase):
         import subprocess
 
         repo_root = Path(__file__).resolve().parent.parent
-        tracked = subprocess.run(["git", "ls-files"], cwd=repo_root, capture_output=True, text=True, check=True).stdout.splitlines()
+        if not (repo_root / ".git").exists():
+            manifest = json.loads((repo_root / "SOURCE_MANIFEST.json").read_text())
+            tracked = list(manifest["files"])
+        else:
+            tracked = subprocess.run(["git", "ls-files"], cwd=repo_root, capture_output=True, text=True, check=True).stdout.splitlines()
         offenders = [f for f in tracked if f.endswith("context_profile.json") or f.endswith("mnq_continuous_1m.csv")]
         self.assertEqual(offenders, [])
 
